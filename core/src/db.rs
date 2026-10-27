@@ -101,6 +101,10 @@ const MIGRATIONS: &[&str] = &[
     // When the feed was last subscribed to (ms; synced sub_t at that moment).
     // Until RETENTION_MS after it, all of its items count as unread.
     "ALTER TABLE feeds ADD COLUMN since_t INTEGER NOT NULL DEFAULT 0;",
+    // Nostr posts now keep their Markdown formatting: forget that each Nostr
+    // feed's history was read (the worker's NOSTR_FETCHED marker), so it's
+    // read again once and the posts stored before get the formatting too.
+    "UPDATE feeds SET etag = NULL WHERE etag = 'fetched';",
 ];
 
 /// SQL expression: is the item `i` (left-joined with state `s`) shown? Word
@@ -1636,6 +1640,24 @@ mod tests {
         // Opening again doesn't run the migration twice.
         let version: i64 = db.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(version as usize, MIGRATIONS.len());
+    }
+
+    #[test]
+    fn nostr_history_is_read_again_once_for_markdown() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        for migration in &MIGRATIONS[..MIGRATIONS.len() - 1] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.execute_batch(&format!("PRAGMA user_version = {}", MIGRATIONS.len() - 1)).unwrap();
+        conn.execute(
+            "INSERT INTO feeds (url, etag) VALUES ('nostr:npub1x', 'fetched'), ('https://a.example/', 'abc')",
+            [],
+        )
+        .unwrap();
+        let db = Db::init(conn).unwrap();
+        assert!(db.fetch_info("nostr:npub1x").unwrap().etag.is_none());
+        assert_eq!(db.fetch_info("https://a.example/").unwrap().etag.as_deref(), Some("abc"));
     }
 
     #[test]

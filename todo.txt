@@ -1,0 +1,23 @@
+To do:
+Add “open in [selected] app” button
+Audit dependencies
+make web support PWA installation
+qr bunker scan for web&desktop
+** Use "Untitled Item" for feed entries without a title
+
+Desktop:
+** make sure markdown rendering in nostr posts works
+
+Mobile:
+open nostr links in default app
+** rename "Nostr" settings to "Socials"
+** Text in the settings tab is being cut off
+Start installation with sync disabled
+keyboard rapidly appearing and dissapearing when trying to add a feed
+see logo is logo file
+
+Maybe:
+Add I2P & Tor support?
+Add Plugin Support?
+Add misc nip support (magazines, videos, ect?)
+Add a relay bully mode, and/or allow setting larger file sizes?

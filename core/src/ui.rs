@@ -80,10 +80,11 @@ enum Screen {
     Main,
 }
 
+/// `focus`: the dialog's text field still has to get the cursor (see [`focus_on_open`]).
 enum Dialog {
-    AddFeed { input: String, category: String, busy: bool, error: Option<String> },
+    AddFeed { input: String, category: String, busy: bool, error: Option<String>, focus: bool },
     RenameCategory { from: String, to: String },
-    NewCategory { url: String, name: String },
+    NewCategory { url: String, name: String, focus: bool },
     NewSyncKey { nsec: String },
     ConfirmSignOut,
     ConfirmErase { understood: bool, busy: bool, error: Option<String> },
@@ -95,14 +96,14 @@ enum SettingsTab {
     Sync,
     Filters,
     Report,
-    Nostr,
+    Socials,
     Data,
     Appearance,
 }
 
 impl SettingsTab {
     const ALL: [SettingsTab; 7] =
-        [Self::Account, Self::Sync, Self::Filters, Self::Report, Self::Nostr, Self::Data, Self::Appearance];
+        [Self::Account, Self::Sync, Self::Filters, Self::Report, Self::Socials, Self::Data, Self::Appearance];
 
     fn label(self) -> &'static str {
         match self {
@@ -110,7 +111,7 @@ impl SettingsTab {
             Self::Sync => "Sync",
             Self::Filters => "Filters",
             Self::Report => "Feed report",
-            Self::Nostr => "Nostr",
+            Self::Socials => "Socials",
             Self::Data => "Import & export",
             Self::Appearance => "Appearance",
         }
@@ -477,90 +478,94 @@ impl App {
     }
 
     fn login_screen(&mut self, ui: &mut Ui) {
+        // Scrolls on short screens: a phone held sideways, a large interface size.
         CentralPanel::default().show(ui, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(((ui.available_height() - 520.0) / 2.0).max(24.0));
-                ui.set_max_width(400.0);
-                ui.label(RichText::new("Feedstr").size(36.0).strong());
-                ui.label(RichText::new("Your feeds, synced privately over Nostr").weak());
-                ui.add_space(28.0);
-                if let Some(notice) = &self.login.notice {
-                    card(ui, |ui| {
-                        ui.add(Label::new(notice.as_str()).wrap());
-                    });
-                    ui.add_space(12.0);
-                }
+            ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(((ui.available_height() - 520.0) / 2.0).max(24.0));
+                    ui.set_max_width(400.0);
+                    ui.label(RichText::new("Feedstr").size(36.0).strong());
+                    ui.label(RichText::new("Your feeds, synced privately over Nostr").weak());
+                    ui.add_space(28.0);
+                    if let Some(notice) = &self.login.notice {
+                        card(ui, |ui| {
+                            ui.add(Label::new(notice.as_str()).wrap());
+                        });
+                        ui.add_space(12.0);
+                    }
 
-                let enabled = !self.login.busy;
-                #[cfg(target_arch = "wasm32")]
-                {
+                    let enabled = !self.login.busy;
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        card(ui, |ui| {
+                            ui.label(RichText::new("Browser extension").strong());
+                            let hint = "Alby, nos2x or another Nostr extension (NIP-07) that supports NIP-44";
+                            ui.label(RichText::new(hint).small().weak());
+                            if ui.add_enabled(enabled, wide(primary_button("Use extension"), ui)).clicked() {
+                                self.sign_in(Login::Extension);
+                            }
+                        });
+                        ui.add_space(12.0);
+                    }
+                    if self.has_signer_app {
+                        card(ui, |ui| {
+                            ui.label(RichText::new("Signer app").strong());
+                            let hint = "Amber or another Nostr signer app (NIP-55) keeps your key";
+                            ui.label(RichText::new(hint).small().weak());
+                            if ui.add_enabled(enabled, wide(primary_button("Use signer app"), ui)).clicked() {
+                                self.sign_in(Login::SignerApp);
+                            }
+                        });
+                        ui.add_space(12.0);
+                    }
                     card(ui, |ui| {
-                        ui.label(RichText::new("Browser extension").strong());
-                        let hint = "Alby, nos2x or another Nostr extension (NIP-07) that supports NIP-44";
-                        ui.label(RichText::new(hint).small().weak());
-                        if ui.add_enabled(enabled, wide(primary_button("Use extension"), ui)).clicked() {
-                            self.sign_in(Login::Extension);
+                        ui.label(RichText::new("Sync Key").strong());
+                        let edit = TextEdit::singleline(&mut self.login.sync_key).password(true).hint_text("nsec1…");
+                        let response = ui.add_enabled(enabled, edit.desired_width(f32::INFINITY));
+                        let submit = response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                        if ui.add_enabled(enabled, wide(primary_button("Sign in"), ui)).clicked() || submit {
+                            self.sign_in(Login::SyncKey(self.login.sync_key.clone()));
                         }
                     });
                     ui.add_space(12.0);
-                }
-                if self.has_signer_app {
                     card(ui, |ui| {
-                        ui.label(RichText::new("Signer app").strong());
-                        let hint = "Amber or another Nostr signer app (NIP-55) keeps your key";
-                        ui.label(RichText::new(hint).small().weak());
-                        if ui.add_enabled(enabled, wide(primary_button("Use signer app"), ui)).clicked() {
-                            self.sign_in(Login::SignerApp);
+                        ui.label(RichText::new("Remote signer").strong());
+                        let edit = TextEdit::singleline(&mut self.login.bunker).hint_text("bunker://…");
+                        ui.add_enabled(enabled, edit.desired_width(f32::INFINITY));
+                        if ui.add_enabled(enabled, wide(primary_button("Connect"), ui)).clicked() {
+                            self.sign_in(Login::Bunker(self.login.bunker.clone()));
                         }
                     });
-                    ui.add_space(12.0);
-                }
-                card(ui, |ui| {
-                    ui.label(RichText::new("Sync Key").strong());
-                    let edit = TextEdit::singleline(&mut self.login.sync_key).password(true).hint_text("nsec1…");
-                    let response = ui.add_enabled(enabled, edit.desired_width(f32::INFINITY));
-                    let submit = response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                    if ui.add_enabled(enabled, wide(primary_button("Sign in"), ui)).clicked() || submit {
-                        self.sign_in(Login::SyncKey(self.login.sync_key.clone()));
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        ui.add_space(12.0);
+                        let mut remember = !self.login.forget;
+                        ui.checkbox(&mut remember, "Remember me on this browser");
+                        self.login.forget = !remember;
+                        let hint = if remember {
+                            "Your sign-in and feeds are kept in this browser until you sign out."
+                        } else {
+                            "Nothing is kept in this browser: you sign in again next time."
+                        };
+                        ui.label(RichText::new(hint).small().weak());
                     }
-                });
-                ui.add_space(12.0);
-                card(ui, |ui| {
-                    ui.label(RichText::new("Remote signer").strong());
-                    let edit = TextEdit::singleline(&mut self.login.bunker).hint_text("bunker://…");
-                    ui.add_enabled(enabled, edit.desired_width(f32::INFINITY));
-                    if ui.add_enabled(enabled, wide(primary_button("Connect"), ui)).clicked() {
-                        self.sign_in(Login::Bunker(self.login.bunker.clone()));
+                    ui.add_space(16.0);
+                    if self.login.busy {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(&self.status);
+                        });
+                    } else if let Some(error) = &self.login.error {
+                        ui.colored_label(ui.visuals().error_fg_color, error);
                     }
-                });
-                #[cfg(target_arch = "wasm32")]
-                {
-                    ui.add_space(12.0);
-                    let mut remember = !self.login.forget;
-                    ui.checkbox(&mut remember, "Remember me on this browser");
-                    self.login.forget = !remember;
-                    let hint = if remember {
-                        "Your sign-in and feeds are kept in this browser until you sign out."
-                    } else {
-                        "Nothing is kept in this browser: you sign in again next time."
-                    };
-                    ui.label(RichText::new(hint).small().weak());
-                }
-                ui.add_space(16.0);
-                if self.login.busy {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(&self.status);
-                    });
-                } else if let Some(error) = &self.login.error {
-                    ui.colored_label(ui.visuals().error_fg_color, error);
-                }
-                ui.add_space(16.0);
-                ui.label(RichText::new("New here?").weak());
-                if ui.add_enabled(enabled, Button::new("Create a Sync Key")).clicked() {
-                    let nsec = Keys::generate().secret_key().to_bech32().expect("bech32 encoding can't fail");
-                    self.dialog = Some(Dialog::NewSyncKey { nsec });
-                }
+                    ui.add_space(16.0);
+                    ui.label(RichText::new("New here?").weak());
+                    if ui.add_enabled(enabled, Button::new("Create a Sync Key")).clicked() {
+                        let nsec = Keys::generate().secret_key().to_bech32().expect("bech32 encoding can't fail");
+                        self.dialog = Some(Dialog::NewSyncKey { nsec });
+                    }
+                    ui.add_space(24.0);
+                })
             });
         });
     }
@@ -588,7 +593,8 @@ impl App {
                     View::Category(name) => name.clone(),
                     _ => String::new(),
                 };
-                self.dialog = Some(Dialog::AddFeed { input: String::new(), category, busy: false, error: None });
+                self.dialog =
+                    Some(Dialog::AddFeed { input: String::new(), category, busy: false, error: None, focus: true });
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.button("⚙").on_hover_text("Settings").clicked() {
@@ -701,7 +707,9 @@ impl App {
             Some(FeedAction::SetCategory(url, category)) if self.db.set_category(&url, &category).is_ok() => {
                 self.reload();
             }
-            Some(FeedAction::NewCategory(url)) => self.dialog = Some(Dialog::NewCategory { url, name: String::new() }),
+            Some(FeedAction::NewCategory(url)) => {
+                self.dialog = Some(Dialog::NewCategory { url, name: String::new(), focus: true })
+            }
             Some(FeedAction::Rename(from)) => self.dialog = Some(Dialog::RenameCategory { to: from.clone(), from }),
             Some(FeedAction::RemoveCategory(name)) => self.rename_category(&name, ""),
             Some(FeedAction::SetSynced(name, synced)) if self.db.set_category_synced(&name, synced).is_ok() => {
@@ -920,7 +928,7 @@ impl App {
                     meta.push(format_date(item.published, true));
                     ui.label(RichText::new(meta.join("  ·  ")).weak());
                     ui.add_space(6.0);
-                    ui.add(Label::new(RichText::new(html::decode_entities(&item.title)).size(26.0).strong()).wrap());
+                    ui.add(Label::new(RichText::new(item_title(&item.title)).size(26.0).strong()).wrap());
                     ui.add_space(10.0);
                     // Wrapped, so the buttons fit on a phone too.
                     ui.horizontal_wrapped(|ui| {
@@ -1002,7 +1010,7 @@ impl App {
         let modal = Modal::new(Id::unique("dialog")).frame(frame).show(ctx, |ui| {
             ui.set_width(440.0_f32.min(ctx.content_rect().width() - 72.0));
             match &mut dialog {
-                Dialog::AddFeed { input, category, busy, error } => {
+                Dialog::AddFeed { input, category, busy, error, focus } => {
                     ui.label(RichText::new("Add a feed").size(18.0).strong());
                     let hint = "Paste a feed address or a website that has one. For a Nostr writer's long-form posts, \
                                 paste their npub or NIP-05 address (like name@example.com).";
@@ -1011,9 +1019,7 @@ impl App {
                     let edit =
                         TextEdit::singleline(input).hint_text("https://example.com").desired_width(f32::INFINITY);
                     let response = ui.add_enabled(!*busy, edit);
-                    if !*busy && input.is_empty() {
-                        response.request_focus();
-                    }
+                    focus_on_open(&response, focus);
                     let enter = response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
                     ui.add_space(4.0);
                     let edit =
@@ -1048,13 +1054,11 @@ impl App {
                         }
                     });
                 }
-                Dialog::NewCategory { url, name } => {
+                Dialog::NewCategory { url, name, focus } => {
                     ui.label(RichText::new("New category").size(18.0).strong());
                     ui.add_space(8.0);
                     let response = ui.add(TextEdit::singleline(name).desired_width(f32::INFINITY));
-                    if name.is_empty() {
-                        response.request_focus();
-                    }
+                    focus_on_open(&response, focus);
                     let enter = response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
@@ -1229,7 +1233,7 @@ impl App {
                                 SettingsTab::Sync => self.sync_settings(ui, &mut page.new_relay),
                                 SettingsTab::Filters => self.filter_settings(ui, &mut page),
                                 SettingsTab::Report => self.feed_report(ui, &mut page.report),
-                                SettingsTab::Nostr => self.nostr_settings(ui),
+                                SettingsTab::Socials => self.socials_settings(ui),
                                 SettingsTab::Data => self.data_settings(ui),
                                 SettingsTab::Appearance => self.appearance_settings(ui),
                             }
@@ -1262,7 +1266,7 @@ impl App {
         });
         ui.add_space(16.0);
         ui.label(RichText::new("Theme").strong());
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let current = ui.ctx().options(|o| o.theme_preference);
             for (preference, label, name) in [
                 (ThemePreference::System, "System", "system"),
@@ -1295,11 +1299,12 @@ impl App {
                 .map(|(_, label)| label.clone())
                 .unwrap_or_else(|| scope.replacen("category:", "Category: ", 1).replacen("feed:", "Feed: ", 1))
         };
-        ui.horizontal(|ui| {
-            let edit = TextEdit::singleline(&mut page.new_filter).hint_text("Word or phrase").desired_width(220.0);
+        ui.horizontal_wrapped(|ui| {
+            let width = ui.available_width().min(220.0);
+            let edit = TextEdit::singleline(&mut page.new_filter).hint_text("Word or phrase").desired_width(width);
             let response = ui.add(edit);
             let enter = response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-            ComboBox::from_id_salt("filter scope").selected_text(scope_label(&page.filter_scope)).width(220.0).show_ui(
+            ComboBox::from_id_salt("filter scope").selected_text(scope_label(&page.filter_scope)).width(width).show_ui(
                 ui,
                 |ui| {
                     for (scope, _) in &scopes {
@@ -1322,7 +1327,7 @@ impl App {
             ui.label(RichText::new("No filters yet.").weak());
         }
         for filter in filters {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.small_button("✖").on_hover_text("Remove").clicked() && self.db.remove_filter(&filter.id).is_ok()
                 {
                     self.reload();
@@ -1333,7 +1338,7 @@ impl App {
         }
     }
 
-    fn nostr_settings(&mut self, ui: &mut Ui) {
+    fn socials_settings(&mut self, ui: &mut Ui) {
         let hint = "Feedstr can follow long-form posts (NIP-23) from Nostr. To follow one writer, use “Add feed” \
                     with their npub or NIP-05 address (like name@example.com); you don't need to follow them on \
                     Nostr.";
@@ -1356,7 +1361,7 @@ impl App {
         ui.add(Label::new(RichText::new(hint).small().weak()).wrap());
         if on {
             ui.add_space(8.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Show it as");
                 let label = |category: &str| {
                     if category.is_empty() {
@@ -1366,7 +1371,8 @@ impl App {
                     }
                 };
                 let mut chosen = category.clone();
-                ComboBox::from_id_salt("follows placement").selected_text(label(&chosen)).show_ui(ui, |ui| {
+                let combo = ComboBox::from_id_salt("follows placement").selected_text(label(&chosen));
+                combo.width(ui.available_width().min(380.0)).show_ui(ui, |ui| {
                     ui.selectable_value(&mut chosen, String::new(), label(""));
                     for name in self.categories.clone() {
                         ui.selectable_value(&mut chosen, name.clone(), label(&name));
@@ -1383,7 +1389,7 @@ impl App {
         let current = self.db.meta("report_days").ok().flatten().and_then(|d| d.parse().ok());
         let current = current.unwrap_or(DEFAULT_REPORT_DAYS);
         let mut days = current;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Feeds that failed to update, or have had no new posts for");
             ui.add(DragValue::new(&mut days).range(1..=3650));
             ui.label("days.");
@@ -1409,30 +1415,23 @@ impl App {
         for row in rows {
             Frame::new().fill(ui.visuals().faint_bg_color).corner_radius(8).inner_margin(12).show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.set_width((ui.available_width() - 230.0).max(120.0));
-                        ui.add(Label::new(RichText::new(&row.title).strong()).truncate());
-                        ui.add(Label::new(RichText::new(&row.url).small().weak()).truncate());
-                        let problem = match (&row.error, row.latest) {
-                            (Some(error), _) => {
-                                RichText::new(format!("Update failed: {error}")).color(ui.visuals().error_fg_color)
-                            }
-                            (None, None) => RichText::new("No posts"),
-                            (None, Some(latest)) => {
-                                RichText::new(format!("Newest post: {}", format_date(latest, false)))
-                            }
-                        };
-                        ui.add(Label::new(problem.small()).wrap());
-                    });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button("Unsubscribe").clicked() {
-                            unsubscribe = Some(row.url.clone());
-                        }
-                        if ui.button("Copy address").clicked() {
-                            ui.ctx().copy_text(row.url.clone());
-                        }
-                    });
+                ui.add(Label::new(RichText::new(&row.title).strong()).truncate());
+                ui.add(Label::new(RichText::new(&row.url).small().weak()).truncate());
+                let problem = match (&row.error, row.latest) {
+                    (Some(error), _) => {
+                        RichText::new(format!("Update failed: {error}")).color(ui.visuals().error_fg_color)
+                    }
+                    (None, None) => RichText::new("No posts"),
+                    (None, Some(latest)) => RichText::new(format!("Newest post: {}", format_date(latest, false))),
+                };
+                ui.add(Label::new(problem.small()).wrap());
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Copy address").clicked() {
+                        ui.ctx().copy_text(row.url.clone());
+                    }
+                    if ui.button("Unsubscribe").clicked() {
+                        unsubscribe = Some(row.url.clone());
+                    }
                 });
             });
             ui.add_space(6.0);
@@ -1450,7 +1449,7 @@ impl App {
 
     fn size_settings(&mut self, ui: &mut Ui) {
         ui.label(RichText::new("Interface size").strong());
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let zoom = ui.ctx().zoom_factor();
             let smaller = ZOOM_STEPS.iter().rev().find(|&&z| z < zoom - 0.001);
             let larger = ZOOM_STEPS.iter().find(|&&z| z > zoom + 0.001);
@@ -1474,7 +1473,7 @@ impl App {
 
     fn account_settings(&mut self, ui: &mut Ui, show_key: &mut bool) {
         ui.add(Label::new(RichText::new(&self.npub).monospace().small()).truncate());
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.button("Copy public key").clicked() {
                 ui.ctx().copy_text(self.npub.clone());
             }
@@ -1523,7 +1522,7 @@ impl App {
         ];
         for (title, kind, text) in sections {
             ui.label(RichText::new(title).strong());
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.add_enabled_ui(!self.file_busy, |ui| {
                     if ui.button("Import…").clicked() {
                         self.file_busy = true;
@@ -1560,7 +1559,7 @@ impl App {
     fn sync_settings(&mut self, ui: &mut Ui, new_relay: &mut String) {
         let hint = |ui: &mut Ui, text: &str| ui.add(Label::new(RichText::new(text).small().weak()).wrap());
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Sync automatically");
             let current = worker::sync_minutes(&self.db);
             let mut minutes = current;
@@ -1589,7 +1588,7 @@ impl App {
         let mut changed = false;
         relays.retain(|relay| {
             let mut keep = true;
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.small_button("✖").on_hover_text("Remove").clicked() {
                     keep = false;
                     changed = true;
@@ -1598,8 +1597,9 @@ impl App {
             });
             keep
         });
-        ui.horizontal(|ui| {
-            let edit = ui.add(TextEdit::singleline(new_relay).hint_text("wss://…").desired_width(300.0));
+        ui.horizontal_wrapped(|ui| {
+            let width = (ui.available_width() - 60.0).clamp(120.0, 300.0);
+            let edit = ui.add(TextEdit::singleline(new_relay).hint_text("wss://…").desired_width(width));
             let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
             let relay = worker::parse_relay(new_relay).filter(|relay| !relays.contains(relay));
             if (ui.add_enabled(relay.is_some(), Button::new("Add")).clicked() || enter)
@@ -1638,7 +1638,7 @@ impl App {
         ui.label(RichText::new("Cached on relays").strong());
         let current = self.db.cache_limits().ok().flatten().map(|l| l.0).unwrap_or_default();
         let mut limits = current;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Up to");
             ui.add(DragValue::new(&mut limits.items).range(0..=500));
             ui.label("items per feed, from the last");
@@ -1660,7 +1660,7 @@ impl App {
         let current = self.db.keep_days().unwrap_or(crate::db::DEFAULT_KEEP_DAYS);
         let mut forever = current == 0;
         let mut days = if forever { crate::db::SUGGESTED_KEEP_DAYS } else { current };
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.checkbox(&mut forever, "Keep everything");
             if !forever {
                 ui.label("or delete items after");
@@ -1968,7 +1968,7 @@ fn item_row(ui: &mut Ui, item: &ItemRow, selected: bool) -> egui::Response {
                 }
             });
         });
-        let title = RichText::new(html::decode_entities(&item.title));
+        let title = RichText::new(item_title(&item.title));
         let title = if item.unread {
             title.strong()
         } else if selected {
@@ -2056,7 +2056,7 @@ fn compact_row(ui: &mut Ui, item: &ItemRow, selected: bool) -> Response {
     }
     let left = rect.left() + 26.0;
     let color = title_color(ui, item, selected);
-    let title = elided(&painter, &html::decode_entities(&item.title), body, color, right - 12.0 - left, 1);
+    let title = elided(&painter, &item_title(&item.title), body, color, right - 12.0 - left, 1);
     painter.galley(pos2(left, y - title.size().y / 2.0), title, color);
     response
 }
@@ -2101,7 +2101,7 @@ fn item_card(ui: &mut Ui, item: &ItemRow, selected: bool, size: Vec2, compact: b
     let title_font = if compact { TextStyle::Body.resolve(ui.style()) } else { FontId::proportional(17.0) };
     let color = title_color(ui, item, selected);
     let rows = if compact { 2 } else { 3 };
-    let title = elided(&painter, &html::decode_entities(&item.title), title_font, color, inner.width(), rows);
+    let title = elided(&painter, &item_title(&item.title), title_font, color, inner.width(), rows);
     let title_height = title.size().y;
     painter.galley(pos2(inner.left(), y), title, color);
     y += title_height + 8.0;
@@ -2116,35 +2116,106 @@ fn item_card(ui: &mut Ui, item: &ItemRow, selected: bool, size: Vec2, compact: b
 }
 
 fn show_block(ui: &mut Ui, block: &Block) {
-    let body = 16.0;
-    match block.style {
-        Style::Paragraph => {
-            ui.add(Label::new(RichText::new(&block.text).size(body)).wrap());
-        }
-        Style::Heading => {
-            ui.add_space(6.0);
-            ui.add(Label::new(RichText::new(&block.text).size(20.0).strong()).wrap());
-        }
-        Style::Bullet => {
-            ui.horizontal_top(|ui| {
-                ui.label(RichText::new("•").size(body));
-                ui.add(Label::new(RichText::new(&block.text).size(body)).wrap());
-            });
-        }
-        Style::Quote => {
-            Frame::new().fill(ui.visuals().faint_bg_color).corner_radius(6).inner_margin(12).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.add(Label::new(RichText::new(&block.text).size(body).italics()).wrap());
-            });
-        }
-        Style::Code => {
-            Frame::new().fill(ui.visuals().extreme_bg_color).corner_radius(6).inner_margin(12).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.add(Label::new(RichText::new(&block.text).monospace()).wrap());
-            });
-        }
+    let size = match block.style {
+        Style::Heading(1) => 23.0,
+        Style::Heading(2) => 20.0,
+        Style::Heading(_) => 18.0,
+        _ => 16.0,
+    };
+    if matches!(block.style, Style::Heading(_)) {
+        ui.add_space(6.0);
     }
-    ui.add_space(10.0);
+    let row = |ui: &mut Ui| {
+        ui.horizontal_top(|ui| {
+            // List items: indented by depth, with the marker in a column of its own.
+            if block.depth > 0 {
+                ui.add_space(20.0 * f32::from(block.depth - 1));
+                let start = ui.cursor().left();
+                ui.label(RichText::new(block.marker.as_deref().unwrap_or("")).size(size));
+                ui.add_space((22.0 - (ui.cursor().left() - start)).max(0.0));
+            }
+            ui.vertical(|ui| match block.style {
+                Style::Rule => {
+                    ui.separator();
+                }
+                Style::Code => {
+                    ui.add(Label::new(RichText::new(block.text()).monospace()).wrap());
+                }
+                _ => show_spans(ui, &block.spans, size, block.style),
+            });
+        });
+    };
+    // Quotes and code sit on a background, list markers included.
+    let background = match block.style {
+        Style::Quote => Some(ui.visuals().faint_bg_color),
+        Style::Code => Some(ui.visuals().extreme_bg_color),
+        _ => None,
+    };
+    match background {
+        Some(fill) => {
+            Frame::new().fill(fill).corner_radius(6).inner_margin(12).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                row(ui);
+            });
+        }
+        None => row(ui),
+    }
+    ui.add_space(if block.depth > 0 { 4.0 } else { 10.0 });
+}
+
+/// Styled runs of text flowing as one paragraph; links open in the browser.
+/// Headings are strong throughout, quotes in italics.
+fn show_spans(ui: &mut Ui, spans: &[html::Span], size: f32, style: Style) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        for span in spans {
+            let mut text = RichText::new(&span.text).size(size);
+            if span.bold || matches!(style, Style::Heading(_)) {
+                text = text.strong();
+            }
+            if span.italic || style == Style::Quote {
+                text = text.italics();
+            }
+            if span.code {
+                text = text.code();
+            }
+            if span.strike {
+                text = text.strikethrough();
+            }
+            match &span.link {
+                Some(url) => {
+                    if ui.link(text).on_hover_text(url).clicked() {
+                        ui.ctx().open_url(OpenUrl::new_tab(url));
+                    }
+                }
+                None => {
+                    ui.add(Label::new(text).wrap());
+                }
+            }
+        }
+    });
+}
+
+/// Puts the cursor in a dialog's text field when it opens, asking until it has
+/// it (a new dialog's first frame is laid out twice). Only until then: every
+/// request also restarts the on-screen keyboard's typing, so asking on every
+/// frame made phone keyboards flicker and drop what was typed, and grabbing
+/// focus back after Enter would hide that Enter was pressed.
+fn focus_on_open(response: &Response, focus: &mut bool) {
+    if !*focus {
+        return;
+    }
+    if response.has_focus() {
+        *focus = false;
+    } else {
+        response.request_focus();
+    }
+}
+
+/// An item's title as shown, with a stand-in for items that have none.
+fn item_title(title: &str) -> String {
+    let title = html::decode_entities(title);
+    if title.trim().is_empty() { "Untitled Entry".into() } else { title }
 }
 
 fn format_date(seconds: i64, long: bool) -> String {
@@ -2166,6 +2237,14 @@ fn format_date(seconds: i64, long: bool) -> String {
 mod tests {
     use super::*;
     use crate::db::Db;
+
+    #[test]
+    fn blank_titles_get_a_stand_in() {
+        assert_eq!(item_title(""), "Untitled Entry");
+        assert_eq!(item_title("  \n "), "Untitled Entry");
+        assert_eq!(item_title("&nbsp;"), "Untitled Entry");
+        assert_eq!(item_title("Fish &amp; chips"), "Fish & chips");
+    }
 
     #[test]
     fn partly_local_groups_mark_each_local_feed() {

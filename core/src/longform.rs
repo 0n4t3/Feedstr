@@ -19,7 +19,7 @@ use crate::html;
 pub const FOLLOWS_URL: &str = "nostr:follows";
 pub const FOLLOWS_TITLE: &str = "Nostr Follows";
 /// Where "Open in Ditto" shows Nostr posts and profiles.
-const WEB_VIEWER: &str = "https://ditto.pub";
+pub(crate) const WEB_VIEWER: &str = "https://ditto.pub";
 /// Collects relay lists and profiles, so it knows where most people publish.
 const INDEX_RELAY: &str = "wss://purplepag.es";
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -322,7 +322,7 @@ fn item(post: &Event, names: &HashMap<PublicKey, String>) -> (String, Item) {
     let author =
         names.get(&post.pubkey).cloned().unwrap_or_else(|| short(&post.pubkey.to_bech32().unwrap_or_default()));
     let item = Item {
-        title: tag("title").filter(|t| !t.trim().is_empty()).unwrap_or_else(|| "Untitled".into()),
+        title: tag("title").unwrap_or_default(),
         link: format!("{WEB_VIEWER}/{naddr}"),
         author,
         published,

@@ -17,6 +17,7 @@ futures = "0.3.34"
 log = "0.4.34"
 nostr-connect = "0.45.2"
 nostr-sdk = "0.45.4"
+pulldown-cmark = { version = "0.13.5", default-features = false, features = ["html"] }
 quick-xml = "0.42"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "gzip", "brotli"] }
 rusqlite = { version = "0.40.2", features = ["bundled", "serialize"] }
