@@ -1,0 +1,43 @@
+# Flatpak of the desktop app, for building and installing locally:
+#   flatpak-builder --user --install-deps-from=flathub --install --force-clean build-dir flatpak/top.dns7.feedstr.Feedstr.yml
+# (run from the repository root). Not ready for Flathub: it downloads crates during the build.
+id: top.dns7.feedstr.Feedstr
+runtime: org.freedesktop.Platform
+runtime-version: '26.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: feedstr
+finish-args:
+  - --share=network # feeds and relays
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri # drawing with the GPU
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+modules:
+  - name: feedstr
+    buildsystem: simple
+    build-options:
+      # Lets cargo download crates; fine locally, not allowed on Flathub.
+      build-args:
+        - --share=network
+      env:
+        CARGO_HOME: /run/build/feedstr/cargo
+    sources:
+      - type: dir
+        path: ..
+        skip:
+          - target
+          - build-dir
+          - .flatpak-builder
+          - web/dist
+          - droid/build
+          - droid/app/build
+          - droid/.gradle
+    build-commands:
+      - cargo build --release -p feedstr
+      - install -Dm755 target/release/feedstr /app/bin/feedstr
+      - install -Dm644 flatpak/top.dns7.feedstr.Feedstr.desktop -t /app/share/applications
+      - install -Dm644 logo.svg /app/share/icons/hicolor/scalable/apps/top.dns7.feedstr.Feedstr.svg

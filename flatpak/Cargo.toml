@@ -1,0 +1,13 @@
+[package]
+name = "feedstr"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+dirs = "7.0.0"
+eframe = "0.37.0"
+feedstr-core = { path = "../core" }
+futures = "0.3.34"
+log = "0.4.34"
+rfd = "0.17"

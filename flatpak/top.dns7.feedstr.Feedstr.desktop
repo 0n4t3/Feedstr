@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Feedstr
+GenericName=Feed Reader
+Comment=Read your feeds, synced privately over Nostr
+Exec=feedstr
+Icon=top.dns7.feedstr.Feedstr
+Terminal=false
+Categories=Network;News;Feed;
+Keywords=RSS;Atom;Nostr;News;Feeds;
+StartupWMClass=top.dns7.feedstr.Feedstr

@@ -1,0 +1,16 @@
+[workspace]
+members = ["core", "droid", "flatpak", "web"]
+resolver = "3"
+
+# The Android app's library: about half the size of a plain release build
+# (link-time optimization across all crates, optimized for size, no symbols).
+[profile.android]
+inherits = "release"
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+strip = true
+
+# The web version's WebAssembly: the same trade-offs as on Android.
+[profile.web]
+inherits = "android"

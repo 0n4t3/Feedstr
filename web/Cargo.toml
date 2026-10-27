@@ -1,0 +1,44 @@
+[package]
+name = "feedstr-web"
+version = "0.1.0"
+edition = "2024"
+
+# Built with trunk (see index.html); natively this is an empty program.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+anyhow = "1.0.104"
+eframe = { version = "0.37.0", default-features = false, features = ["glow"] }
+feedstr-core = { path = "../core" }
+flate2 = "1.1.10"
+js-sys = "0.3"
+log = "0.4.34"
+# nostr reads the time through this, and in the browser it needs the clock supplied.
+universal-time = "0.3.1"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "Blob",
+    "BroadcastChannel",
+    "BlobPropertyBag",
+    "Document",
+    "Element",
+    "HtmlElement",
+    "Node",
+    "Event",
+    "File",
+    "FileList",
+    "HtmlAnchorElement",
+    "HtmlCanvasElement",
+    "HtmlInputElement",
+    "IdbDatabase",
+    "IdbFactory",
+    "IdbObjectStore",
+    "IdbOpenDbRequest",
+    "IdbRequest",
+    "IdbTransaction",
+    "IdbTransactionMode",
+    "Location",
+    "MessageEvent",
+    "Url",
+    "VisibilityState",
+    "Window",
+] }

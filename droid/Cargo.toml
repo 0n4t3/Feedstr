@@ -1,0 +1,19 @@
+[package]
+name = "feedstr-droid"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+# Loaded by Android as libfeedstr.so (see app/src/main/AndroidManifest.xml).
+name = "feedstr"
+crate-type = ["cdylib"]
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.15"
+anyhow = "1.0.104"
+eframe = { version = "0.37.0", default-features = false, features = ["android-native-activity", "glow"] }
+feedstr-core = { path = "../core" }
+futures = "0.3.34"
+jni = "0.22.4"
+log = "0.4.34"
+winit = { version = "0.30.13", default-features = false, features = ["android-native-activity"] }
