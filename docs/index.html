@@ -9,11 +9,14 @@
     <meta http-equiv="Content-Security-Policy"
           content="default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; connect-src 'self' https: wss: ws://localhost:* ws://127.0.0.1:*; img-src 'self' data:; frame-src nostr:; style-src 'self' 'unsafe-inline'">
     <title>Feedstr</title>
+    <!-- The same icon as the apps (logo.svg in the repository root). -->
+    
+    <link rel="icon" type="image/svg+xml" href="logo.svg">
     <!-- wasm-opt shrinks the WebAssembly further; the features listed are the ones Rust's wasm target uses. -->
     
 <script type="module">
-import init, * as bindings from '/feedstr-web-2b4104e681573be3.js';
-const wasm = await init({ module_or_path: '/feedstr-web-348ea371bc4b2b1e_bg.wasm' });
+import init, * as bindings from '/feedstr-web-e0f274a55568f904.js';
+const wasm = await init({ module_or_path: '/feedstr-web-208b2df62f263f1c_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -28,7 +31,7 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
         canvas { display: block; width: 100%; height: 100%; outline: none; }
         noscript { color: #888; font: 16px sans-serif; display: block; padding: 2em; }
     </style>
-<link rel="modulepreload" href="/feedstr-web-2b4104e681573be3.js" crossorigin="anonymous" integrity="sha384-dh6bHuz19DJsiLB/pyjKSg6p5IIvoB7UmMd8Iy/5zUWewDAoeVplz2KZLvqxtOH8"><link rel="preload" href="/feedstr-web-348ea371bc4b2b1e_bg.wasm" crossorigin="anonymous" integrity="sha384-xNVLu14J/XL1+xLEXU6Ya8IYUmihe+wg7P/6AG942PRmk+Z45JELuYAzC7sv/yki" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/feedstr-web-e0f274a55568f904.js" crossorigin="anonymous" integrity="sha384-Mctxl3jOn//u3lmRIVapqk/iuf+DqGNiA1oj8zTEg11H4vK48Uqdg80oz1H++y7s"><link rel="preload" href="/feedstr-web-208b2df62f263f1c_bg.wasm" crossorigin="anonymous" integrity="sha384-fRoDP6nVeK+qtl9TEAQWHS1+AQ4Q2r44UNrVAAVxZDb+6JI9IWD45SbUogcRLEbL" as="fetch" type="application/wasm"></head>
 <body>
     <canvas id="feedstr"></canvas>
     <noscript>Feedstr needs JavaScript and WebAssembly.</noscript>
