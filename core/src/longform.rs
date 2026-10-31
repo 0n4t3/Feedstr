@@ -110,6 +110,17 @@ impl Reader {
         feed
     }
 
+    /// Whether `user`'s Nostr follow list has anyone in it.
+    pub async fn follows_anyone(&self, user: PublicKey) -> bool {
+        let session = Session::new(&self.index).await;
+        let lists = session.query(&session.index, Filter::new().kind(Kind::ContactList).author(user)).await;
+        session.client.shutdown().await;
+        lists
+            .into_iter()
+            .max_by_key(|list| list.created_at)
+            .is_some_and(|list| list.tags.public_keys().next().is_some())
+    }
+
     /// Long-form posts by everyone `user` follows, newer than about the
     /// newest one stored (or from the last couple of months).
     pub async fn fetch_follows(&self, user: PublicKey, newest: Option<i64>) -> Result<Feed> {
@@ -385,6 +396,30 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert!(!connected());
+    }
+
+    #[tokio::test]
+    async fn knows_whether_someone_follows_anyone() {
+        let relay = nostr_sdk::local_relay::LocalRelay::new();
+        relay.run().await.unwrap();
+        let url = relay.url().await.to_string();
+        let publisher = Client::default();
+        publisher.add_relay(&url).await.unwrap();
+        publisher.connect().await;
+        let (follower, empty, nobody) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let list = |keys: &Keys, follows: Vec<PublicKey>| {
+            EventBuilder::new(Kind::ContactList, "")
+                .tags(follows.into_iter().map(Tag::public_key))
+                .finalize(keys)
+                .unwrap()
+        };
+        publisher.send_event(&list(&follower, vec![nobody.public_key()])).await.unwrap();
+        publisher.send_event(&list(&empty, Vec::new())).await.unwrap();
+        publisher.shutdown().await;
+        let reader = Reader { index: vec![url] };
+        assert!(reader.follows_anyone(follower.public_key()).await);
+        assert!(!reader.follows_anyone(empty.public_key()).await);
+        assert!(!reader.follows_anyone(nobody.public_key()).await);
     }
 
     /// Open TCP connections to or from a local port (Linux).

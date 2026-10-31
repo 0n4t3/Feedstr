@@ -75,6 +75,15 @@ CREATE TABLE IF NOT EXISTS sync_shadow (
     category TEXT NOT NULL DEFAULT '',
     category_t INTEGER NOT NULL DEFAULT 0
 );
+-- For items of those feeds: the synced read/favorite state, passed on as is.
+-- The state table keeps this device's own view, which isn't synced.
+CREATE TABLE IF NOT EXISTS state_shadow (
+    key TEXT PRIMARY KEY,
+    read INTEGER NOT NULL DEFAULT 0,
+    read_t INTEGER NOT NULL DEFAULT 0,
+    fav INTEGER NOT NULL DEFAULT 0,
+    fav_t INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS filters (
     id TEXT PRIMARY KEY,
     phrase TEXT NOT NULL,
@@ -105,7 +114,15 @@ const MIGRATIONS: &[&str] = &[
     // feed's history was read (the worker's NOSTR_FETCHED marker), so it's
     // read again once and the posts stored before get the formatting too.
     "UPDATE feeds SET etag = NULL WHERE etag = 'fetched';",
+    // Read/favorite state of Local Only feeds stops syncing: what was synced
+    // for them so far becomes their shadow (see `state_shadow`).
+    "INSERT OR IGNORE INTO state_shadow (key, read, read_t, fav, fav_t)
+     SELECT s.key, s.read, s.read_t, s.fav, s.fav_t FROM state s JOIN items i ON i.key = s.key
+     WHERE i.feed_url IN (SELECT url FROM sync_shadow);",
 ];
+
+/// SQL: keys of the items of feeds kept on this device (Local Only).
+const LOCAL_KEYS: &str = "(SELECT key FROM items WHERE feed_url IN (SELECT url FROM sync_shadow))";
 
 /// SQL expression: is the item `i` (left-joined with state `s`) shown? Word
 /// filters never hide favorites.
@@ -329,6 +346,17 @@ impl Db {
         Ok(())
     }
 
+    /// Whether this device knows anything about the feed: subscribed or not,
+    /// here or on another device.
+    pub fn feed_known(&self, url: &str) -> Result<bool> {
+        Ok(self.conn.query_row("SELECT count(*) FROM feeds WHERE url = ?1", [url], |r| r.get::<_, i64>(0))? > 0)
+    }
+
+    pub fn delete_meta(&self, key: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM meta WHERE key = ?1", [key])?;
+        Ok(())
+    }
+
     /// Forgets the account's data (settings like relays stay), and optionally how to sign in.
     pub fn wipe_account(&self, forget_login: bool) -> Result<()> {
         let login = if forget_login { ", 'login', 'sync_key', 'bunker_uri', 'bunker_app_key'" } else { "" };
@@ -348,7 +376,7 @@ impl Db {
         self.conn.execute_batch(&format!(
             "BEGIN;
              DELETE FROM feeds; DELETE FROM items; DELETE FROM state; DELETE FROM revs; DELETE FROM filters;
-             DELETE FROM local_categories; DELETE FROM sync_shadow;
+             DELETE FROM local_categories; DELETE FROM sync_shadow; DELETE FROM state_shadow;
              DELETE FROM relay_docs; DELETE FROM decrypted; DELETE FROM relays; {more}
              COMMIT;"
         ))?;
@@ -467,6 +495,14 @@ impl Db {
              ON CONFLICT (url) DO NOTHING",
             params![url, self.clock()?],
         )?;
+        // Its items' read/favorite state as synced so far is passed on from now
+        // on, while what this device does with them stays here.
+        self.conn.execute(
+            "INSERT OR IGNORE INTO state_shadow (key, read, read_t, fav, fav_t)
+             SELECT s.key, s.read, s.read_t, s.fav, s.fav_t FROM state s JOIN items i ON i.key = s.key
+             WHERE i.feed_url = ?1",
+            [url],
+        )?;
         bump(&self.conn, SUBSCRIPTIONS_REV)?;
         Ok(())
     }
@@ -483,6 +519,21 @@ impl Db {
         self.conn.execute("DELETE FROM sync_shadow WHERE url = ?1", [url])?;
         bump(&self.conn, SUBSCRIPTIONS_REV)?;
         bump(&self.conn, &items_rev(url))?;
+        // Read/favorite state: whatever changed last, here or elsewhere, wins,
+        // and this device's own state is shared again.
+        let mine = "key IN (SELECT key FROM items WHERE feed_url = ?1)";
+        let shadow = self
+            .read_state_rows(&format!("SELECT key, read, read_t, fav, fav_t FROM state_shadow WHERE {mine}"), [url])?;
+        self.conn.execute(&format!("DELETE FROM state_shadow WHERE {mine}"), [url])?;
+        self.merge_state_into(&shadow, false)?;
+        let keys: Vec<String> = self
+            .conn
+            .prepare(&format!("SELECT key FROM state WHERE {mine}"))?
+            .query_map([url], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        for shard in keys.iter().map(|key| docs::shard_of(key)).collect::<BTreeSet<_>>() {
+            bump(&self.conn, &state_rev(shard))?;
+        }
         Ok(())
     }
 
@@ -1107,22 +1158,32 @@ impl Db {
         Ok(Subscriptions { salt: self.salt()?, feeds, categories, filters, cache: self.cache_limits()?, erased_at })
     }
 
+    /// A synced state document. Items of Local Only feeds have their shadow
+    /// (what other devices said about them) instead of this device's state.
     pub fn state_doc(&self, shard: u8) -> Result<StateShard> {
         // A shard is made of the keys starting with these two hex digits.
         let prefixes: Vec<String> =
             (0..=255u8).filter(|b| b % docs::STATE_SHARDS == shard).map(|b| format!("'{b:02x}'")).collect();
-        self.read_state(&format!("substr(key, 1, 2) IN ({})", prefixes.join(",")))
+        let shard = format!("substr(key, 1, 2) IN ({})", prefixes.join(","));
+        self.read_state_rows(
+            &format!(
+                "SELECT key, read, read_t, fav, fav_t FROM state
+                 WHERE {shard} AND key NOT IN {LOCAL_KEYS} AND key NOT IN (SELECT key FROM state_shadow)
+                 UNION ALL
+                 SELECT key, read, read_t, fav, fav_t FROM state_shadow WHERE {shard}"
+            ),
+            (),
+        )
     }
 
-    /// All read/favorite state, for backups.
+    /// All of this device's read/favorite state, for backups.
     pub fn all_state(&self) -> Result<StateShard> {
-        self.read_state("1")
+        self.read_state_rows("SELECT key, read, read_t, fav, fav_t FROM state", ())
     }
 
-    fn read_state(&self, filter: &str) -> Result<StateShard> {
-        let sql = format!("SELECT key, read, read_t, fav, fav_t FROM state WHERE {filter}");
-        let mut stmt = self.conn.prepare(&sql)?;
-        let mut rows = stmt.query([])?;
+    fn read_state_rows(&self, sql: &str, params: impl rusqlite::Params) -> Result<StateShard> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut rows = stmt.query(params)?;
         let mut doc = StateShard::default();
         while let Some(r) = rows.next()? {
             let key: String = r.get(0)?;
@@ -1287,28 +1348,46 @@ impl Db {
         Ok(erased.is_some())
     }
 
+    /// Merges a synced state document. Items of Local Only feeds only get
+    /// their shadow updated: other devices' changes to them don't apply here.
     pub fn merge_state(&self, doc: &StateShard) -> Result<()> {
+        self.merge_state_into(doc, true)
+    }
+
+    /// Merges state from a backup: this device's own, Local Only feeds too.
+    pub fn import_state(&self, doc: &StateShard) -> Result<()> {
+        self.merge_state_into(doc, false)
+    }
+
+    fn merge_state_into(&self, doc: &StateShard, shadow_local: bool) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         for (key, state) in &doc.items {
+            let local =
+                shadow_local && tx.query_row(&format!("SELECT ?1 IN {LOCAL_KEYS}"), [key], |r| r.get::<_, bool>(0))?;
+            let table = if local { "state_shadow" } else { "state" };
             let (read, read_t) = state.r.as_ref().map_or((false, 0), |r| (r.0, r.1));
             let (fav, fav_t) = state.f.as_ref().map_or((false, 0), |f| (f.0, f.1));
             let old_fav: (i64, bool) = tx
-                .query_row("SELECT fav_t, fav FROM state WHERE key = ?1", [key], |r| Ok((r.get(0)?, r.get(1)?)))
+                .query_row(&format!("SELECT fav_t, fav FROM {table} WHERE key = ?1"), [key], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
                 .optional()?
                 .unwrap_or_default();
             let changed = tx.execute(
-                "INSERT INTO state (key, read, read_t, fav, fav_t) VALUES (?1, ?2, ?3, ?4, ?5)
+                &format!(
+                    "INSERT INTO {table} (key, read, read_t, fav, fav_t) VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT (key) DO UPDATE SET
                     read   = CASE WHEN (excluded.read_t, excluded.read) > (read_t, read) THEN excluded.read ELSE read END,
                     read_t = CASE WHEN (excluded.read_t, excluded.read) > (read_t, read) THEN excluded.read_t ELSE read_t END,
                     fav    = CASE WHEN (excluded.fav_t, excluded.fav) > (fav_t, fav) THEN excluded.fav ELSE fav END,
                     fav_t  = CASE WHEN (excluded.fav_t, excluded.fav) > (fav_t, fav) THEN excluded.fav_t ELSE fav_t END
-                 WHERE (excluded.read_t, excluded.read) > (read_t, read) OR (excluded.fav_t, excluded.fav) > (fav_t, fav)",
+                 WHERE (excluded.read_t, excluded.read) > (read_t, read) OR (excluded.fav_t, excluded.fav) > (fav_t, fav)"
+                ),
                 params![key, read, read_t, fav, fav_t],
             )?;
             if changed > 0 {
                 bump(&tx, &state_rev(docs::shard_of(key)))?;
-                if (fav_t, fav) > old_fav {
+                if !local && (fav_t, fav) > old_fav {
                     bump_feed_of(&tx, key)?;
                 }
             }
@@ -1646,10 +1725,12 @@ mod tests {
     fn nostr_history_is_read_again_once_for_markdown() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA).unwrap();
-        for migration in &MIGRATIONS[..MIGRATIONS.len() - 1] {
+        // A database from just before that migration.
+        let before = MIGRATIONS.iter().position(|m| m.contains("WHERE etag = 'fetched'")).unwrap();
+        for migration in &MIGRATIONS[..before] {
             conn.execute_batch(migration).unwrap();
         }
-        conn.execute_batch(&format!("PRAGMA user_version = {}", MIGRATIONS.len() - 1)).unwrap();
+        conn.execute_batch(&format!("PRAGMA user_version = {before}")).unwrap();
         conn.execute(
             "INSERT INTO feeds (url, etag) VALUES ('nostr:npub1x', 'fetched'), ('https://a.example/', 'abc')",
             [],

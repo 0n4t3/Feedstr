@@ -231,7 +231,7 @@ pub fn import_backup(db: &Db, json: &str) -> Result<BackupImport> {
     for (url, feed) in &backup.feeds {
         db.merge_feed_items(url, feed)?;
     }
-    db.merge_state(&backup.state)?;
+    db.import_state(&backup.state)?;
     let items = backup.feeds.values().map(|f| f.items.len()).sum();
     Ok(BackupImport { feeds: backup.subscriptions.feeds.values().filter(|s| s.0).count(), items })
 }

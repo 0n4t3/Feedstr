@@ -9,6 +9,9 @@
     <meta http-equiv="Content-Security-Policy"
           content="default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; connect-src 'self' https: wss: ws://localhost:* ws://127.0.0.1:*; img-src 'self' data:; frame-src nostr:; style-src 'self' 'unsafe-inline'">
     <title>Feedstr</title>
+    <!-- The same icon as the apps (logo.svg in the repository root). -->
+    <link data-trunk rel="copy-file" href="../logo.svg">
+    <link rel="icon" type="image/svg+xml" href="logo.svg">
     <!-- wasm-opt shrinks the WebAssembly further; the features listed are the ones Rust's wasm target uses. -->
     <link data-trunk rel="rust" data-cargo-profile="web" data-wasm-opt="z"
           data-wasm-opt-params="--enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals --enable-multivalue --enable-reference-types">

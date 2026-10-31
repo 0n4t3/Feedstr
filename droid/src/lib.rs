@@ -122,9 +122,12 @@ impl Droid {
                 log::error!("copying failed: {e:#}");
             }
         }
-        if ctx.egui_wants_keyboard_input() {
+        // Tapping the button takes the focus from the text field in the same
+        // frame as the tap, so it stays one frame longer than the editing.
+        let editing = ctx.egui_wants_keyboard_input();
+        if editing {
             self.editing = ctx.memory(|m| m.focused());
-        } else {
+        } else if self.editing.is_none() {
             return;
         }
         let paste = egui::Area::new(egui::Id::unique("paste"))
@@ -143,6 +146,8 @@ impl Droid {
                 ctx.memory_mut(|m| m.request_focus(id));
             }
             ctx.request_repaint();
+        } else if !editing {
+            self.editing = None;
         }
     }
 }

@@ -1343,6 +1343,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_state_of_local_groups_stays_on_the_device() {
+        let net = FakeNet::new(1);
+        let a = client_with_items();
+        a.set_category(FEED, "Mine").unwrap();
+        a.set_read(&[key(0)], true).unwrap();
+        sync_ok(&a, &net).await;
+        let b = Db::open_memory().unwrap();
+        sync_ok(&b, &net).await;
+        let synced = |db: &Db, i: usize| db.all_state().unwrap().items.get(&key(i)).cloned().unwrap_or_default();
+        assert_eq!(synced(&b, 0).r.map(|r| r.0), Some(true));
+
+        // Once the group is Local Only, reading and favoriting there stays on A...
+        a.set_category_synced("Mine", false).unwrap();
+        a.set_read(&[key(1)], true).unwrap();
+        a.set_fav(&key(2), true).unwrap();
+        sync_ok(&a, &net).await;
+        sync_ok(&b, &net).await;
+        assert!(synced(&b, 1).r.is_none() && synced(&b, 2).f.is_none());
+        // ...and what B does with those items doesn't change A.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        b.set_read(&[key(0)], false).unwrap();
+        sync_ok(&b, &net).await;
+        sync_ok(&a, &net).await;
+        assert!(read(&a, 0) && read(&a, 1) && fav(&a, 2));
+        // The devices pass the same things on, so nothing goes back and forth.
+        for db in [&a, &b, &a, &b] {
+            assert_eq!(sync_ok(db, &net).await.published, 0);
+        }
+
+        // Synced again: the newest change on either device wins.
+        a.set_category_synced("Mine", true).unwrap();
+        sync_at(&a, &net, PUSH, now_ms() + 4 * 3600 * 1000).await.unwrap();
+        sync_ok(&b, &net).await;
+        assert!(!read(&a, 0), "B's later change applies on A");
+        assert_eq!(synced(&b, 1).r.map(|r| r.0), Some(true));
+        assert_eq!(synced(&b, 2).f.map(|f| f.0), Some(true));
+        for db in [&a, &b, &a, &b] {
+            assert_eq!(sync_ok(db, &net).await.published, 0);
+        }
+    }
+
+    #[tokio::test]
     async fn changes_elsewhere_to_a_local_feed_dont_override_this_device() {
         let net = FakeNet::new(1);
         let a = client_with_items();

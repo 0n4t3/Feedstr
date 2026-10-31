@@ -14,6 +14,8 @@ use crate::worker::SignerApp;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 const BUNKER_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long a QR code sign-in waits for the signer app to connect.
+const QR_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Tags per NIP-09 deletion request.
 const DELETION_TAGS_PER_EVENT: usize = 100;
@@ -36,6 +38,23 @@ impl Signer {
     pub fn bunker(uri: &str, app_key: &Keys) -> Result<Self> {
         let uri = NostrConnectUri::parse(uri.trim()).context("not a valid bunker:// address")?;
         Ok(Signer::Bunker(Box::new(NostrConnect::new(uri, app_key.clone(), BUNKER_TIMEOUT, None)?)))
+    }
+
+    /// A remote signer that comes to us: its app scans the returned
+    /// `nostrconnect://` link (NIP-46) as a QR code, and answers on `relays`.
+    pub fn nostr_connect(app_key: &Keys, relays: &[String]) -> Result<(String, Self)> {
+        let relays = relays.iter().filter_map(|relay| RelayUrl::parse(relay).ok());
+        let uri = NostrConnectUri::client(app_key.public_key(), relays, "Feedstr");
+        let link = uri.to_string();
+        Ok((link, Signer::Bunker(Box::new(NostrConnect::new(uri, app_key.clone(), QR_TIMEOUT, None)?))))
+    }
+
+    /// For a remote signer: the `bunker://` link to connect to it again later.
+    pub async fn bunker_uri(&self) -> Option<String> {
+        match self {
+            Signer::Bunker(bunker) => bunker.bunker_uri().await.ok().map(|uri| uri.to_string()),
+            _ => None,
+        }
     }
 
     /// The browser's Nostr extension (NIP-07).
@@ -242,6 +261,35 @@ mod tests {
     use crate::sync::{Options, sync};
 
     const PUSH: Options = Options { publish: true, throttle_feed_caches: true };
+
+    #[tokio::test]
+    async fn signs_in_with_a_scanned_qr_code() {
+        use nostr_connect::prelude::{
+            NostrConnectKeys, NostrConnectRemoteSigner, NostrConnectRequest, NostrConnectSignerActions,
+        };
+
+        struct ApproveAll;
+        impl NostrConnectSignerActions for ApproveAll {
+            fn approve(&self, _: &PublicKey, _: &NostrConnectRequest) -> bool {
+                true
+            }
+        }
+
+        let relay = MockRelay::run().await.unwrap();
+        let (app_key, user) = (Keys::generate(), Keys::generate());
+        let (link, signer) = Signer::nostr_connect(&app_key, &[relay.url().await.to_string()]).unwrap();
+        assert!(link.starts_with("nostrconnect://") && link.contains("secret="));
+        // The signer app "scans" the link and answers.
+        let uri = NostrConnectUri::parse(&link).unwrap();
+        let remote =
+            NostrConnectRemoteSigner::from_uri(uri, NostrConnectKeys::new(Keys::generate(), user.clone()), None)
+                .unwrap();
+        tokio::spawn(async move { remote.serve(ApproveAll).await });
+        assert_eq!(signer.public_key().await.unwrap(), user.public_key());
+        let unsigned = EventBuilder::new(Kind::TextNote, "hi").finalize_unsigned(user.public_key());
+        assert!(signer.sign(unsigned).await.unwrap().verify().is_ok());
+        assert!(signer.bunker_uri().await.unwrap().starts_with("bunker://"));
+    }
 
     #[test]
     fn signer_app_answers_are_checked() {

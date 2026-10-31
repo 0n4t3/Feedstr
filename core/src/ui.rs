@@ -1,6 +1,7 @@
 //! The desktop interface.
 
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
@@ -82,12 +83,37 @@ enum Screen {
 
 /// `focus`: the dialog's text field still has to get the cursor (see [`focus_on_open`]).
 enum Dialog {
-    AddFeed { input: String, category: String, busy: bool, error: Option<String>, focus: bool },
-    RenameCategory { from: String, to: String },
-    NewCategory { url: String, name: String, focus: bool },
-    NewSyncKey { nsec: String },
+    AddFeed {
+        input: String,
+        category: String,
+        busy: bool,
+        error: Option<String>,
+        focus: bool,
+    },
+    RenameCategory {
+        from: String,
+        to: String,
+    },
+    NewCategory {
+        url: String,
+        name: String,
+        focus: bool,
+    },
+    NewSyncKey {
+        nsec: String,
+    },
     ConfirmSignOut,
-    ConfirmErase { understood: bool, busy: bool, error: Option<String> },
+    /// Marking every unread article in a view (matching a search) as read.
+    ConfirmMarkRead {
+        view: View,
+        search: String,
+        count: usize,
+    },
+    ConfirmErase {
+        understood: bool,
+        busy: bool,
+        error: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -154,11 +180,16 @@ struct LoginForm {
     /// On the web: don't keep anything in this browser after signing in
     /// ("Remember me" unticked).
     forget: bool,
+    /// While signing in with a QR code: the `nostrconnect://` link it shows.
+    connect_link: Option<String>,
 }
 
 pub struct App {
     db: Conn,
     tx: UnboundedSender<Cmd>,
+    /// Stops a QR code sign-in (not offered on phones).
+    #[cfg_attr(target_os = "android", allow(dead_code))]
+    cancel_connect: Arc<tokio::sync::Notify>,
     platform: Arc<dyn worker::Platform>,
     /// A signer app is installed (Android), so signing in with it is offered.
     has_signer_app: bool,
@@ -192,6 +223,12 @@ pub struct App {
     limit: usize,
     selected: Option<ItemRow>,
     blocks: Vec<Block>,
+    /// The article's title and text, for "Copy article".
+    article_text: String,
+    /// Heights of the article's blocks and of list rows, so off-screen ones
+    /// aren't laid out on every frame (long articles and lists scrolled slowly).
+    block_heights: RowHeights,
+    row_heights: RefCell<RowHeights>,
     /// Set when the selection moved by keyboard, so the list follows it.
     scroll_to_selected: bool,
     layout: ListLayout,
@@ -214,7 +251,8 @@ impl App {
     /// The app, keeping its data in `store`, with what differs between platforms in `platform`.
     pub fn new(cc: &eframe::CreationContext, store: Store, platform: Arc<dyn worker::Platform>) -> Result<Self> {
         let db = db::connect(&store)?;
-        let worker::Handle { tx, rx, closing } = worker::spawn(&store, cc.egui_ctx.clone(), platform.clone())?;
+        let worker::Handle { tx, rx, closing, cancel_connect } =
+            worker::spawn(&store, cc.egui_ctx.clone(), platform.clone())?;
         setup_style(&cc.egui_ctx);
         let theme = match db.meta("theme")?.as_deref() {
             Some("light") => ThemePreference::Light,
@@ -222,6 +260,9 @@ impl App {
             _ => ThemePreference::System,
         };
         cc.egui_ctx.set_theme(theme);
+        cc.egui_ctx.add_plugin(SelectedText::default());
+        // A notch of the mouse wheel moves the text further than egui does by default.
+        cc.egui_ctx.options_mut(|o| o.input_options.line_scroll_speed *= 1.5);
         let zoom = db.meta("zoom")?.and_then(|z| z.parse().ok()).unwrap_or(1.0);
         cc.egui_ctx.set_zoom_factor(zoom);
         let layout = ListLayout::from_key(&db.meta("layout")?.unwrap_or_default());
@@ -234,6 +275,7 @@ impl App {
         let mut app = Self {
             db,
             tx,
+            cancel_connect,
             has_signer_app: platform.signer_app().is_some(),
             platform,
             closing,
@@ -258,6 +300,9 @@ impl App {
             limit: ITEMS_PAGE,
             selected: None,
             blocks: Vec::new(),
+            article_text: String::new(),
+            block_heights: RowHeights::default(),
+            row_heights: RefCell::default(),
             scroll_to_selected: false,
             layout,
             reading: false,
@@ -346,9 +391,12 @@ impl App {
                     self.login = LoginForm::default();
                     self.reload();
                 }
+                Msg::ConnectLink(link) => self.login.connect_link = Some(link),
                 Msg::LoginFailed(error) if self.screen == Screen::Login => {
                     self.login.busy = false;
-                    self.login.error = Some(error);
+                    // Cancelling a QR code sign-in isn't a problem worth showing.
+                    let cancelled = self.login.connect_link.take().is_some() && error == "cancelled";
+                    self.login.error = (!cancelled).then_some(error);
                 }
                 Msg::LoginFailed(error) => {
                     self.status = "Not signed in".into();
@@ -419,6 +467,9 @@ impl App {
 
     fn select(&mut self, item: ItemRow) {
         self.blocks = html::to_blocks(&self.db.item_content(&item.key).unwrap_or_default());
+        self.block_heights = RowHeights::default();
+        let texts = self.blocks.iter().map(Block::text).filter(|text| !text.is_empty());
+        self.article_text = std::iter::once(item_title(&item.title)).chain(texts).collect::<Vec<_>>().join("\n\n");
         if item.unread {
             self.set_read(&item.key, true);
         }
@@ -460,10 +511,20 @@ impl App {
         self.items = self.db.items_matching(&self.view, self.unread_only, &self.search, self.limit).unwrap_or_default();
     }
 
-    fn mark_view_read(&mut self, view: View) {
-        let keys = self.db.unread_keys(&view, "").unwrap_or_default();
-        if self.db.set_read(&keys, true).is_ok() {
-            self.reload();
+    /// Asks before marking every unread article in `view` (matching `search`) as read.
+    fn confirm_mark_read(&mut self, view: View, search: &str) {
+        let count = self.db.unread_keys(&view, search).map_or(0, |keys| keys.len());
+        if count > 0 {
+            self.dialog = Some(Dialog::ConfirmMarkRead { view, search: search.to_string(), count });
+        }
+    }
+
+    fn view_title(&self, view: &View) -> String {
+        match view {
+            View::All => "All items".to_string(),
+            View::Favorites => "Favorites".to_string(),
+            View::Feed(url) => self.feeds.iter().find(|f| &f.url == url).map_or(url.clone(), |f| f.title.clone()),
+            View::Category(name) | View::Person(name) => name.clone(),
         }
     }
 
@@ -534,6 +595,29 @@ impl App {
                         ui.add_enabled(enabled, edit.desired_width(f32::INFINITY));
                         if ui.add_enabled(enabled, wide(primary_button("Connect"), ui)).clicked() {
                             self.sign_in(Login::Bunker(self.login.bunker.clone()));
+                        }
+                        // On a computer, the signer app on a phone can scan a code instead.
+                        #[cfg(not(target_os = "android"))]
+                        match self.login.connect_link.clone() {
+                            Some(link) if self.login.busy => {
+                                ui.add_space(8.0);
+                                let hint = "Scan this with your Nostr signer app (Amber, nsec.app, …)";
+                                ui.label(RichText::new(hint).small());
+                                qr_code(ui, &link);
+                                ui.horizontal(|ui| {
+                                    if ui.button("Copy link").clicked() {
+                                        ui.ctx().copy_text(link.clone());
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        self.cancel_connect.notify_waiters();
+                                    }
+                                });
+                            }
+                            _ => {
+                                if ui.add_enabled(enabled, wide(Button::new("Sign in with a QR code"), ui)).clicked() {
+                                    self.sign_in(Login::QrCode);
+                                }
+                            }
                         }
                     });
                     #[cfg(target_arch = "wasm32")]
@@ -698,7 +782,7 @@ impl App {
         });
         match action {
             Some(FeedAction::Show(view)) => self.set_view(view),
-            Some(FeedAction::MarkRead(view)) => self.mark_view_read(view),
+            Some(FeedAction::MarkRead(view)) => self.confirm_mark_read(view, ""),
             Some(FeedAction::Fold(category)) => {
                 if !self.collapsed.remove(&category) {
                     self.collapsed.insert(category);
@@ -737,23 +821,14 @@ impl App {
     fn item_list(&mut self, ui: &mut Ui) {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            let title = match &self.view {
-                View::All => "All items".to_string(),
-                View::Favorites => "Favorites".to_string(),
-                View::Feed(url) => self.feeds.iter().find(|f| &f.url == url).map_or(url.clone(), |f| f.title.clone()),
-                View::Category(name) => name.clone(),
-                View::Person(name) => name.clone(),
-            };
+            let title = self.view_title(&self.view);
             ui.add(Label::new(RichText::new(title).size(16.0).strong()).truncate());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let any_unread = self.items.iter().any(|i| i.unread);
                 let mark = ui.add_enabled(any_unread, Button::new("✔").frame_when_inactive(false));
                 // Every unread article in the view (matching the search), not just those listed.
-                if mark.on_hover_text("Mark all as read").clicked()
-                    && let Ok(keys) = self.db.unread_keys(&self.view, &self.search)
-                    && self.db.set_read(&keys, true).is_ok()
-                {
-                    self.reload();
+                if mark.on_hover_text("Mark all as read").clicked() {
+                    self.confirm_mark_read(self.view.clone(), &self.search.clone());
                 }
                 if ui.toggle_value(&mut self.unread_only, "Unread").changed() {
                     self.limit = ITEMS_PAGE;
@@ -829,21 +904,25 @@ impl App {
         self.selected.as_ref().is_some_and(|s| s.key == item.key)
     }
 
-    /// Rows of varying height (titles wrap), so all of them are laid out.
+    /// Rows of varying height (titles wrap); only the visible ones are laid out.
     /// Returns the clicked article, and whether the end of the list is in view.
     fn standard_list(&self, ui: &mut Ui) -> (Option<ItemRow>, bool) {
         let (mut clicked, mut at_end) = (None, false);
+        let heights = &mut *self.row_heights.borrow_mut();
         ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            heights.check_width(ui.available_width());
             for item in &self.items {
                 let selected = self.is_selected(item);
-                let response = item_row(ui, item, selected);
-                if selected && self.scroll_to_selected {
-                    response.scroll_to_me(None);
-                }
-                if response.clicked() {
-                    clicked = Some(item.clone());
-                }
-                at_end = ui.is_rect_visible(response.rect);
+                let follow = selected && self.scroll_to_selected;
+                at_end = heights.row(ui, &item.key, 72.0, follow, |ui| {
+                    let response = item_row(ui, item, selected);
+                    if follow {
+                        response.scroll_to_me(None);
+                    }
+                    if response.clicked() {
+                        clicked = Some(item.clone());
+                    }
+                });
             }
         });
         (clicked, at_end)
@@ -928,7 +1007,9 @@ impl App {
                     meta.push(format_date(item.published, true));
                     ui.label(RichText::new(meta.join("  ·  ")).weak());
                     ui.add_space(6.0);
-                    ui.add(Label::new(RichText::new(item_title(&item.title)).size(26.0).strong()).wrap());
+                    let title = item_title(&item.title);
+                    ui.add(Label::new(RichText::new(&title).size(26.0).strong()).wrap())
+                        .context_menu(|ui| copy_menu(ui, &title, &self.article_text, None));
                     ui.add_space(10.0);
                     // Wrapped, so the buttons fit on a phone too.
                     ui.horizontal_wrapped(|ui| {
@@ -956,8 +1037,10 @@ impl App {
                     ui.add_space(14.0);
                     ui.separator();
                     ui.add_space(14.0);
-                    for block in &self.blocks {
-                        show_block(ui, block);
+                    self.block_heights.check_width(ui.available_width());
+                    for (i, block) in self.blocks.iter().enumerate() {
+                        let article = &self.article_text;
+                        self.block_heights.row(ui, &i.to_string(), 40.0, false, |ui| show_block(ui, block, article));
                     }
                     ui.add_space(40.0);
                 });
@@ -1133,6 +1216,29 @@ impl App {
                         if *busy {
                             ui.spinner();
                             ui.label(RichText::new(&self.status).weak());
+                        }
+                    });
+                }
+                Dialog::ConfirmMarkRead { view, search, count } => {
+                    let articles = if *count == 1 { "1 article".to_string() } else { format!("{count} articles") };
+                    ui.label(RichText::new(format!("Mark {articles} as read?")).size(18.0).strong());
+                    let mut text = format!("Every unread article in “{}”", self.view_title(view));
+                    if !search.trim().is_empty() {
+                        text.push_str(&format!(" matching “{}”", search.trim()));
+                    }
+                    text.push_str(" is marked as read.");
+                    ui.add(Label::new(text).wrap());
+                    ui.add_space(8.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.add(primary_button("Mark as read")).clicked() {
+                            let keys = self.db.unread_keys(view, search).unwrap_or_default();
+                            if self.db.set_read(&keys, true).is_ok() {
+                                self.reload();
+                            }
+                            open = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            open = false;
                         }
                     });
                 }
@@ -1610,10 +1716,15 @@ impl App {
                 changed = true;
             }
         });
+        if worker::custom_relays(&self.db) && ui.button("Use the default relays").clicked() {
+            relays = worker::DEFAULT_RELAYS.iter().map(|r| r.to_string()).collect();
+            changed = true;
+        }
         if changed {
-            let _ = self.db.set_meta("relays", &relays.join("\n"));
+            let _ = worker::set_relays(&self.db, &relays);
             self.send(Cmd::RelaysChanged);
         }
+        hint(ui, "Unless you change them, Feedstr uses its default relays, and updates to Feedstr can change those.");
 
         ui.add_space(12.0);
         let categories = self.categories.clone();
@@ -1630,8 +1741,8 @@ impl App {
             }
             hint(
                 ui,
-                "A Local Only group stays on this device: your other devices remove its feeds, and its \
-                 articles aren't cached on relays. Read/unread state still syncs.",
+                "A Local Only group stays on this device: your other devices remove its feeds, its articles \
+                 aren't cached on relays, and what you read or star in it isn't synced.",
             );
             ui.add_space(12.0);
         }
@@ -1651,7 +1762,7 @@ impl App {
         hint(
             ui,
             "Shared by all your devices. Clients that can't fetch feeds themselves, like the web version, only see \
-             this cache. Favorites are always included. Each feed's cache is also limited to about 40 KB.",
+             this cache. Favorites are always included.",
         );
 
         ui.add_space(12.0);
@@ -1753,7 +1864,7 @@ fn follows_group(
             if ui.button("Mark all as read").clicked() {
                 *action = Some(FeedAction::MarkRead(view));
             }
-            if ui.button("Turn off").on_hover_text("Settings › Nostr turns it on again").clicked() {
+            if ui.button("Turn off").on_hover_text("Settings › Socials turns it on again").clicked() {
                 *action = Some(FeedAction::Unsubscribe(feed.url.clone()));
             }
         });
@@ -2115,7 +2226,8 @@ fn item_card(ui: &mut Ui, item: &ItemRow, selected: bool, size: Vec2, compact: b
     response
 }
 
-fn show_block(ui: &mut Ui, block: &Block) {
+fn show_block(ui: &mut Ui, block: &Block, article: &str) {
+    let text = block.text();
     let size = match block.style {
         Style::Heading(1) => 23.0,
         Style::Heading(2) => 20.0,
@@ -2139,9 +2251,10 @@ fn show_block(ui: &mut Ui, block: &Block) {
                     ui.separator();
                 }
                 Style::Code => {
-                    ui.add(Label::new(RichText::new(block.text()).monospace()).wrap());
+                    ui.add(Label::new(RichText::new(&text).monospace()).wrap())
+                        .context_menu(|ui| copy_menu(ui, &text, article, None));
                 }
-                _ => show_spans(ui, &block.spans, size, block.style),
+                _ => show_spans(ui, &block.spans, size, block.style, |ui, link| copy_menu(ui, &text, article, link)),
             });
         });
     };
@@ -2164,8 +2277,9 @@ fn show_block(ui: &mut Ui, block: &Block) {
 }
 
 /// Styled runs of text flowing as one paragraph; links open in the browser.
-/// Headings are strong throughout, quotes in italics.
-fn show_spans(ui: &mut Ui, spans: &[html::Span], size: f32, style: Style) {
+/// Headings are strong throughout, quotes in italics. `menu` is shown on a
+/// right-click or long press, with the link pressed, if any.
+fn show_spans(ui: &mut Ui, spans: &[html::Span], size: f32, style: Style, menu: impl Fn(&mut Ui, Option<&str>)) {
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         for span in spans {
@@ -2182,16 +2296,17 @@ fn show_spans(ui: &mut Ui, spans: &[html::Span], size: f32, style: Style) {
             if span.strike {
                 text = text.strikethrough();
             }
-            match &span.link {
+            let response = match &span.link {
                 Some(url) => {
-                    if ui.link(text).on_hover_text(url).clicked() {
+                    let response = ui.link(text).on_hover_text(url);
+                    if response.clicked() {
                         ui.ctx().open_url(OpenUrl::new_tab(url));
                     }
+                    response
                 }
-                None => {
-                    ui.add(Label::new(text).wrap());
-                }
-            }
+                None => ui.add(Label::new(text).wrap()),
+            };
+            response.context_menu(|ui| menu(ui, span.link.as_deref()));
         }
     });
 }
@@ -2209,6 +2324,131 @@ fn focus_on_open(response: &Response, focus: &mut bool) {
         *focus = false;
     } else {
         response.request_focus();
+    }
+}
+
+/// A QR code of `text`, in black on white whatever the theme, as scanners expect.
+#[cfg(not(target_os = "android"))]
+fn qr_code(ui: &mut Ui, text: &str) {
+    use qrcodegen::{QrCode, QrCodeEcc};
+    let Ok(qr) = QrCode::encode_text(text, QrCodeEcc::Medium) else {
+        ui.label("The link is too long for a QR code: use Copy link.");
+        return;
+    };
+    // Modules of whole pixels, and the blank border scanners need around them.
+    const BORDER: i32 = 4;
+    let modules = qr.size() + 2 * BORDER;
+    let ppp = ui.ctx().pixels_per_point();
+    let module = ((240.0_f32.min(ui.available_width()) * ppp / modules as f32).floor() / ppp).max(1.0 / ppp);
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(module * modules as f32), Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 0, Color32::WHITE);
+    for y in 0..qr.size() {
+        for x in 0..qr.size() {
+            if qr.get_module(x, y) {
+                let min = rect.min + vec2((x + BORDER) as f32, (y + BORDER) as f32) * module;
+                painter.rect_filled(Rect::from_min_size(min, Vec2::splat(module)), 0, Color32::BLACK);
+            }
+        }
+    }
+}
+
+/// The menu on article text, opened with a right-click (or a long press on a
+/// touch screen, where text can't be selected by dragging).
+fn copy_menu(ui: &mut Ui, paragraph: &str, article: &str, link: Option<&str>) {
+    let selection = ui.ctx().plugin::<SelectedText>().lock().at_menu.clone();
+    let mut copy = None;
+    if let Some(selection) = selection
+        && ui.button("Copy").clicked()
+    {
+        copy = Some(selection);
+    }
+    if ui.button("Copy paragraph").clicked() {
+        copy = Some(paragraph.to_string());
+    }
+    if ui.button("Copy article").clicked() {
+        copy = Some(article.to_string());
+    }
+    if let Some(link) = link {
+        if ui.button("Copy link address").clicked() {
+            copy = Some(link.to_string());
+        }
+        if ui.button("Open link").clicked() {
+            ui.ctx().open_url(OpenUrl::new_tab(link));
+        }
+    }
+    if let Some(text) = copy {
+        ui.ctx().copy_text(text);
+    }
+}
+
+/// Keeps the text selected in an article when its menu is opened with a
+/// right-click: egui drops the selection as soon as a menu item is pressed.
+/// Registered after egui's own text selection, so it sees what it reported.
+#[derive(Default)]
+struct SelectedText {
+    /// The selection as egui last reported it.
+    settled: String,
+    /// What was selected when the menu was opened, if anything.
+    at_menu: Option<String>,
+}
+
+impl egui::Plugin for SelectedText {
+    fn debug_name(&self) -> &'static str {
+        "SelectedText"
+    }
+
+    fn on_end_pass(&mut self, ui: &mut Ui) {
+        let ctx = ui.ctx();
+        ctx.output(|o| {
+            for command in &o.commands {
+                if let egui::OutputCommand::TextSelectionSettled(text) = command {
+                    self.settled = text.clone();
+                }
+            }
+        });
+        if ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary)) {
+            let selected = ctx.plugin::<egui::text_selection::LabelSelectionState>().lock().has_selection();
+            self.at_menu = selected.then(|| self.settled.clone()).filter(|text| !text.is_empty());
+        }
+    }
+}
+
+/// Heights of rows last laid out (each with the spacing after it), so rows
+/// out of view can be skipped: they're just empty space of that height.
+#[derive(Default)]
+struct RowHeights {
+    width: f32,
+    heights: HashMap<String, f32>,
+}
+
+impl RowHeights {
+    /// Heights are only right for the width they were measured at.
+    fn check_width(&mut self, width: f32) {
+        if (width - self.width).abs() > 0.5 {
+            self.width = width;
+            self.heights.clear();
+        }
+    }
+
+    /// Shows a row with `show` if it's in view (or `always`), otherwise
+    /// leaves room for it: its measured height, or `estimate` if it was never
+    /// shown. Returns whether it's in view.
+    fn row(&mut self, ui: &mut Ui, key: &str, estimate: f32, always: bool, show: impl FnOnce(&mut Ui)) -> bool {
+        let top = ui.cursor().top();
+        let known = self.heights.get(key).copied();
+        let rect = Rect::from_min_size(
+            egui::pos2(ui.cursor().left(), top),
+            vec2(ui.available_width(), known.unwrap_or(estimate)),
+        );
+        let visible = ui.is_rect_visible(rect);
+        if !visible && !always {
+            ui.add_space(rect.height());
+            return false;
+        }
+        show(ui);
+        self.heights.insert(key.to_string(), ui.cursor().top() - top);
+        visible
     }
 }
 

@@ -22,7 +22,8 @@ use crate::db::{self, Conn, Db, Store};
 use crate::feeds::{self, Fetched};
 use crate::import_export;
 use crate::longform;
-use crate::nostr::{DEFAULT_RELAYS, NostrTransport, Signer};
+pub use crate::nostr::DEFAULT_RELAYS;
+use crate::nostr::{NostrTransport, Signer};
 use crate::sync::{self, Options, Transport};
 
 /// Feeds downloaded at once, and at most this many from the same site.
@@ -145,6 +146,9 @@ pub trait SignerApp: Send + Sync {
 pub enum Login {
     SyncKey(String),
     Bunker(String),
+    /// A remote signer scanning a QR code (`nostrconnect://`, NIP-46); not offered on phones.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
+    QrCode,
     /// A Nostr browser extension (NIP-07), on the web.
     #[cfg(target_arch = "wasm32")]
     Extension,
@@ -189,6 +193,8 @@ pub enum Msg {
     LoggedIn {
         npub: String,
     },
+    /// The `nostrconnect://` link to show as a QR code while signing in.
+    ConnectLink(String),
     LoginFailed(String),
     LoggedOut,
     /// Signing out was refused because changes couldn't be saved to relays.
@@ -204,6 +210,8 @@ pub enum Msg {
     ExitReady,
 }
 
+/// The relays this device uses: the user's own list once they've changed it,
+/// otherwise this version's defaults (so new defaults in an update apply).
 pub fn relays(db: &Db) -> Vec<String> {
     let mut relays: Vec<String> = match db.meta("relays").ok().flatten() {
         Some(list) => list.lines().map(String::from).collect(),
@@ -213,6 +221,19 @@ pub fn relays(db: &Db) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     relays.retain(|relay| seen.insert(parse_relay(relay).unwrap_or_else(|| relay.clone())));
     relays
+}
+
+/// Whether the user has their own relay list instead of the defaults.
+pub fn custom_relays(db: &Db) -> bool {
+    db.meta("relays").ok().flatten().is_some()
+}
+
+/// Saves the user's relay list. If it's just the defaults, the device goes
+/// back to following the defaults, so later versions can change them.
+pub fn set_relays(db: &Db, relays: &[String]) -> Result<()> {
+    let set = |list: &[String]| list.iter().filter_map(|r| parse_relay(r)).collect::<std::collections::BTreeSet<_>>();
+    let defaults: Vec<String> = DEFAULT_RELAYS.iter().map(|r| r.to_string()).collect();
+    if set(relays) == set(&defaults) { db.delete_meta("relays") } else { db.set_meta("relays", &relays.join("\n")) }
 }
 
 /// A relay address as typed, cleaned up (`wss://relay.example`), or `None` if
@@ -235,6 +256,8 @@ pub struct Handle {
     pub tx: UnboundedSender<Cmd>,
     pub rx: mpsc::Receiver<Msg>,
     pub closing: watch::Sender<bool>,
+    /// Stops waiting for a QR code sign-in.
+    pub cancel_connect: Arc<tokio::sync::Notify>,
 }
 
 /// Tells the worker about the app's life cycle from any thread (say, Android's).
@@ -261,7 +284,9 @@ pub fn spawn(store: &Store, ctx: eframe::egui::Context, platform: Arc<dyn Platfo
     let (cmd_tx, cmd_rx) = unbounded_channel();
     let (msg_tx, msg_rx) = mpsc::channel();
     let (closing_tx, closing) = watch::channel(false);
-    let worker = Worker::new(db::connect(store)?, msg_tx, ctx, closing, platform);
+    let cancel_connect = Arc::new(tokio::sync::Notify::new());
+    let mut worker = Worker::new(db::connect(store)?, msg_tx, ctx, closing, platform);
+    worker.cancel_connect = cancel_connect.clone();
     #[cfg(not(target_arch = "wasm32"))]
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -269,7 +294,7 @@ pub fn spawn(store: &Store, ctx: eframe::egui::Context, platform: Arc<dyn Platfo
     });
     #[cfg(target_arch = "wasm32")]
     wasm_bindgen_futures::spawn_local(worker.run(cmd_rx));
-    Ok(Handle { tx: cmd_tx, rx: msg_rx, closing: closing_tx })
+    Ok(Handle { tx: cmd_tx, rx: msg_rx, closing: closing_tx, cancel_connect })
 }
 
 struct Worker {
@@ -283,6 +308,7 @@ struct Worker {
     /// Becomes true when the app is closing.
     closing: watch::Receiver<bool>,
     platform: Arc<dyn Platform>,
+    cancel_connect: Arc<tokio::sync::Notify>,
 }
 
 impl Worker {
@@ -294,7 +320,8 @@ impl Worker {
         platform: Arc<dyn Platform>,
     ) -> Self {
         let reader = tokio::sync::Mutex::default();
-        Worker { db, http: feeds::http_client(), nostr: None, reader, msg_tx, ctx, closing, platform }
+        let cancel_connect = Arc::default();
+        Worker { db, http: feeds::http_client(), nostr: None, reader, msg_tx, ctx, closing, platform, cancel_connect }
     }
 
     fn send(&self, msg: Msg) {
@@ -316,13 +343,16 @@ impl Worker {
                 cmd = rx.recv() => {
                     let Some(cmd) = cmd else { break };
                     match cmd {
-                        Cmd::Login(login) => match self.login_with_retries(login).await {
-                            Ok(npub) => {
+                        Cmd::Login(login) => match (matches!(login, Login::Saved), self.login_with_retries(login).await) {
+                            (saved, Ok(npub)) => {
                                 self.send(Msg::LoggedIn { npub });
+                                if !saved {
+                                    self.follows_by_default().await;
+                                }
                                 self.cycle(false).await;
                                 next_cycle = self.next_cycle();
                             }
-                            Err(e) => self.send(Msg::LoginFailed(format!("{e:#}"))),
+                            (_, Err(e)) => self.send(Msg::LoginFailed(format!("{e:#}"))),
                         },
                         Cmd::Logout { force } => self.logout(force).await,
                         Cmd::SyncNow => {
@@ -466,6 +496,22 @@ impl Worker {
                 self.db.set_meta("bunker_uri", uri.trim())?;
                 signer
             }
+            Login::QrCode => {
+                let (link, signer) = Signer::nostr_connect(&self.bunker_app_key()?, &relays(&self.db))?;
+                self.send(Msg::ConnectLink(link));
+                self.status("Waiting for your signer app…");
+                tokio::select! {
+                    key = signer.public_key() => {
+                        key.context("the signer app didn't connect")?;
+                    }
+                    () = self.cancel_connect.notified() => bail!("cancelled"),
+                }
+                // From now on it's a remote signer like any other.
+                let uri = signer.bunker_uri().await.context("the signer app didn't say how to reach it")?;
+                self.db.set_meta("login", "bunker")?;
+                self.db.set_meta("bunker_uri", &uri)?;
+                signer
+            }
             #[cfg(target_arch = "wasm32")]
             Login::Extension => {
                 self.status("Waiting for the browser extension…");
@@ -594,7 +640,10 @@ impl Worker {
             return match self.fetch_longform(url, fetched_before).await {
                 Ok(feed) => {
                     self.db.store_fetched(url, &feed.title, &feed.site, &feed.items)?;
-                    let done = FetchInfo { etag: Some(NOSTR_FETCHED.into()), last_modified: None };
+                    // Finding nothing may only mean the relays were slow to answer:
+                    // the history isn't counted as read until posts come back.
+                    let fetched = fetched_before || !feed.items.is_empty();
+                    let done = FetchInfo { etag: fetched.then(|| NOSTR_FETCHED.into()), last_modified: None };
                     self.db.set_fetch_result(url, &done, None)
                 }
                 Err(e) => {
@@ -620,13 +669,7 @@ impl Worker {
     /// A Nostr feed: one person's long-form posts, or everyone the user follows.
     /// `fetched_before`: this device read the feed in full already, so only newer posts are asked for.
     async fn fetch_longform(&self, url: &str, fetched_before: bool) -> Result<feeds::Feed> {
-        let reader = {
-            let mut reader = self.reader.lock().await;
-            if reader.is_none() {
-                *reader = Some(Arc::new(longform::Reader::new(relays(&self.db))));
-            }
-            reader.clone().expect("just made")
-        };
+        let reader = self.reader().await;
         let newest = if fetched_before { self.db.newest_published(url)? } else { None };
         if url == longform::FOLLOWS_URL {
             let user =
@@ -635,6 +678,29 @@ impl Worker {
         } else {
             let author = longform::parse_author(url).context("not a Nostr address")?;
             reader.fetch_author(author, newest).await
+        }
+    }
+
+    /// The reader of public Nostr posts, made when first needed.
+    async fn reader(&self) -> Arc<longform::Reader> {
+        let mut reader = self.reader.lock().await;
+        reader.get_or_insert_with(|| Arc::new(longform::Reader::new(relays(&self.db)))).clone()
+    }
+
+    /// At a fresh sign-in: turns on the follows feed if the account follows
+    /// anyone on Nostr, unless one of the user's devices already turned it on
+    /// or off. That's only known after reading the relays, so nothing happens
+    /// if none of them answers.
+    async fn follows_by_default(&self) {
+        let downloaded = self.sync(Options { publish: false, throttle_feed_caches: false }).await.saved;
+        let untouched = self.db.feed_known(longform::FOLLOWS_URL).is_ok_and(|known| !known);
+        let Some(user) = self.nostr.as_ref().map(|n| n.pubkey()) else { return };
+        if !downloaded || !untouched || !self.reader().await.follows_anyone(user).await {
+            return;
+        }
+        if self.db.set_subscribed(longform::FOLLOWS_URL, true).is_ok() {
+            let _ = self.db.set_title_if_empty(longform::FOLLOWS_URL, longform::FOLLOWS_TITLE);
+            self.send(Msg::Changed);
         }
     }
 
@@ -777,6 +843,24 @@ mod tests {
         let db = Db::open_memory().unwrap();
         db.set_meta("relays", "wss://nos.lol\nwss://nos.lol/\nwss://nostr.mom").unwrap();
         assert_eq!(relays(&db), ["wss://nos.lol", "wss://nostr.mom"]);
+    }
+
+    #[test]
+    fn untouched_relays_follow_the_defaults() {
+        let db = Db::open_memory().unwrap();
+        let defaults: Vec<String> = DEFAULT_RELAYS.iter().map(|r| r.to_string()).collect();
+        assert_eq!(relays(&db), defaults);
+        assert!(!custom_relays(&db));
+        // A list of their own is kept as it is...
+        set_relays(&db, &["wss://relay.example".to_string()]).unwrap();
+        assert!(custom_relays(&db));
+        assert_eq!(relays(&db), ["wss://relay.example"]);
+        // ...and going back to the defaults (in any order) follows them again.
+        let mut back = defaults.clone();
+        back.reverse();
+        set_relays(&db, &back).unwrap();
+        assert!(!custom_relays(&db));
+        assert_eq!(relays(&db), defaults);
     }
 
     #[tokio::test]
