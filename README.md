@@ -5,7 +5,7 @@
 Feedstr was born out of the highly personalized annoyance of wanting private RSS feed sync, but not wanting to host my own FreshRSS instance (the only publicly accessible service on my home server right now). Feedstr attempts to solve that, syncing feeds, read/unread status, and favorites using the decentralized Nostr protocol - relying on either community relays (default), or a multi purpose self hosted relay.
 
 #### Features
-* Zero tracking, no outgoing connections ever aside from fetching feeds and optional sync
+* Zero tracking, no outgoing connections ever aside from fetching feeds and sync
 * E2E Encrypted sync, no need to trust a community relay
 * Linux (flatpak), Android, and Web support
 * Lightweight multi purpose server - a Nostr relay can do quite a bit more than just sync feeds
