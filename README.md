@@ -24,6 +24,7 @@ Feedstr was born out of the highly personalized annoyance of wanting private RSS
 * Tor & I2P feed support (likely desktop only)
 * Feed subgroups
 * Automatic YouTube RSS feed extraction from channel links
+* TTS Narration Support
 
 ## Installation
 coming soon
