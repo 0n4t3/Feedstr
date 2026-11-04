@@ -8,8 +8,9 @@ use std::time::Duration;
 use anyhow::Result;
 use eframe::egui::{
     self, Align, Button, CentralPanel, Color32, ComboBox, CornerRadius, DragValue, FontId, Frame, Galley, Id, Key,
-    Label, Layout, Margin, Modal, OpenUrl, Painter, Panel, Rect, Response, RichText, ScrollArea, Sense, Shape, Stroke,
-    StrokeKind, TextEdit, TextStyle, Theme, ThemePreference, Ui, Vec2, ViewportCommand, pos2, text::LayoutJob, vec2,
+    Label, Layout, Margin, Modal, OpenUrl, Painter, Panel, Pos2, Rect, Response, RichText, ScrollArea, Sense, Shape,
+    Stroke, StrokeKind, TextEdit, TextStyle, Theme, ThemePreference, Ui, Vec2, ViewportCommand, pos2, text::LayoutJob,
+    text_edit::TextEditState, vec2,
 };
 use nostr_sdk::prelude::{Keys, ToBech32};
 use tokio::sync::mpsc::UnboundedSender;
@@ -30,6 +31,39 @@ const CARD_GAP: f32 = 12.0;
 const ITEMS_PAGE: usize = 1000;
 /// Narrower than this (a phone, say), one pane is shown at a time.
 const NARROW_WIDTH: f32 = 640.0;
+/// How far an article has to be swiped sideways to mark it read (left) or star it (right).
+const SWIPE_DISTANCE: f32 = 80.0;
+/// A press that moves this far decides whether it is a sideways swipe or scrolling.
+const SWIPE_DECIDE: f32 = 14.0;
+/// What "Mark older as read" starts at, unless changed.
+const DEFAULT_OLDER_DAYS: u32 = 7;
+/// Quick choices in "Mark older as read", in days.
+const OLDER_CHOICES: &[(u32, &str)] = &[(1, "1 day"), (3, "3 days"), (7, "1 week"), (14, "2 weeks"), (30, "1 month")];
+
+/// An article being swiped sideways (by touch or with the mouse).
+struct Swipe {
+    key: String,
+    origin: Pos2,
+    last: Pos2,
+    /// Decided once the press has moved a little: sideways (a swipe) or not (scrolling).
+    sideways: Option<bool>,
+    /// The pass it was last followed in, so one the list stopped showing is dropped.
+    pass: u64,
+}
+
+impl Swipe {
+    /// How far it has been swiped to the right (negative: to the left), if it is a swipe.
+    fn offset(&self) -> Option<f32> {
+        (self.sideways == Some(true)).then_some(self.last.x - self.origin.x)
+    }
+}
+
+/// What happened to an article in the list.
+enum RowEvent {
+    Open(ItemRow),
+    /// Added to or taken out of the selection (long press, right click or Ctrl+click).
+    Pick(String),
+}
 
 /// How the article list is shown.
 #[derive(Clone, Copy, PartialEq)]
@@ -108,6 +142,14 @@ enum Dialog {
         view: View,
         search: String,
         count: usize,
+    },
+    /// Marking the unread articles in a view older than some days as read.
+    MarkOlderRead {
+        view: View,
+        search: String,
+        days: u32,
+        /// The number of articles it would mark, and for how many days it was counted.
+        count: Option<(u32, usize)>,
     },
     ConfirmErase {
         understood: bool,
@@ -231,6 +273,18 @@ pub struct App {
     row_heights: RefCell<RowHeights>,
     /// Set when the selection moved by keyboard, so the list follows it.
     scroll_to_selected: bool,
+    /// Articles picked for marking read, starring and so on together (by long press,
+    /// right click or Ctrl+click); while there are any, a tap adds or removes one.
+    picked: HashSet<String>,
+    /// The article being swiped sideways, if any.
+    swipe: RefCell<Option<Swipe>>,
+    /// The keyboard request of the text field being edited, kept for while it's out of view.
+    editing_ime: Option<(Id, egui::output::IMEOutput)>,
+    /// The text field being edited should be scrolled into view (it just got the
+    /// focus, or the on-screen keyboard just covered part of the screen).
+    reveal_editing: bool,
+    /// The space the app had last frame, to notice the on-screen keyboard appearing.
+    last_content: Rect,
     layout: ListLayout,
     /// With cards or on a narrow screen, the selected article is shown instead of the list.
     reading: bool,
@@ -304,6 +358,11 @@ impl App {
             block_heights: RowHeights::default(),
             row_heights: RefCell::default(),
             scroll_to_selected: false,
+            picked: HashSet::new(),
+            swipe: RefCell::default(),
+            editing_ime: None,
+            reveal_editing: false,
+            last_content: Rect::NOTHING,
             layout,
             reading: false,
             narrow: false,
@@ -356,6 +415,10 @@ impl App {
         }
         if self.reading && self.selected.is_some() && (self.narrow || self.layout.is_cards()) {
             self.reading = false;
+            return true;
+        }
+        if !self.picked.is_empty() {
+            self.picked.clear();
             return true;
         }
         std::mem::take(&mut self.show_feeds)
@@ -484,20 +547,29 @@ impl App {
     }
 
     fn set_read(&mut self, key: &str, read: bool) {
-        if self.db.set_read(&[key.to_string()], read).is_ok() {
-            self.update_item(key, |i| i.unread = !read);
-        }
+        self.set_read_many(&[key.to_string()], read);
     }
 
     fn set_fav(&mut self, key: &str, fav: bool) {
-        if self.db.set_fav(key, fav).is_ok() {
-            self.update_item(key, |i| i.fav = fav);
+        self.set_fav_many(&[key.to_string()], fav);
+    }
+
+    fn set_read_many(&mut self, keys: &[String], read: bool) {
+        if self.db.set_read(keys, read).is_ok() {
+            self.update_items(keys, |i| i.unread = !read);
         }
     }
 
-    /// Updates an item on screen without reloading the list, so it doesn't jump around.
-    fn update_item(&mut self, key: &str, change: impl Fn(&mut ItemRow)) {
-        self.items.iter_mut().chain(self.selected.as_mut()).filter(|i| i.key == key).for_each(change);
+    fn set_fav_many(&mut self, keys: &[String], fav: bool) {
+        if self.db.set_favs(keys, fav).is_ok() {
+            self.update_items(keys, |i| i.fav = fav);
+        }
+    }
+
+    /// Updates items on screen without reloading the list, so it doesn't jump around.
+    fn update_items(&mut self, keys: &[String], change: impl Fn(&mut ItemRow)) {
+        let keys: HashSet<&String> = keys.iter().collect();
+        self.items.iter_mut().chain(self.selected.as_mut()).filter(|i| keys.contains(&i.key)).for_each(change);
         self.feeds = self.db.feeds().unwrap_or_default();
         self.favorites = self.db.favorites_count().unwrap_or_default();
         self.follows_people = self.db.follows_people().unwrap_or_default();
@@ -506,9 +578,17 @@ impl App {
     fn set_view(&mut self, view: View) {
         self.view = view;
         self.reading = false;
+        self.picked.clear();
         self.show_feeds = false;
         self.limit = ITEMS_PAGE;
         self.items = self.db.items_matching(&self.view, self.unread_only, &self.search, self.limit).unwrap_or_default();
+    }
+
+    /// Asks how old the unread articles in `view` (matching `search`) must be to be marked as read.
+    fn mark_older_read(&mut self, view: View, search: &str) {
+        let days = self.db.meta("older_days").ok().flatten().and_then(|d| d.parse().ok());
+        let days = days.unwrap_or(DEFAULT_OLDER_DAYS);
+        self.dialog = Some(Dialog::MarkOlderRead { view, search: search.to_string(), days, count: None });
     }
 
     /// Asks before marking every unread article in `view` (matching `search`) as read.
@@ -649,7 +729,8 @@ impl App {
                         self.dialog = Some(Dialog::NewSyncKey { nsec });
                     }
                     ui.add_space(24.0);
-                })
+                });
+                reveal_editing(ui, &mut self.reveal_editing);
             });
         });
     }
@@ -749,7 +830,10 @@ impl App {
                     }
                     response.context_menu(|ui| {
                         if ui.button("Mark all as read").clicked() {
-                            action = Some(FeedAction::MarkRead(view));
+                            action = Some(FeedAction::MarkRead(view.clone()));
+                        }
+                        if ui.button("Mark older as read…").clicked() {
+                            action = Some(FeedAction::MarkOlderRead(view));
                         }
                         let toggle = if local { "Sync this group" } else { "Make Local Only" };
                         let hint = if local {
@@ -783,6 +867,7 @@ impl App {
         match action {
             Some(FeedAction::Show(view)) => self.set_view(view),
             Some(FeedAction::MarkRead(view)) => self.confirm_mark_read(view, ""),
+            Some(FeedAction::MarkOlderRead(view)) => self.mark_older_read(view, ""),
             Some(FeedAction::Fold(category)) => {
                 if !self.collapsed.remove(&category) {
                     self.collapsed.insert(category);
@@ -820,15 +905,72 @@ impl App {
 
     fn item_list(&mut self, ui: &mut Ui) {
         ui.add_space(6.0);
+        if !self.picked.is_empty() {
+            self.selection_bar(ui);
+        } else {
+            self.list_header(ui);
+        }
+        ui.add_space(2.0);
+        self.search_box(ui);
+        ui.add_space(4.0);
+        ui.separator();
+        if self.items.is_empty() {
+            ui.add_space(24.0);
+            // The web version shows other feeds only as your other devices cached them.
+            let waiting = cfg!(target_arch = "wasm32")
+                && matches!(&self.view, View::Feed(url) if !longform::is_nostr(url))
+                && !self.unread_only
+                && self.search.is_empty();
+            let empty = if waiting {
+                "Nothing here yet: your other devices fetch this feed, and its articles show up after they sync."
+            } else {
+                "Nothing here"
+            };
+            ui.vertical_centered(|ui| ui.add(Label::new(RichText::new(empty).weak()).wrap()));
+        }
+        ui.style_mut().interaction.selectable_labels = false;
+        self.follow_swipe(ui);
+        let (event, at_end) = match self.layout {
+            ListLayout::List => self.standard_list(ui),
+            ListLayout::CompactList => self.compact_list(ui),
+            ListLayout::Cards | ListLayout::CompactCards => self.card_grid(ui),
+        };
+        self.finish_swipe(ui);
+        self.scroll_to_selected = false;
+        // Scrolled to the end of a full page: list older articles too.
+        if at_end && self.items.len() >= self.limit {
+            self.limit += ITEMS_PAGE;
+            self.reload();
+        }
+        match event {
+            Some(RowEvent::Open(item)) => self.select(item),
+            Some(RowEvent::Pick(key)) if !self.picked.remove(&key) => {
+                self.picked.insert(key);
+            }
+            Some(RowEvent::Pick(_)) => {}
+            None => {}
+        }
+    }
+
+    /// The view's title, with the buttons that act on the whole view.
+    fn list_header(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
             let title = self.view_title(&self.view);
             ui.add(Label::new(RichText::new(title).size(16.0).strong()).truncate());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let any_unread = self.items.iter().any(|i| i.unread);
-                let mark = ui.add_enabled(any_unread, Button::new("✔").frame_when_inactive(false));
                 // Every unread article in the view (matching the search), not just those listed.
-                if mark.on_hover_text("Mark all as read").clicked() {
+                let (mut all, mut older) = (false, false);
+                ui.menu_button("✔", |ui| {
+                    all = ui.button("Mark all as read…").clicked();
+                    older = ui.button("Mark older as read…").clicked();
+                })
+                .response
+                .on_hover_text("Mark as read");
+                if all {
                     self.confirm_mark_read(self.view.clone(), &self.search.clone());
+                }
+                if older {
+                    self.mark_older_read(self.view.clone(), &self.search.clone());
                 }
                 if ui.toggle_value(&mut self.unread_only, "Unread").changed() {
                     self.limit = ITEMS_PAGE;
@@ -850,7 +992,45 @@ impl App {
                 }
             });
         });
-        ui.add_space(2.0);
+    }
+
+    /// Shown instead of the view's title while articles are picked: what can be done to them.
+    fn selection_bar(&mut self, ui: &mut Ui) {
+        let keys: Vec<String> = self.picked.iter().cloned().collect();
+        let (mut read, mut fav) = (None, None);
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("✖").on_hover_text("Cancel (Esc)").clicked() {
+                self.picked.clear();
+            }
+            ui.label(RichText::new(format!("{} selected", keys.len())).strong());
+            if self.picked.len() < self.items.len() && ui.button("Select all").clicked() {
+                self.picked.extend(self.items.iter().map(|i| i.key.clone()));
+            }
+            if ui.button("✔ Read").on_hover_text("Mark as read").clicked() {
+                read = Some(true);
+            }
+            if ui.button("● Unread").on_hover_text("Mark as unread").clicked() {
+                read = Some(false);
+            }
+            if ui.button("★ Star").on_hover_text("Add to favorites").clicked() {
+                fav = Some(true);
+            }
+            if ui.button("☆ Unstar").on_hover_text("Remove from favorites").clicked() {
+                fav = Some(false);
+            }
+        });
+        if let Some(read) = read {
+            self.set_read_many(&keys, read);
+        }
+        if let Some(fav) = fav {
+            self.set_fav_many(&keys, fav);
+        }
+        if read.is_some() || fav.is_some() {
+            self.picked.clear();
+        }
+    }
+
+    fn search_box(&mut self, ui: &mut Ui) {
         // Right to left, so the text field takes exactly the space left by the button.
         let row = vec2(ui.available_width(), ui.spacing().interact_size.y);
         ui.allocate_ui_with_layout(row, Layout::right_to_left(Align::Center), |ui| {
@@ -867,47 +1047,92 @@ impl App {
                 self.reload();
             }
         });
-        ui.add_space(4.0);
-        ui.separator();
-        if self.items.is_empty() {
-            ui.add_space(24.0);
-            // The web version shows other feeds only as your other devices cached them.
-            let waiting = cfg!(target_arch = "wasm32")
-                && matches!(&self.view, View::Feed(url) if !longform::is_nostr(url))
-                && !self.unread_only
-                && self.search.is_empty();
-            let empty = if waiting {
-                "Nothing here yet: your other devices fetch this feed, and its articles show up after they sync."
-            } else {
-                "Nothing here"
-            };
-            ui.vertical_centered(|ui| ui.add(Label::new(RichText::new(empty).weak()).wrap()));
-        }
-        ui.style_mut().interaction.selectable_labels = false;
-        let (clicked, at_end) = match self.layout {
-            ListLayout::List => self.standard_list(ui),
-            ListLayout::CompactList => self.compact_list(ui),
-            ListLayout::Cards | ListLayout::CompactCards => self.card_grid(ui),
-        };
-        self.scroll_to_selected = false;
-        // Scrolled to the end of a full page: list older articles too.
-        if at_end && self.items.len() >= self.limit {
-            self.limit += ITEMS_PAGE;
-            self.reload();
-        }
-        if let Some(item) = clicked {
-            self.select(item);
-        }
     }
 
     fn is_selected(&self, item: &ItemRow) -> bool {
         self.selected.as_ref().is_some_and(|s| s.key == item.key)
     }
 
+    /// Highlighted: the article being read, or one of those picked.
+    fn is_highlighted(&self, item: &ItemRow) -> bool {
+        self.is_selected(item) || self.picked.contains(&item.key)
+    }
+
+    /// Taps, long presses and swipes on an article in the list (drawn at `response.rect`).
+    fn row_event(&self, ui: &Ui, item: &ItemRow, response: &Response) -> Option<RowEvent> {
+        let rect = response.rect;
+        // A press on the article may start a swipe.
+        let pressed_here = ui
+            .input(|i| i.pointer.any_pressed().then(|| i.pointer.press_origin()).flatten())
+            // Not when the press was on a menu or dialog above the list.
+            .filter(|&origin| {
+                rect.contains(origin)
+                    && ui.clip_rect().contains(origin)
+                    && ui.ctx().layer_id_at(origin) == Some(ui.layer_id())
+            });
+        if let Some(origin) = pressed_here {
+            let key = item.key.clone();
+            let pass = ui.ctx().cumulative_pass_nr();
+            *self.swipe.borrow_mut() = Some(Swipe { key, origin, last: origin, sideways: None, pass });
+        }
+        if self.picked.contains(&item.key) {
+            ui.painter().rect_stroke(rect, CornerRadius::same(6), Stroke::new(2.0, ACCENT), StrokeKind::Inside);
+        }
+        if let Some(offset) = self.swipe.borrow().as_ref().filter(|s| s.key == item.key).and_then(Swipe::offset) {
+            paint_swipe(ui, rect, offset, item);
+        }
+        // Long press (or right click, or Ctrl+click) picks; while some are picked, so does a tap.
+        let command = ui.input(|i| i.modifiers.command);
+        let pick = response.long_touched()
+            || response.secondary_clicked()
+            || (response.clicked() && (command || !self.picked.is_empty()));
+        if pick {
+            Some(RowEvent::Pick(item.key.clone()))
+        } else if response.clicked() {
+            Some(RowEvent::Open(item.clone()))
+        } else {
+            None
+        }
+    }
+
+    /// Follows the pointer while an article is being swiped, before the list is drawn.
+    fn follow_swipe(&self, ui: &Ui) {
+        let mut current = self.swipe.borrow_mut();
+        let pass = ui.ctx().cumulative_pass_nr();
+        if current.as_ref().is_some_and(|swipe| swipe.pass + 1 < pass) {
+            *current = None;
+        }
+        let Some(swipe) = current.as_mut() else { return };
+        swipe.pass = pass;
+        if let Some(pos) = ui.input(|i| i.pointer.latest_pos()) {
+            swipe.last = pos;
+        }
+        let moved = swipe.last - swipe.origin;
+        if swipe.sideways.is_none() && moved.length() >= SWIPE_DECIDE {
+            swipe.sideways = Some(moved.x.abs() > 1.5 * moved.y.abs());
+        }
+    }
+
+    /// Once a swipe ends: marks the article read or unread (swiped left) or stars or
+    /// unstars it (swiped right), if it was swiped far enough.
+    fn finish_swipe(&mut self, ui: &Ui) {
+        if ui.input(|i| i.pointer.any_down()) {
+            return;
+        }
+        let Some(swipe) = self.swipe.take() else { return };
+        let Some(offset) = swipe.offset().filter(|offset| offset.abs() >= SWIPE_DISTANCE) else { return };
+        let Some(item) = self.items.iter().find(|i| i.key == swipe.key).cloned() else { return };
+        if offset < 0.0 {
+            self.set_read(&item.key, item.unread);
+        } else {
+            self.set_fav(&item.key, !item.fav);
+        }
+    }
+
     /// Rows of varying height (titles wrap); only the visible ones are laid out.
-    /// Returns the clicked article, and whether the end of the list is in view.
-    fn standard_list(&self, ui: &mut Ui) -> (Option<ItemRow>, bool) {
-        let (mut clicked, mut at_end) = (None, false);
+    /// Returns what happened to an article, and whether the end of the list is in view.
+    fn standard_list(&self, ui: &mut Ui) -> (Option<RowEvent>, bool) {
+        let (mut event, mut at_end) = (None, false);
         let heights = &mut *self.row_heights.borrow_mut();
         ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             heights.check_width(ui.available_width());
@@ -915,23 +1140,21 @@ impl App {
                 let selected = self.is_selected(item);
                 let follow = selected && self.scroll_to_selected;
                 at_end = heights.row(ui, &item.key, 72.0, follow, |ui| {
-                    let response = item_row(ui, item, selected);
+                    let response = item_row(ui, item, self.is_highlighted(item));
                     if follow {
                         response.scroll_to_me(None);
                     }
-                    if response.clicked() {
-                        clicked = Some(item.clone());
-                    }
+                    event = self.row_event(ui, item, &response).or(event.take());
                 });
             }
         });
-        (clicked, at_end)
+        (event, at_end)
     }
 
     /// Rows of equal height, so only the visible ones are laid out.
-    fn compact_list(&self, ui: &mut Ui) -> (Option<ItemRow>, bool) {
+    fn compact_list(&self, ui: &mut Ui) -> (Option<RowEvent>, bool) {
         let height = compact_row_height(ui);
-        let (mut clicked, mut at_end) = (None, false);
+        let (mut event, mut at_end) = (None, false);
         ui.spacing_mut().item_spacing.y = 0.0;
         let selected_row = self.selected.as_ref().and_then(|s| self.items.iter().position(|i| i.key == s.key));
         let mut scroll = ScrollArea::vertical().auto_shrink(false);
@@ -941,22 +1164,21 @@ impl App {
         scroll.show_rows(ui, height, self.items.len(), |ui, rows| {
             at_end = rows.end == self.items.len();
             for item in &self.items[rows] {
-                if compact_row(ui, item, self.is_selected(item)).clicked() {
-                    clicked = Some(item.clone());
-                }
+                let response = compact_row(ui, item, self.is_highlighted(item));
+                event = self.row_event(ui, item, &response).or(event.take());
             }
         });
-        (clicked, at_end)
+        (event, at_end)
     }
 
     /// Cards in rows filling the width; only the visible rows are laid out.
-    fn card_grid(&self, ui: &mut Ui) -> (Option<ItemRow>, bool) {
+    fn card_grid(&self, ui: &mut Ui) -> (Option<RowEvent>, bool) {
         let min = self.layout.card_size();
         let width = ui.available_width() - 16.0;
         let columns = (((width + CARD_GAP) / (min.x + CARD_GAP)) as usize).max(1);
         let card = vec2((width - CARD_GAP * (columns - 1) as f32) / columns as f32, min.y);
         let compact = self.layout == ListLayout::CompactCards;
-        let (mut clicked, mut at_end) = (None, false);
+        let (mut event, mut at_end) = (None, false);
         ui.spacing_mut().item_spacing = vec2(CARD_GAP, CARD_GAP);
         let selected_row =
             self.selected.as_ref().and_then(|s| self.items.iter().position(|i| i.key == s.key)).map(|i| i / columns);
@@ -973,14 +1195,13 @@ impl App {
             for row in rows {
                 ui.horizontal(|ui| {
                     for item in self.items.iter().skip(row * columns).take(columns) {
-                        if item_card(ui, item, self.is_selected(item), card, compact).clicked() {
-                            clicked = Some(item.clone());
-                        }
+                        let response = item_card(ui, item, self.is_highlighted(item), card, compact);
+                        event = self.row_event(ui, item, &response).or(event.take());
                     }
                 });
             }
         });
-        (clicked, at_end)
+        (event, at_end)
     }
 
     fn reader(&mut self, ui: &mut Ui) {
@@ -1080,7 +1301,11 @@ impl App {
             self.send(Cmd::SyncNow);
         }
         if pressed(Key::Escape) {
-            self.reading = false;
+            if self.picked.is_empty() {
+                self.reading = false;
+            } else {
+                self.picked.clear();
+            }
         }
     }
 
@@ -1242,6 +1467,51 @@ impl App {
                         }
                     });
                 }
+                Dialog::MarkOlderRead { view, search, days, count } => {
+                    ui.label(RichText::new("Mark older articles as read").size(18.0).strong());
+                    let mut text = format!("Unread articles in “{}”", self.view_title(view));
+                    if !search.trim().is_empty() {
+                        text.push_str(&format!(" matching “{}”", search.trim()));
+                    }
+                    text.push_str(" published more than this long ago are marked as read.");
+                    ui.add(Label::new(text).wrap());
+                    ui.add_space(8.0);
+                    ui.horizontal_wrapped(|ui| {
+                        for &(choice, label) in OLDER_CHOICES {
+                            if ui.add(Button::selectable(*days == choice, label)).clicked() {
+                                *days = choice;
+                            }
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Older than");
+                        ui.add(DragValue::new(days).range(1..=3650));
+                        ui.label(if *days == 1 { "day" } else { "days" });
+                    });
+                    let before = now_ms() / 1000 - i64::from(*days) * 24 * 3600;
+                    // Counted again only when the number of days changes, not on every frame.
+                    if count.is_none_or(|(counted, _)| counted != *days) {
+                        let found = self.db.unread_keys_before(view, search, before).map_or(0, |keys| keys.len());
+                        *count = Some((*days, found));
+                    }
+                    let found = count.map_or(0, |(_, found)| found);
+                    let articles = if found == 1 { "1 article".to_string() } else { format!("{found} articles") };
+                    ui.label(RichText::new(format!("{articles} to mark")).weak());
+                    ui.add_space(8.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.add_enabled(found > 0, primary_button("Mark as read")).clicked() {
+                            let keys = self.db.unread_keys_before(view, search, before).unwrap_or_default();
+                            if self.db.set_read(&keys, true).is_ok() {
+                                self.reload();
+                            }
+                            let _ = self.db.set_meta("older_days", &days.to_string());
+                            open = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            open = false;
+                        }
+                    });
+                }
                 Dialog::ConfirmSignOut => {
                     ui.label(RichText::new("Sign out anyway?").size(18.0).strong());
                     ui.label(
@@ -1346,6 +1616,7 @@ impl App {
                             ui.add_space(32.0);
                         });
                     });
+                    reveal_editing(ui, &mut self.reveal_editing);
                 });
             });
         }
@@ -1825,6 +2096,8 @@ fn schedule_label(minutes: u32) -> String {
 enum FeedAction {
     Show(View),
     MarkRead(View),
+    /// Asks how old the unread articles must be to be marked as read.
+    MarkOlderRead(View),
     /// Folds or unfolds a category in the sidebar.
     Fold(String),
     SetCategory(String, String),
@@ -1862,7 +2135,10 @@ fn follows_group(
         }
         response.context_menu(|ui| {
             if ui.button("Mark all as read").clicked() {
-                *action = Some(FeedAction::MarkRead(view));
+                *action = Some(FeedAction::MarkRead(view.clone()));
+            }
+            if ui.button("Mark older as read…").clicked() {
+                *action = Some(FeedAction::MarkOlderRead(view));
             }
             if ui.button("Turn off").on_hover_text("Settings › Socials turns it on again").clicked() {
                 *action = Some(FeedAction::Unsubscribe(feed.url.clone()));
@@ -1907,7 +2183,10 @@ fn feed_row(
     }
     response.context_menu(|ui| {
         if ui.button("Mark all as read").clicked() {
-            *action = Some(FeedAction::MarkRead(view));
+            *action = Some(FeedAction::MarkRead(view.clone()));
+        }
+        if ui.button("Mark older as read…").clicked() {
+            *action = Some(FeedAction::MarkOlderRead(view));
         }
         ui.menu_button("Move to category", |ui| {
             for name in categories.iter().filter(|c| **c != feed.category) {
@@ -1936,6 +2215,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.handle_messages(ui.ctx());
         let ctx = ui.ctx().clone();
+        self.watch_editing(&ctx);
         self.narrow = ctx.content_rect().width() < NARROW_WIDTH;
         match self.screen {
             Screen::Login => self.login_screen(ui),
@@ -1990,10 +2270,31 @@ impl eframe::App for App {
         }
         self.dialogs(&ctx);
         self.handle_exit(&ctx);
+        self.keep_keyboard(&ctx);
     }
 }
 
 impl App {
+    /// Before drawing: notices when the text field being edited should be
+    /// scrolled into view (see [`reveal_editing`]): when it was just chosen, or
+    /// when the space for the app just shrank (the on-screen keyboard opened).
+    fn watch_editing(&mut self, ctx: &egui::Context) {
+        let content = ctx.content_rect();
+        match editing_field(ctx) {
+            None => self.reveal_editing = false,
+            Some(id) => {
+                let newly_chosen = self.editing_ime.as_ref().is_none_or(|(editing, _)| *editing != id);
+                let shrank = content.height() < self.last_content.height() - 1.0;
+                self.reveal_editing |= newly_chosen || shrank;
+            }
+        }
+        self.last_content = content;
+    }
+
+    fn keep_keyboard(&mut self, ctx: &egui::Context) {
+        keep_keyboard(ctx, &mut self.editing_ime);
+    }
+
     /// Closing first saves changes to relays (or gives up after a while).
     fn handle_exit(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.viewport().close_requested()) && self.exit != Exit::Ready {
@@ -2105,6 +2406,29 @@ fn item_row(ui: &mut Ui, item: &ItemRow, selected: bool) -> egui::Response {
 
 fn compact_row_height(ui: &Ui) -> f32 {
     ui.text_style_height(&TextStyle::Body) + 14.0
+}
+
+/// Shows what letting go of a swiped article will do: a band growing from the
+/// side it's swiped away from, solid once it's far enough.
+fn paint_swipe(ui: &Ui, rect: Rect, offset: f32, item: &ItemRow) {
+    let width = offset.abs().min(rect.width());
+    let band = if offset > 0.0 {
+        Rect::from_min_max(rect.min, pos2(rect.left() + width, rect.bottom()))
+    } else {
+        Rect::from_min_max(pos2(rect.right() - width, rect.top()), rect.max)
+    };
+    let ready = offset.abs() >= SWIPE_DISTANCE;
+    let painter = ui.painter_at(band);
+    painter.rect_filled(band, CornerRadius::same(6), if ready { ACCENT } else { ACCENT.gamma_multiply(0.5) });
+    let label = match (offset > 0.0, item.fav, item.unread) {
+        (true, false, _) => "★  Star",
+        (true, true, _) => "☆  Unstar",
+        (false, _, true) => "✔  Read",
+        (false, _, false) => "●  Unread",
+    };
+    let text = painter.layout_no_wrap(label.into(), TextStyle::Body.resolve(ui.style()), Color32::WHITE);
+    let x = if offset > 0.0 { band.left() + 14.0 } else { band.right() - 14.0 - text.size().x };
+    painter.galley(pos2(x, rect.center().y - text.size().y / 2.0), text, Color32::WHITE);
 }
 
 fn paint_background(ui: &Ui, rect: Rect, selected: bool, hovered: bool) {
@@ -2316,6 +2640,57 @@ fn show_spans(ui: &mut Ui, spans: &[html::Span], size: f32, style: Style, menu: 
 /// request also restarts the on-screen keyboard's typing, so asking on every
 /// frame made phone keyboards flicker and drop what was typed, and grabbing
 /// focus back after Enter would hide that Enter was pressed.
+/// The text field (or number being typed into) that has the keyboard focus, if any.
+fn editing_field(ctx: &egui::Context) -> Option<Id> {
+    let id = ctx.memory(|m| m.focused())?;
+    let enabled = ctx.read_response(id).is_some_and(|r| r.enabled());
+    (enabled && TextEditState::load(ctx, id).is_some()).then_some(id)
+}
+
+/// Call after drawing: keeps the on-screen keyboard open while a text field is
+/// being edited. egui only asks for it while the field is in view, so a
+/// keyboard covering the field closed itself, which uncovered the field, which
+/// opened the keyboard again, over and over. `last` keeps the field's last
+/// request, to repeat while it's out of view.
+fn keep_keyboard(ctx: &egui::Context, last: &mut Option<(Id, egui::output::IMEOutput)>) {
+    let Some(id) = editing_field(ctx) else {
+        *last = None;
+        return;
+    };
+    if let Some(ime) = ctx.output(|o| o.ime) {
+        *last = Some((id, ime));
+        return;
+    }
+    let ime = match *last {
+        Some((editing, ime)) if editing == id => ime,
+        _ => {
+            let Some(rect) = ctx.read_response(id).map(|r| r.rect) else { return };
+            let purpose = egui::IMEPurpose::Normal;
+            egui::output::IMEOutput { purpose, rect, cursor_rect: rect, should_interrupt_composition: false }
+        }
+    };
+    ctx.output_mut(|o| o.ime = Some(egui::output::IMEOutput { should_interrupt_composition: false, ..ime }));
+}
+
+/// Call at the end of a scroll area's contents: if `reveal` asks for it and the
+/// text field being edited is in this scroll area but out of view (under the
+/// on-screen keyboard, say), scrolls to it.
+fn reveal_editing(ui: &Ui, reveal: &mut bool) {
+    if !*reveal {
+        return;
+    }
+    let Some(rect) = editing_field(ui.ctx()).and_then(|id| ui.ctx().read_response(id)).map(|r| r.rect) else {
+        return;
+    };
+    if !ui.min_rect().contains_rect(rect) {
+        return;
+    }
+    if !ui.clip_rect().contains_rect(rect) {
+        ui.scroll_to_rect(rect, Some(Align::Center));
+    }
+    *reveal = false;
+}
+
 fn focus_on_open(response: &Response, focus: &mut bool) {
     if !*focus {
         return;
@@ -2477,6 +2852,40 @@ fn format_date(seconds: i64, long: bool) -> String {
 mod tests {
     use super::*;
     use crate::db::Db;
+
+    #[test]
+    fn keyboard_stays_open_while_the_field_being_edited_is_covered() {
+        let ctx = egui::Context::default();
+        let id = Id::new("days");
+        let mut text = String::from("30");
+        let mut last = None;
+        // A frame `height` points tall (smaller: the on-screen keyboard is open),
+        // with the field below the top; returns whether the keyboard is asked for.
+        let mut frame = |height: f32, keep: bool| {
+            let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, height));
+            let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+            let mut output = ctx.run_ui(input, |ui| {
+                ScrollArea::vertical().show(ui, |ui| {
+                    ui.add_space(300.0);
+                    ui.add(TextEdit::singleline(&mut text).id(id));
+                });
+                if keep {
+                    keep_keyboard(ui.ctx(), &mut last);
+                }
+            });
+            output.textures_delta.clear();
+            output.platform_output.ime.is_some()
+        };
+        frame(600.0, true);
+        ctx.memory_mut(|m| m.request_focus(id));
+        assert!(frame(600.0, true));
+        // egui alone stops asking once the keyboard covers the field (which then closed the keyboard)…
+        assert!(!frame(200.0, false));
+        // …but it's kept open while the field is still being edited.
+        assert!(frame(200.0, true));
+        ctx.memory_mut(|m| m.surrender_focus(id));
+        assert!(!frame(200.0, true));
+    }
 
     #[test]
     fn blank_titles_get_a_stand_in() {

@@ -417,14 +417,21 @@ impl Db {
     }
 
     pub fn set_fav(&self, key: &str, fav: bool) -> Result<()> {
+        self.set_favs(&[key.to_string()], fav)
+    }
+
+    /// Stars or unstars several items at once (one transaction).
+    pub fn set_favs(&self, keys: &[String], fav: bool) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "INSERT INTO state (key, fav, fav_t) VALUES (?1, ?2, ?3)
-             ON CONFLICT (key) DO UPDATE SET fav = ?2, fav_t = max(?3, fav_t + 1)",
-            params![key, fav, now_ms()],
-        )?;
-        bump(&tx, &state_rev(docs::shard_of(key)))?;
-        bump_feed_of(&tx, key)?;
+        for key in keys {
+            tx.execute(
+                "INSERT INTO state (key, fav, fav_t) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (key) DO UPDATE SET fav = ?2, fav_t = max(?3, fav_t + 1)",
+                params![key, fav, now_ms()],
+            )?;
+            bump(&tx, &state_rev(docs::shard_of(key)))?;
+            bump_feed_of(&tx, key)?;
+        }
         Ok(tx.commit()?)
     }
 
@@ -853,14 +860,20 @@ impl Db {
 
     /// Every unread item in a view (or those of them matching `search`), for "mark all as read".
     pub fn unread_keys(&self, view: &View, search: &str) -> Result<Vec<String>> {
+        self.unread_keys_before(view, search, i64::MAX)
+    }
+
+    /// Like [`Db::unread_keys`], but only items published before `before` (seconds),
+    /// for "mark older articles as read".
+    pub fn unread_keys_before(&self, view: &View, search: &str, before: i64) -> Result<Vec<String>> {
         let (filter, value) = view_filter(view);
         let sql = format!(
             "SELECT i.key FROM items i JOIN feeds f ON f.url = i.feed_url LEFT JOIN state s ON s.key = i.key
-             WHERE {filter} AND {UNREAD} AND {VISIBLE} AND {SEARCH}"
+             WHERE {filter} AND {UNREAD} AND {VISIBLE} AND {SEARCH} AND i.published < ?4"
         );
         let search = search.trim().to_lowercase();
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![unread_cutoff(), value, search], |r| r.get(0))?;
+        let rows = stmt.query_map(params![unread_cutoff(), value, search, before], |r| r.get(0))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -1625,6 +1638,33 @@ mod tests {
         assert_eq!(db.feeds().unwrap()[0].unread, 1500 - 11);
         db.set_read(&db.unread_keys(&view, "").unwrap(), true).unwrap();
         assert_eq!(db.feeds().unwrap()[0].unread, 0);
+    }
+
+    #[test]
+    fn marks_only_older_items_read_and_stars_several_at_once() {
+        let db = Db::open_memory().unwrap();
+        let feed = "https://a.example/feed";
+        db.set_subscribed(feed, true).unwrap();
+        let now = now_ms() / 1000;
+        let items: Vec<(String, Item)> = (0..10)
+            .map(|i| {
+                let published = now - i * DAY_SECS;
+                (format!("g{i}"), Item { title: format!("Post {i}"), published, ..Default::default() })
+            })
+            .collect();
+        db.store_fetched(feed, "Feed", "", &items).unwrap();
+        let view = View::Feed(feed.into());
+        // Posts 4 to 9 are more than 3 days and an hour old.
+        let older = db.unread_keys_before(&view, "", now - 3 * DAY_SECS - 3600).unwrap();
+        assert_eq!(older.len(), 6);
+        db.set_read(&older, true).unwrap();
+        assert_eq!(db.feeds().unwrap()[0].unread, 4);
+        let newest: Vec<String> = db.items(&view, true).unwrap().into_iter().map(|i| i.key).collect();
+        assert_eq!(newest.len(), 4);
+        db.set_favs(&newest, true).unwrap();
+        assert_eq!(db.favorites_count().unwrap(), 4);
+        db.set_favs(&newest[..2], false).unwrap();
+        assert_eq!(db.favorites_count().unwrap(), 2);
     }
 
     #[test]

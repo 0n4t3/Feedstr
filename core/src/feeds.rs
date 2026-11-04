@@ -147,7 +147,18 @@ fn find_feed_link(html: &str) -> Option<String> {
 
 /// Parses a feed downloaded from `url`; relative links are resolved against it.
 pub fn parse(body: &[u8], url: &str) -> Result<Feed> {
-    let feed = feed_rs::parser::Builder::new().base_uri(Some(url)).build().parse(body)?;
+    // A parser can't be used again after an error, so each attempt gets its own.
+    let parser = || feed_rs::parser::Builder::new().base_uri(Some(url)).build();
+    let feed = match parser().parse(body) {
+        Ok(feed) => feed,
+        // feed-rs rejects a whole feed over one empty Media RSS title or
+        // description (YouTube has one for every video without a description),
+        // so try again without them.
+        Err(feed_rs::parser::ParseFeedError::ParseError(feed_rs::parser::ParseErrorKind::MissingContent {
+            ..
+        })) => parser().parse(without_empty_media_text(body).as_slice())?,
+        Err(e) => return Err(e.into()),
+    };
     let now = now_ms() / 1000;
     let items = feed
         .entries
@@ -172,6 +183,61 @@ pub fn parse(body: &[u8], url: &str) -> Result<Feed> {
         .collect();
     let site = feed.links.iter().find(|l| l.rel.as_deref() != Some("self")).map(|l| l.href.clone()).unwrap_or_default();
     Ok(Feed { title: feed.title.map(|t| t.content).unwrap_or_default(), site, items })
+}
+
+/// `body` without empty namespaced title and description elements
+/// (`<media:description></media:description>`, `<media:title/>`, …), which
+/// carry nothing but make feed-rs give up.
+fn without_empty_media_text(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(start) = rest.iter().position(|&b| b == b'<') {
+        out.extend_from_slice(&rest[..start]);
+        rest = &rest[start..];
+        match empty_media_text_len(rest) {
+            Some(len) => rest = &rest[len..],
+            None => {
+                out.push(b'<');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.extend_from_slice(rest);
+    out
+}
+
+/// If `xml` starts with an empty element named `prefix:title` or
+/// `prefix:description`, how long it is.
+fn empty_media_text_len(xml: &[u8]) -> Option<usize> {
+    let name_len = xml[1..].iter().position(|&b| b.is_ascii_whitespace() || b == b'>' || b == b'/')?;
+    let name = &xml[1..1 + name_len];
+    let colon = name.iter().position(|&b| b == b':')?;
+    if !matches!(&name[colon + 1..], b"title" | b"description") {
+        return None;
+    }
+    // The tag ends at the first '>' outside quoted attribute values.
+    let mut quote = None;
+    let mut end = None;
+    for (i, &b) in xml.iter().enumerate().skip(1 + name_len) {
+        match (quote, b) {
+            (Some(q), _) if b == q => quote = None,
+            (Some(_), _) => {}
+            (None, b'"' | b'\'') => quote = Some(b),
+            (None, b'>') => {
+                end = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let end = end?;
+    if xml[end - 1] == b'/' {
+        return Some(end + 1);
+    }
+    let after = &xml[end + 1..];
+    let blank = after.iter().take_while(|b| b.is_ascii_whitespace()).count();
+    let close = [b"</".as_slice(), name, b">"].concat();
+    after[blank..].starts_with(&close).then(|| end + 1 + blank + close.len())
 }
 
 pub fn truncate(mut text: String, max: usize) -> String {
@@ -240,6 +306,40 @@ mod tests {
             </channel></rss>"#;
         let feed = parse(rss, "https://t.example/feed.xml").unwrap();
         assert!(feed.items.iter().all(|(_, item)| item.published == 0));
+    }
+
+    #[test]
+    fn empty_media_descriptions_dont_break_a_feed() {
+        // As YouTube sends them for videos without a description.
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns:yt="http://www.youtube.com/xml/schemas/2015" xmlns:media="http://search.yahoo.com/mrss/" xmlns="http://www.w3.org/2005/Atom">
+ <title>Channel</title>
+ <entry>
+  <id>yt:video:a</id><title>No description</title>
+  <link rel="alternate" href="https://www.youtube.com/watch?v=a"/>
+  <published>2024-01-01T00:00:00+00:00</published>
+  <media:group><media:title>No description</media:title><media:description></media:description></media:group>
+ </entry>
+ <entry>
+  <id>yt:video:b</id><title>Described</title>
+  <link rel="alternate" href="https://www.youtube.com/watch?v=b"/>
+  <published>2024-01-02T00:00:00+00:00</published>
+  <media:group><media:title /><media:description type="plain">Hello &amp; welcome</media:description></media:group>
+ </entry>
+</feed>"#;
+        let feed = parse(xml, "https://www.youtube.com/feeds/videos.xml?channel_id=x").unwrap();
+        assert_eq!(feed.title, "Channel");
+        let titles: Vec<_> = feed.items.iter().map(|(_, item)| item.title.as_str()).collect();
+        assert_eq!(titles, ["No description", "Described"]);
+        assert_eq!(feed.items[0].1.link, "https://www.youtube.com/watch?v=a");
+    }
+
+    #[test]
+    fn only_empty_media_text_is_removed() {
+        let xml = b"<a><media:title a='>'/><m:description>\n </m:description><title></title>\
+            <media:description>x</media:description><media:titles/></a>";
+        let cleaned = String::from_utf8(without_empty_media_text(xml)).unwrap();
+        assert_eq!(cleaned, "<a><title></title><media:description>x</media:description><media:titles/></a>");
     }
 
     #[test]
