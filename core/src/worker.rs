@@ -104,7 +104,7 @@ pub type PlatformFuture<T> = futures::future::BoxFuture<'static, Result<T>>;
 pub type PlatformFuture<T> = futures::future::LocalBoxFuture<'static, Result<T>>;
 
 /// What each platform does its own way: asking the user for a file to read
-/// or a place to save one, and handing Nostr links to other apps.
+/// or a place to save one, handing Nostr links to other apps, and sharing links.
 pub trait Platform: Send + Sync {
     /// The contents of a file the user picks, or `None` if they cancel.
     fn open_file(&self, kind: FileKind) -> PlatformFuture<Option<Vec<u8>>>;
@@ -118,6 +118,15 @@ pub trait Platform: Send + Sync {
     /// Opens a `nostr:` link (NIP-21) in the user's Nostr app.
     fn open_nostr_link(&self, _link: &str) -> Result<()> {
         bail!("Nostr links can't be opened in other apps here")
+    }
+    /// Whether links can be handed to the system's share sheet; otherwise
+    /// articles offer to copy their address instead.
+    fn shares_links(&self) -> bool {
+        false
+    }
+    /// Shares a web link (an article's, titled `title`) through the system's share sheet.
+    fn share_link(&self, _title: &str, _link: &str) -> Result<()> {
+        bail!("links can't be shared here")
     }
     /// A signer app installed on the device, to sign in with (`None` if there is none).
     fn signer_app(&self) -> Option<Arc<dyn SignerApp>> {
@@ -200,6 +209,8 @@ pub enum Msg {
     /// Signing out was refused because changes couldn't be saved to relays.
     LogoutBlocked,
     Status(String),
+    /// Like [`Msg::Status`], for something under way: how far along it is, from 0 to 1.
+    Progress(String, f32),
     FeedAdded(Result<String, String>),
     /// The database changed; reload what's on screen.
     Changed,
@@ -210,30 +221,34 @@ pub enum Msg {
     ExitReady,
 }
 
-/// The relays this device uses: the user's own list once they've changed it,
-/// otherwise this version's defaults (so new defaults in an update apply).
+/// The relays this device uses: the user's own list once they've changed it
+/// (on any of their devices, see [`crate::docs::RelayList`]), otherwise this
+/// version's defaults (so new defaults in an update apply).
 pub fn relays(db: &Db) -> Vec<String> {
-    let mut relays: Vec<String> = match db.meta("relays").ok().flatten() {
-        Some(list) => list.lines().map(String::from).collect(),
-        None => DEFAULT_RELAYS.iter().map(|r| r.to_string()).collect(),
-    };
-    // Older versions could store one twice.
-    let mut seen = std::collections::HashSet::new();
-    relays.retain(|relay| seen.insert(parse_relay(relay).unwrap_or_else(|| relay.clone())));
-    relays
+    match db.relay_list() {
+        Ok(list) if list.is_custom() => list.listed(),
+        _ => DEFAULT_RELAYS.iter().map(|r| r.to_string()).collect(),
+    }
 }
 
 /// Whether the user has their own relay list instead of the defaults.
 pub fn custom_relays(db: &Db) -> bool {
-    db.meta("relays").ok().flatten().is_some()
+    db.relay_list().is_ok_and(|list| list.is_custom())
 }
 
-/// Saves the user's relay list. If it's just the defaults, the device goes
-/// back to following the defaults, so later versions can change them.
+/// Saves the user's relay list, to be synced to their other devices. If it's
+/// just the defaults, the devices go back to following the defaults, so later
+/// versions can change them.
 pub fn set_relays(db: &Db, relays: &[String]) -> Result<()> {
-    let set = |list: &[String]| list.iter().filter_map(|r| parse_relay(r)).collect::<std::collections::BTreeSet<_>>();
-    let defaults: Vec<String> = DEFAULT_RELAYS.iter().map(|r| r.to_string()).collect();
-    if set(relays) == set(&defaults) { db.delete_meta("relays") } else { db.set_meta("relays", &relays.join("\n")) }
+    let mut list: Vec<String> = Vec::new();
+    for relay in relays.iter().filter_map(|r| parse_relay(r)) {
+        if !list.contains(&relay) {
+            list.push(relay);
+        }
+    }
+    let set = |list: &[String]| list.iter().cloned().collect::<std::collections::BTreeSet<_>>();
+    let defaults: Vec<String> = DEFAULT_RELAYS.iter().filter_map(|r| parse_relay(r)).collect();
+    db.set_relay_list(&list, set(&list) != set(&defaults))
 }
 
 /// A relay address as typed, cleaned up (`wss://relay.example`), or `None` if
@@ -333,12 +348,20 @@ impl Worker {
         self.send(Msg::Status(text.into()));
     }
 
+    fn progress(&self, text: impl Into<String>, done: usize, total: usize) {
+        self.send(Msg::Progress(text.into(), done as f32 / total.max(1) as f32));
+    }
+
     async fn run(mut self, mut rx: UnboundedReceiver<Cmd>) {
         let mut next_cycle = self.next_cycle();
         let mut paused_at: Option<i64> = None;
         // What was last uploaded, for uploading changes soon in the browser.
         let (mut uploaded, mut retry_at) = (self.db.revision().unwrap_or(0), 0);
         loop {
+            // A sync can bring a relay list changed on another device.
+            if self.nostr.as_ref().is_some_and(|nostr| nostr.relays() != relays(&self.db)) {
+                self.reconnect().await;
+            }
             tokio::select! {
                 cmd = rx.recv() => {
                     let Some(cmd) = cmd else { break };
@@ -364,12 +387,7 @@ impl Worker {
                             self.send(Msg::FeedAdded(result));
                             self.send(Msg::Changed);
                         }
-                        Cmd::RelaysChanged => {
-                            *self.reader.lock().await = None;
-                            if self.nostr.is_some() && let Err(e) = self.login_with_retries(Login::Saved).await {
-                                self.send(Msg::LoginFailed(format!("{e:#}")));
-                            }
-                        }
+                        Cmd::RelaysChanged => self.reconnect().await,
                         Cmd::FetchFeed(url) => {
                             self.status("Fetching…");
                             let status = match self.fetch_feed(&url).await {
@@ -434,6 +452,16 @@ impl Worker {
                     }
                 }
             }
+        }
+    }
+
+    /// Connects to the relays in the (changed) relay list.
+    async fn reconnect(&mut self) {
+        *self.reader.lock().await = None;
+        if self.nostr.is_some()
+            && let Err(e) = self.login_with_retries(Login::Saved).await
+        {
+            self.send(Msg::LoginFailed(format!("{e:#}")));
         }
     }
 
@@ -743,7 +771,7 @@ impl Worker {
             if let Err(e) = result {
                 log::warn!("fetching feed failed: {e:#}");
             }
-            self.status(format!("Fetching feeds… {done}/{total}"));
+            self.progress(format!("Fetching feeds… {done}/{total}"), done, total);
         }
     }
 
@@ -786,7 +814,23 @@ impl Worker {
         let Some(nostr) = &self.nostr else { return outcome };
         self.status(if options.publish { "Uploading changes…" } else { "Downloading changes…" });
         let erased_before = self.db.erased_at().unwrap_or(0);
-        let status = match sync::sync(&self.db, nostr, options).await {
+        // Every step counts up from zero; the bar shows the step under way.
+        // Repaint only when what's shown changes: an upload can send thousands of events.
+        let shown = std::cell::RefCell::new(String::new());
+        let progress = |p: sync::Progress| {
+            let percent = p.done * 100 / p.total.max(1);
+            let text = match p.step {
+                sync::Step::Reading => format!("Reading from relays… {percent}%"),
+                sync::Step::Decrypting => format!("Decrypting changes… {}/{}", p.done, p.total),
+                sync::Step::Encrypting => format!("Encrypting changes… {}/{}", p.done, p.total),
+                sync::Step::Uploading => format!("Uploading changes… {percent}%"),
+            };
+            if *shown.borrow() != text {
+                self.progress(&text, p.done, p.total);
+                *shown.borrow_mut() = text;
+            }
+        };
+        let status = match sync::sync_reporting(&self.db, nostr, options, &progress).await {
             Ok(report) => {
                 outcome = SyncOutcome {
                     saved: report.relays_ok > 0 && report.problems.is_empty(),
@@ -840,9 +884,13 @@ mod tests {
         }
         // The same relay typed differently is one relay.
         assert_eq!(parse_relay("wss://nos.lol/"), parse_relay("wss://NOS.lol"));
+        // A list kept by an older version is cleaned up, and shared from now on.
         let db = Db::open_memory().unwrap();
         db.set_meta("relays", "wss://nos.lol\nwss://nos.lol/\nwss://nostr.mom").unwrap();
         assert_eq!(relays(&db), ["wss://nos.lol", "wss://nostr.mom"]);
+        assert!(custom_relays(&db));
+        assert_eq!(db.meta("relays").unwrap(), None);
+        assert_eq!(db.subscriptions_doc().unwrap().relays.listed(), ["wss://nos.lol", "wss://nostr.mom"]);
     }
 
     #[test]
@@ -861,6 +909,20 @@ mod tests {
         set_relays(&db, &back).unwrap();
         assert!(!custom_relays(&db));
         assert_eq!(relays(&db), defaults);
+    }
+
+    #[test]
+    fn relays_stay_after_signing_out_but_give_way_to_the_next_account() {
+        let db = Db::open_memory().unwrap();
+        set_relays(&db, &["wss://relay.example".to_string()]).unwrap();
+        db.wipe_account(true).unwrap();
+        assert_eq!(relays(&db), ["wss://relay.example"]);
+        assert!(db.subscriptions_doc().unwrap().relays.is_empty());
+        // The next account's list (even an older one) is used instead.
+        let mut doc = crate::docs::Subscriptions::default();
+        doc.relays.set(&["wss://other.example".to_string()], true, 1);
+        db.merge_subscriptions(&doc).unwrap();
+        assert_eq!(relays(&db), ["wss://other.example"]);
     }
 
     #[tokio::test]

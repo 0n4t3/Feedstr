@@ -4,7 +4,7 @@
 //! (Java, in `app/`) handles what egui can't do by itself and talks to this
 //! file over JNI: keeping clear of the system bars and keyboard, the back
 //! button, going to the background, picking files, the clipboard, opening
-//! Nostr links in other apps, and Nostr signer apps.
+//! Nostr links in other apps, sharing links, and Nostr signer apps.
 #![cfg(target_os = "android")]
 
 use std::collections::HashMap;
@@ -31,6 +31,8 @@ static EGUI: Mutex<Option<egui::Context>> = Mutex::new(None);
 /// left, top, right, bottom.
 static INSETS: [AtomicI32; 4] = [const { AtomicI32::new(0) }; 4];
 static BACK_PRESSED: AtomicBool = AtomicBool::new(false);
+/// Typing from the keyboard, for the next frame.
+static TYPED: Mutex<Vec<egui::Event>> = Mutex::new(Vec::new());
 /// File picks and signer requests waiting for an answer, by request number.
 static PENDING: Mutex<Option<HashMap<i32, oneshot::Sender<Reply>>>> = Mutex::new(None);
 static NEXT_REQUEST: AtomicI32 = AtomicI32::new(1);
@@ -53,7 +55,7 @@ fn android_main(app: AndroidApp) {
             *EGUI.lock().unwrap() = Some(cc.egui_ctx.clone());
             let app = App::new(cc, dir.join("feedstr.db"), Arc::new(Android))?;
             *REMOTE.lock().unwrap() = Some(app.remote());
-            Ok(Box::new(Droid { app, editing: None, paste: None }))
+            Ok(Box::new(Droid { app, editing: None, password: false, paste: None }))
         }),
     );
     if let Err(e) = result {
@@ -66,6 +68,8 @@ struct Droid {
     app: App,
     /// The text field last being edited, to paste into.
     editing: Option<egui::Id>,
+    /// Whether the keyboard was last told a password is being typed.
+    password: bool,
     /// Text to paste in the next frame.
     paste: Option<String>,
 }
@@ -91,6 +95,7 @@ impl eframe::App for Droid {
         if let Some(text) = self.paste.take() {
             raw_input.events.push(egui::Event::Paste(text));
         }
+        raw_input.events.append(&mut TYPED.lock().unwrap());
         let ppp = ctx.pixels_per_point();
         let [left, top, right, bottom] = INSETS.each_ref().map(|i| i.load(Ordering::Relaxed) as f32 / ppp);
         raw_input.safe_area_insets = Some(SafeAreaInsets(MarginF32 { left, right, top, bottom }));
@@ -98,9 +103,9 @@ impl eframe::App for Droid {
 }
 
 impl Droid {
-    /// egui's clipboard doesn't work on Android, and the keyboard can't paste
-    /// into a NativeActivity: copied text goes to Android's clipboard here,
-    /// and a Paste button shows while a text field is being edited.
+    /// egui's clipboard doesn't work on Android: copied text goes to
+    /// Android's clipboard here, and a Paste button shows while a text field
+    /// is being edited, for keyboards without a clipboard of their own.
     fn clipboard(&mut self, ctx: &egui::Context) {
         let copied: Vec<String> = ctx.output(|o| {
             o.commands
@@ -126,7 +131,25 @@ impl Droid {
         // frame as the tap, so it stays one frame longer than the editing.
         let editing = ctx.egui_wants_keyboard_input();
         if editing {
-            self.editing = ctx.memory(|m| m.focused());
+            let focused = ctx.memory(|m| m.focused());
+            // The keyboard only knows what it typed (see `Typing` in
+            // MainActivity): start it afresh when the cursor goes elsewhere.
+            // (It does by itself when it's hidden.)
+            let moved = self.editing.is_some()
+                && (focused != self.editing || ctx.input(|i| i.pointer.any_pressed()));
+            let password = ctx.output(|o| o.ime.as_ref().is_some_and(|i| i.purpose == egui::IMEPurpose::Password));
+            if moved || password != self.password {
+                self.password = password;
+                let restart = with_activity(|env, activity| {
+                    let sig = jni_sig!("(Z)V");
+                    env.call_method(activity, jni_str!("restartInput"), sig, &[JValue::Bool(password)])?;
+                    Ok(())
+                });
+                if let Err(e) = restart {
+                    log::error!("restarting the keyboard failed: {e:#}");
+                }
+            }
+            self.editing = focused;
         } else if self.editing.is_none() {
             return;
         }
@@ -194,8 +217,9 @@ enum Reply {
     Failed(String),
 }
 
-/// Files are picked with Android's document picker, and Nostr links opened in
-/// whatever app handles them, all through `MainActivity`.
+/// Files are picked with Android's document picker, Nostr links opened in
+/// whatever app handles them, and links shared through the share sheet, all
+/// through `MainActivity`.
 struct Android;
 
 impl Android {
@@ -264,6 +288,19 @@ impl Platform for Android {
         })?;
         anyhow::ensure!(opened, "No app for Nostr links is installed");
         Ok(())
+    }
+
+    fn shares_links(&self) -> bool {
+        true
+    }
+
+    fn share_link(&self, title: &str, link: &str) -> Result<()> {
+        with_activity(|env, activity| {
+            let (title, link) = (env.new_string(title)?, env.new_string(link)?);
+            let sig = jni_sig!("(Ljava/lang/String;Ljava/lang/String;)V");
+            env.call_method(activity, jni_str!("shareLink"), sig, &[JValue::Object(&title), JValue::Object(&link)])?;
+            Ok(())
+        })
     }
 
     fn signer_app(&self) -> Option<Arc<dyn SignerApp>> {
@@ -417,6 +454,38 @@ extern "system" fn Java_top_dns7_feedstr_MainActivity_nativeInsets(
 #[unsafe(no_mangle)]
 extern "system" fn Java_top_dns7_feedstr_MainActivity_nativeBack(_env: EnvUnowned, _class: JClass) {
     BACK_PRESSED.store(true, Ordering::Relaxed);
+    repaint();
+}
+
+/// `key` is 0 for `text` (typed or pasted), else 1 for Backspace, 2 for Delete
+/// or 3 for Enter.
+#[unsafe(no_mangle)]
+extern "system" fn Java_top_dns7_feedstr_MainActivity_nativeTyped<'caller>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    key: i32,
+    text: JString<'caller>,
+) {
+    let key = match key {
+        1 => egui::Key::Backspace,
+        2 => egui::Key::Delete,
+        3 => egui::Key::Enter,
+        _ => {
+            let text = env.with_env(|env| -> jni::errors::Result<_> { Ok(text.mutf8_chars(env)?.to_string()) });
+            if let Ok(text) = outcome(text.into_outcome()) {
+                // A character typed, or more pasted (which single-line fields
+                // take without line breaks).
+                let one = text.chars().count() == 1;
+                TYPED.lock().unwrap().push(if one { egui::Event::Text(text) } else { egui::Event::Paste(text) });
+                repaint();
+            }
+            return;
+        }
+    };
+    let modifiers = egui::Modifiers::NONE;
+    TYPED.lock().unwrap().extend(
+        [true, false].map(|pressed| egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers }),
+    );
     repaint();
 }
 

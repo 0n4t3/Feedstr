@@ -67,6 +67,113 @@ pub struct Subscriptions {
     /// copies on seeing a newer value, and every older entry is ignored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub erased_at: Option<i64>,
+    /// The relays to sync with.
+    #[serde(default, skip_serializing_if = "RelayList::is_empty")]
+    pub relays: RelayList,
+}
+
+/// The relays to sync with, shared so that a relay added or removed on one
+/// device is used by the others too.
+///
+/// Until the user changes the list, every device uses the defaults of the
+/// version of Feedstr it runs (`custom` is unset or false), so an update can
+/// change them. "Use the default relays" sets `custom` to false again and
+/// leaves the entries alone; the next change starts from the defaults.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RelayList {
+    /// Whether the relays below are used instead of the defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom: Option<Lww<bool>>,
+    /// Relay address -> in the list. Removing one keeps it as a tombstone, so
+    /// each relay is merged on its own: two devices adding or removing
+    /// different relays both get their way.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub relays: BTreeMap<String, Lww<bool>>,
+}
+
+impl RelayList {
+    pub fn is_empty(&self) -> bool {
+        self.custom.is_none() && self.relays.is_empty()
+    }
+
+    pub fn is_custom(&self) -> bool {
+        self.custom.as_ref().is_some_and(|custom| custom.0)
+    }
+
+    /// The relays in the list, in the order they were added.
+    pub fn listed(&self) -> Vec<String> {
+        let mut listed: Vec<(i64, &String)> =
+            self.relays.iter().filter(|(_, listed)| listed.0).map(|(url, listed)| (listed.1, url)).collect();
+        listed.sort();
+        listed.into_iter().map(|(_, url)| url.clone()).collect()
+    }
+
+    /// The newest timestamp in the list (0 if there is none).
+    pub fn newest(&self) -> i64 {
+        self.relays.values().map(|v| v.1).chain(self.custom.as_ref().map(|c| c.1)).max().unwrap_or(0)
+    }
+
+    /// Makes `relays` the list (`custom`), or goes back to the defaults.
+    /// Relays that are added get timestamps from `t` on, in order; `t` must be
+    /// newer than every timestamp in the list.
+    pub fn set(&mut self, relays: &[String], custom: bool, t: i64) {
+        self.custom = Some(Lww(custom, t));
+        if !custom {
+            return;
+        }
+        for (url, listed) in &mut self.relays {
+            if listed.0 && !relays.contains(url) {
+                *listed = Lww(false, t);
+            }
+        }
+        let mut next = t;
+        for url in relays {
+            // A relay kept from before signing in to this account (timestamp 0) is shared now.
+            if self.relays.get(url).is_none_or(|listed| !listed.0 || listed.1 == 0) {
+                self.relays.insert(url.clone(), Lww(true, next));
+                next += 1;
+            }
+        }
+    }
+
+    /// Merges another device's list, ignoring values from `floor` or before
+    /// (last writer wins, ties go to the larger value). Returns whether
+    /// anything changed.
+    pub fn merge(&mut self, other: &RelayList, floor: i64) -> bool {
+        let newer = |remote: &Lww<bool>, local: Option<&Lww<bool>>| {
+            remote.1 > floor && local.is_none_or(|local| (remote.1, remote.0) > (local.1, local.0))
+        };
+        let mut changed = false;
+        if let Some(remote) = other.custom.as_ref().filter(|remote| newer(remote, self.custom.as_ref())) {
+            self.custom = Some(remote.clone());
+            // The account has a list of its own: one kept from before signing in gives way.
+            self.relays.retain(|_, listed| listed.1 > 0);
+            changed = true;
+        }
+        for (url, remote) in &other.relays {
+            if newer(remote, self.relays.get(url)) {
+                self.relays.insert(url.clone(), remote.clone());
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// The list as shared: without values that aren't (timestamp 0).
+    pub fn shared(&self) -> RelayList {
+        RelayList {
+            custom: self.custom.clone().filter(|custom| custom.1 > 0),
+            relays: self.relays.iter().filter(|(_, v)| v.1 > 0).map(|(url, v)| (url.clone(), v.clone())).collect(),
+        }
+    }
+
+    /// Keeps the list but stops sharing it (timestamp 0), so any list the
+    /// account already has wins over it.
+    pub fn unshare(&mut self) {
+        for value in self.custom.iter_mut().chain(self.relays.values_mut()) {
+            value.1 = 0;
+        }
+    }
 }
 
 /// Hides items containing a word or phrase.
@@ -232,6 +339,55 @@ mod tests {
         let text = BASE64.encode(deflate.finish().unwrap());
         let err = decode::<Subscriptions>(&text).unwrap_err();
         assert!(err.to_string().contains("newer version"));
+    }
+
+    fn urls(list: &[&str]) -> Vec<String> {
+        list.iter().map(|url| url.to_string()).collect()
+    }
+
+    #[test]
+    fn relay_lists_merge_relay_by_relay() {
+        let mut a = RelayList::default();
+        assert!(!a.is_custom());
+        a.set(&urls(&["wss://one", "wss://two"]), true, 10);
+        assert_eq!(a.listed(), ["wss://one", "wss://two"]);
+        let mut b = a.clone();
+        // Concurrently, one device adds a relay and the other removes one.
+        a.set(&urls(&["wss://one", "wss://two", "wss://three"]), true, 20);
+        b.set(&urls(&["wss://two"]), true, 21);
+        let (mut ab, mut ba) = (a.clone(), b.clone());
+        assert!(ab.merge(&b, 0) && ba.merge(&a, 0));
+        assert_eq!(ab, ba);
+        assert_eq!(ab.listed(), ["wss://two", "wss://three"]);
+        // Merging again changes nothing.
+        assert!(!ab.merge(&ba, 0));
+        // Going back to the defaults is the newest change to the mode, so it wins.
+        b.set(&[], false, 30);
+        assert!(ab.merge(&b, 0));
+        assert!(!ab.is_custom());
+        // The next change starts from the defaults, not from the old list.
+        ab.set(&urls(&["wss://default", "wss://four"]), true, 40);
+        assert_eq!(ab.listed(), ["wss://default", "wss://four"]);
+        // Values from before an erase are ignored.
+        assert!(!RelayList::default().merge(&ab, ab.newest()));
+    }
+
+    #[test]
+    fn unshared_relay_lists_give_way() {
+        let mut device = RelayList::default();
+        device.set(&urls(&["wss://mine"]), true, 10);
+        device.unshare();
+        assert_eq!(device.shared(), RelayList::default());
+        assert_eq!(device.listed(), ["wss://mine"]);
+        // The account's own list wins...
+        let mut account = RelayList::default();
+        account.set(&urls(&["wss://theirs"]), true, 5);
+        let mut merged = device.clone();
+        assert!(merged.merge(&account, 0));
+        assert_eq!(merged.listed(), ["wss://theirs"]);
+        // ...and a change on this device shares all of its list.
+        device.set(&urls(&["wss://mine", "wss://new"]), true, 20);
+        assert_eq!(device.shared().listed(), ["wss://mine", "wss://new"]);
     }
 
     #[test]

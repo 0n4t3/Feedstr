@@ -8,7 +8,9 @@ use std::time::Duration;
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
-use crate::docs::{self, CacheLimits, FeedItems, Item, ItemState, Lww, StateShard, Subscriptions, WordFilter};
+use crate::docs::{
+    self, CacheLimits, FeedItems, Item, ItemState, Lww, RelayList, StateShard, Subscriptions, WordFilter,
+};
 use crate::html;
 use crate::longform;
 
@@ -359,6 +361,10 @@ impl Db {
 
     /// Forgets the account's data (settings like relays stay), and optionally how to sign in.
     pub fn wipe_account(&self, forget_login: bool) -> Result<()> {
+        // This device keeps using its relays, but the next account's own list wins over them.
+        let mut relays = self.relay_list()?;
+        relays.unshare();
+        self.store_relay_list(&self.conn, &relays)?;
         let login = if forget_login { ", 'login', 'sync_key', 'bunker_uri', 'bunker_app_key'" } else { "" };
         self.wipe(&format!(
             "DELETE FROM meta WHERE key IN ('salt', 'salt_t', 'pubkey', 'cache_limits', 'erased_at'{login});"
@@ -1109,6 +1115,43 @@ impl Db {
         }
     }
 
+    /// The relay list as synced. `relays` (one address per line) is where
+    /// older versions kept a list the user changed; it is shared from now on.
+    pub fn relay_list(&self) -> Result<RelayList> {
+        if let Some(json) = self.meta("relay_list")? {
+            return Ok(serde_json::from_str(&json)?);
+        }
+        let mut list = RelayList::default();
+        if let Some(old) = self.meta("relays")? {
+            let mut relays: Vec<String> = Vec::new();
+            for relay in old.lines().filter_map(crate::worker::parse_relay) {
+                if !relays.contains(&relay) {
+                    relays.push(relay);
+                }
+            }
+            list.set(&relays, true, self.clock()?);
+            self.store_relay_list(&self.conn, &list)?;
+            self.delete_meta("relays")?;
+        }
+        Ok(list)
+    }
+
+    /// Makes `relays` (cleaned-up addresses) the relay list, or goes back to the defaults.
+    pub fn set_relay_list(&self, relays: &[String], custom: bool) -> Result<()> {
+        let mut list = self.relay_list()?;
+        list.set(relays, custom, self.clock()?.max(list.newest() + 1));
+        self.store_relay_list(&self.conn, &list)
+    }
+
+    fn store_relay_list(&self, conn: &Connection, list: &RelayList) -> Result<()> {
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('relay_list', ?1)",
+            [serde_json::to_string(list)?],
+        )?;
+        bump(conn, SUBSCRIPTIONS_REV)?;
+        Ok(())
+    }
+
     pub fn ensure_salt(&self) -> Result<String> {
         if let Some(salt) = self.salt()? {
             return Ok(salt.0);
@@ -1168,7 +1211,16 @@ impl Db {
             })?
             .collect::<Result<_, _>>()?;
         let erased_at = Some(self.erased_at()?).filter(|&t| t > 0);
-        Ok(Subscriptions { salt: self.salt()?, feeds, categories, filters, cache: self.cache_limits()?, erased_at })
+        let relays = self.relay_list()?.shared();
+        Ok(Subscriptions {
+            salt: self.salt()?,
+            feeds,
+            categories,
+            filters,
+            cache: self.cache_limits()?,
+            erased_at,
+            relays,
+        })
     }
 
     /// A synced state document. Items of Local Only feeds have their shadow
@@ -1316,6 +1368,13 @@ impl Db {
             if newer {
                 self.store_cache_limits(&tx, remote)?;
             }
+        }
+        // Only addresses this version would store itself.
+        let mut remote_relays = doc.relays.clone();
+        remote_relays.relays.retain(|url, _| crate::worker::parse_relay(url).as_ref() == Some(url));
+        let mut relays = self.relay_list()?;
+        if relays.merge(&remote_relays, floor) {
+            self.store_relay_list(&tx, &relays)?;
         }
         let mut changed = 0;
         let mut regroup = false;

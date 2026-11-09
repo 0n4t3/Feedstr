@@ -8,9 +8,9 @@ use std::time::Duration;
 use anyhow::Result;
 use eframe::egui::{
     self, Align, Button, CentralPanel, Color32, ComboBox, CornerRadius, DragValue, FontId, Frame, Galley, Id, Key,
-    Label, Layout, Margin, Modal, OpenUrl, Painter, Panel, Pos2, Rect, Response, RichText, ScrollArea, Sense, Shape,
-    Stroke, StrokeKind, TextEdit, TextStyle, Theme, ThemePreference, Ui, Vec2, ViewportCommand, pos2, text::LayoutJob,
-    text_edit::TextEditState, vec2,
+    Label, Layout, Margin, Modal, OpenUrl, Painter, Panel, Pos2, ProgressBar, Rect, Response, RichText, ScrollArea,
+    Sense, Shape, Stroke, StrokeKind, TextEdit, TextStyle, Theme, ThemePreference, Ui, Vec2, ViewportCommand, pos2,
+    text::LayoutJob, text_edit::TextEditState, vec2,
 };
 use nostr_sdk::prelude::{Keys, ToBech32};
 use tokio::sync::mpsc::UnboundedSender;
@@ -137,6 +137,8 @@ enum Dialog {
         nsec: String,
     },
     ConfirmSignOut,
+    /// The whole status message, which the top bar may cut short.
+    Status,
     /// Marking every unread article in a view (matching a search) as read.
     ConfirmMarkRead {
         view: View,
@@ -243,14 +245,18 @@ pub struct App {
     dialog: Option<Dialog>,
     settings: Option<SettingsPage>,
     status: String,
+    /// How far along what the status says is under way (a sync, say) is, from
+    /// 0 to 1, with the status it goes with: a newer status hides it.
+    progress: Option<(String, f32)>,
     /// Signing in again (at startup, or after changing relays) failed.
     sign_in_problem: Option<String>,
     npub: String,
     view: View,
+    /// Only unread items are listed; kept on this device.
     unread_only: bool,
     /// Only items whose title, author or text contain this.
     search: String,
-    /// Categories folded up in the sidebar.
+    /// Categories (and the follows group) folded up in the sidebar; kept on this device.
     collapsed: HashSet<String>,
     feeds: Vec<FeedRow>,
     favorites: i64,
@@ -320,6 +326,8 @@ impl App {
         let zoom = db.meta("zoom")?.and_then(|z| z.parse().ok()).unwrap_or(1.0);
         cc.egui_ctx.set_zoom_factor(zoom);
         let layout = ListLayout::from_key(&db.meta("layout")?.unwrap_or_default());
+        let unread_only = db.meta("unread_only")?.as_deref() == Some("1");
+        let collapsed = db.meta("collapsed")?.unwrap_or_default().lines().map(String::from).collect();
 
         let signed_in = db.meta("login")?.is_some();
         if signed_in {
@@ -339,12 +347,13 @@ impl App {
             dialog: None,
             settings: None,
             status: "Connecting…".into(),
+            progress: None,
             sign_in_problem: None,
             npub: String::new(),
             view: View::All,
-            unread_only: false,
+            unread_only,
             search: String::new(),
-            collapsed: HashSet::new(),
+            collapsed,
             feeds: Vec::new(),
             favorites: 0,
             follows_people: Vec::new(),
@@ -478,6 +487,10 @@ impl App {
                     self.dialog = Some(Dialog::ConfirmSignOut);
                 }
                 Msg::Status(status) => self.status = status,
+                Msg::Progress(status, done) => {
+                    self.progress = Some((status.clone(), done));
+                    self.status = status;
+                }
                 Msg::FeedAdded(Ok(url)) => {
                     self.dialog = None;
                     self.view = View::Feed(url);
@@ -773,7 +786,15 @@ impl App {
                         showing: false,
                     });
                 }
-                ui.add(Label::new(RichText::new(&self.status).small().weak()).truncate()).on_hover_text(&self.status);
+                // Cut short when it doesn't fit (on a phone, say); tapping it shows all of it.
+                let status = Label::new(RichText::new(&self.status).small().weak()).truncate().sense(Sense::click());
+                if let Some((_, done)) = self.progress.as_ref().filter(|(status, _)| *status == self.status) {
+                    let width = if self.narrow { 40.0 } else { 80.0 };
+                    ui.add(ProgressBar::new(*done).desired_width(width).desired_height(6.0));
+                }
+                if ui.add(status).on_hover_text(&self.status).clicked() {
+                    self.dialog = Some(Dialog::Status);
+                }
             });
         });
     }
@@ -872,6 +893,7 @@ impl App {
                 if !self.collapsed.remove(&category) {
                     self.collapsed.insert(category);
                 }
+                self.save_collapsed();
             }
             Some(FeedAction::SetCategory(url, category)) if self.db.set_category(&url, &category).is_ok() => {
                 self.reload();
@@ -899,8 +921,20 @@ impl App {
             if self.view == View::Category(from.to_string()) {
                 self.view = if to.trim().is_empty() { View::All } else { View::Category(to.trim().to_string()) };
             }
+            // A folded group stays folded under its new name.
+            if self.collapsed.remove(from) && !to.trim().is_empty() {
+                self.collapsed.insert(to.trim().to_string());
+            }
+            self.save_collapsed();
             self.reload();
         }
+    }
+
+    /// Remembers which groups are folded up, so they stay that way next time.
+    fn save_collapsed(&self) {
+        let mut collapsed: Vec<&str> = self.collapsed.iter().map(String::as_str).collect();
+        collapsed.sort();
+        let _ = self.db.set_meta("collapsed", &collapsed.join("\n"));
     }
 
     fn item_list(&mut self, ui: &mut Ui) {
@@ -973,6 +1007,7 @@ impl App {
                     self.mark_older_read(self.view.clone(), &self.search.clone());
                 }
                 if ui.toggle_value(&mut self.unread_only, "Unread").changed() {
+                    let _ = self.db.set_meta("unread_only", if self.unread_only { "1" } else { "0" });
                     self.limit = ITEMS_PAGE;
                     self.reload();
                 }
@@ -1254,6 +1289,18 @@ impl App {
                         {
                             self.status = format!("{e:#}");
                         }
+                        if html::is_web_link(&item.link) {
+                            if self.platform.shares_links() {
+                                if ui.button("Share…").clicked()
+                                    && let Err(e) = self.platform.share_link(&item_title(&item.title), &item.link)
+                                {
+                                    self.status = format!("Sharing failed: {e:#}");
+                                }
+                            } else if ui.button("Copy URL").clicked() {
+                                ui.ctx().copy_text(item.link.clone());
+                                self.status = "Copied the article's address".into();
+                            }
+                        }
                     });
                     ui.add_space(14.0);
                     ui.separator();
@@ -1509,6 +1556,20 @@ impl App {
                         }
                         if ui.button("Cancel").clicked() {
                             open = false;
+                        }
+                    });
+                }
+                Dialog::Status => {
+                    ui.label(RichText::new("Status").size(18.0).strong());
+                    ui.add_space(8.0);
+                    ui.add(Label::new(&self.status).wrap().selectable(true));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.add(primary_button("Close")).clicked() {
+                            open = false;
+                        }
+                        if ui.button("Copy").clicked() {
+                            ui.ctx().copy_text(self.status.clone());
                         }
                     });
                 }

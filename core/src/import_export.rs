@@ -175,9 +175,11 @@ pub fn export_backup(db: &Db) -> Result<String> {
     // Everything this device has, including feeds it doesn't sync.
     let mut subscriptions = db.local_subscriptions()?;
     // The salt names this account's documents on relays, and an erase is about
-    // this account's relay data too; neither is part of the content.
+    // this account's relay data too; neither is part of the content. The relay
+    // list is how this device reaches the account, so it stays out as well.
     subscriptions.salt = None;
     subscriptions.erased_at = None;
+    subscriptions.relays = Default::default();
     let mut feeds = BTreeMap::new();
     for feed in db.all_feeds()? {
         feeds.insert(feed.url.clone(), db.feed_backup(&feed.url)?);
@@ -227,6 +229,7 @@ pub fn import_backup(db: &Db, json: &str) -> Result<BackupImport> {
     let mut backup: Backup = serde_json::from_str(json).context("the backup is damaged")?;
     backup.subscriptions.salt = None;
     backup.subscriptions.erased_at = None;
+    backup.subscriptions.relays = Default::default();
     db.merge_subscriptions(&backup.subscriptions)?;
     for (url, feed) in &backup.feeds {
         db.merge_feed_items(url, feed)?;
@@ -337,6 +340,21 @@ mod tests {
         assert_eq!(other.feeds().unwrap()[0].title, "Example");
         // The salt stays with the account it belongs to.
         assert!(other.salt().unwrap().is_none());
+    }
+
+    #[test]
+    fn backups_leave_the_relay_list_alone() {
+        let (db, _, _) = sample();
+        crate::worker::set_relays(&db, &["wss://mine.example".into()]).unwrap();
+        let backup = export_backup(&db).unwrap();
+        assert!(!backup.contains("mine.example"));
+        let other = Db::open_memory().unwrap();
+        crate::worker::set_relays(&other, &["wss://theirs.example".into()]).unwrap();
+        // Even a hand-edited backup with relays in it doesn't change them.
+        let mut json: serde_json::Value = serde_json::from_str(&backup).unwrap();
+        json["subscriptions"]["relays"] = serde_json::to_value(db.subscriptions_doc().unwrap().relays).unwrap();
+        import_backup(&other, &json.to_string()).unwrap();
+        assert_eq!(crate::worker::relays(&other), ["wss://theirs.example"]);
     }
 
     #[test]

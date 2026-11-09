@@ -22,6 +22,7 @@
 //! are given a growing break.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Result, anyhow};
 use futures::future::join_all;
@@ -85,6 +86,61 @@ pub struct Options {
     pub publish: bool,
     /// Republish a feed's cache at most every few hours.
     pub throttle_feed_caches: bool,
+}
+
+/// What a sync is busy with, for showing how far along it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// Asking the relays for what changed, `done` of `total` requests.
+    Reading,
+    /// Decrypting what changed, `done` of `total` versions.
+    Decrypting,
+    /// Encrypting and signing changes to publish, `done` of `total`.
+    Encrypting,
+    /// Sending changes, `done` of `total` (one per document per relay).
+    Uploading,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Progress {
+    pub step: Step,
+    pub done: usize,
+    pub total: usize,
+}
+
+/// Counts what's done in one step, telling the caller after each one.
+struct Counter<'a> {
+    step: Step,
+    done: AtomicUsize,
+    total: AtomicUsize,
+    progress: &'a dyn Fn(Progress),
+}
+
+impl<'a> Counter<'a> {
+    fn new(step: Step, total: usize, progress: &'a dyn Fn(Progress)) -> Self {
+        let counter = Counter { step, done: AtomicUsize::new(0), total: AtomicUsize::new(total), progress };
+        if total > 0 {
+            counter.report();
+        }
+        counter
+    }
+
+    fn tick(&self) {
+        self.done.fetch_add(1, Ordering::Relaxed);
+        self.report();
+    }
+
+    /// Corrects the total, once it's known better.
+    fn set_total(&self, total: usize) {
+        self.total.store(total, Ordering::Relaxed);
+        self.report();
+    }
+
+    fn report(&self) {
+        let done = self.done.load(Ordering::Relaxed);
+        let total = self.total.load(Ordering::Relaxed).max(done);
+        (self.progress)(Progress { step: self.step, done, total });
+    }
 }
 
 #[derive(Default, Debug)]
@@ -227,6 +283,7 @@ struct Run<'a, T> {
     /// Events published in this sync.
     publishes: usize,
     report: Report,
+    progress: &'a dyn Fn(Progress),
 }
 
 /// An event to publish.
@@ -238,18 +295,53 @@ struct Job {
     content: String,
 }
 
-/// Reads from one relay, a few requests at a time.
-async fn fetch_chunked<T: Transport>(t: &T, relay: &str, wanted: &[(String, Option<u64>)]) -> Result<Vec<RawEvent>> {
-    let chunks = stream::iter(wanted.chunks(FILTERS_PER_REQ)).map(|chunk| t.fetch(relay, chunk));
+/// Reads from one relay, a few requests at a time, ticking after each one.
+async fn fetch_chunked<T: Transport>(
+    t: &T,
+    relay: &str,
+    wanted: &[(String, Option<u64>)],
+    counter: &Counter<'_>,
+) -> Result<Vec<RawEvent>> {
+    let chunks = stream::iter(wanted.chunks(FILTERS_PER_REQ)).map(|chunk| async move {
+        let result = t.fetch(relay, chunk).await;
+        counter.tick();
+        result
+    });
     let results: Vec<Result<Vec<RawEvent>>> = chunks.buffer_unordered(REQS_IN_FLIGHT).collect().await;
     Ok(results.into_iter().collect::<Result<Vec<_>>>()?.into_iter().flatten().collect())
 }
 
 pub async fn sync<T: Transport>(db: &Db, t: &T, options: Options) -> Result<Report> {
-    sync_at(db, t, options, now_ms()).await
+    sync_reporting(db, t, options, &|_| {}).await
 }
 
+/// Syncs, telling `progress` how far along it is as it goes.
+pub async fn sync_reporting<T: Transport>(
+    db: &Db,
+    t: &T,
+    options: Options,
+    progress: &dyn Fn(Progress),
+) -> Result<Report> {
+    sync_at_reporting(db, t, options, now_ms(), progress).await
+}
+
+#[cfg(test)]
 async fn sync_at<T: Transport>(db: &Db, t: &T, options: Options, now: i64) -> Result<Report> {
+    sync_at_reporting(db, t, options, now, &|_| {}).await
+}
+
+/// Requests needed to read `docs` documents from every relay.
+fn requests(relays: &[String], docs: usize) -> usize {
+    relays.len() * docs.div_ceil(FILTERS_PER_REQ)
+}
+
+async fn sync_at_reporting<T: Transport>(
+    db: &Db,
+    t: &T,
+    options: Options,
+    now: i64,
+    progress: &dyn Fn(Progress),
+) -> Result<Report> {
     let relays = t.relays();
     let mut full = BTreeSet::new();
     let mut backed_off = BTreeSet::new();
@@ -264,15 +356,21 @@ async fn sync_at<T: Transport>(db: &Db, t: &T, options: Options, now: i64) -> Re
     }
     let report = Report { relays_total: relays.len(), ..Default::default() };
     let blocked = BTreeSet::new();
-    let mut run = Run { db, t, options, now, relays, full, backed_off, blocked, planned: 0, publishes: 0, report };
+    let mut run =
+        Run { db, t, options, now, relays, full, backed_off, blocked, planned: 0, publishes: 0, report, progress };
     let mut all_ds = BTreeSet::new();
     for _ in 0..MAX_ROUNDS {
         run.blocked.clear();
+        // The documents to read aren't all known until the feed list is read:
+        // until then, guess that it lists the feeds this device knows.
+        let first_reads = requests(&run.relays, 1) + requests(&run.relays, docs::FEED_SHARDS as usize);
+        let rest_guess = requests(&run.relays, docs::STATE_SHARDS as usize + db.synced_feeds()?.len());
+        let reading = Counter::new(Step::Reading, first_reads + rest_guess, progress);
 
         // The subscriptions document comes first: it holds the salt that names
         // the other documents.
         let subs = BTreeMap::from([(docs::SUBSCRIPTIONS_D.to_string(), Target::Subscriptions)]);
-        let mut view = run.read(&subs).await?;
+        let mut view = run.read(&subs, &reading).await?;
         if run.blocked.contains(docs::SUBSCRIPTIONS_D) && db.salt()?.is_none() {
             // Without the salt we'd invent a new one and orphan everything.
             anyhow::bail!("{}", run.report.problems.join("; "));
@@ -281,7 +379,7 @@ async fn sync_at<T: Transport>(db: &Db, t: &T, options: Options, now: i64) -> Re
         // Then the feed list, which says which feeds' caches there are.
         let feeds: BTreeMap<String, Target> =
             (0..docs::FEED_SHARDS).map(|shard| (docs::feeds_d(&salt, shard), Target::Feeds(shard))).collect();
-        join(&mut view, run.read(&feeds).await?);
+        join(&mut view, run.read(&feeds, &reading).await?);
         // Read state before feed caches, so it is published first if there is a lot to publish.
         let mut rest = Vec::new();
         for shard in 0..docs::STATE_SHARDS {
@@ -290,7 +388,8 @@ async fn sync_at<T: Transport>(db: &Db, t: &T, options: Options, now: i64) -> Re
         for url in db.synced_feeds()? {
             rest.push((docs::items_d(&salt, &url), Target::Items(url)));
         }
-        join(&mut view, run.read(&rest.iter().cloned().collect()).await?);
+        reading.set_total(first_reads + requests(&run.relays, rest.len()));
+        join(&mut view, run.read(&rest.iter().cloned().collect(), &reading).await?);
         let targets: Vec<(String, Target)> = subs.into_iter().chain(feeds).chain(rest).collect();
         for (relay, versions) in &view {
             if versions.is_some() && run.full.remove(relay) {
@@ -380,7 +479,7 @@ pub async fn erase<T: Transport>(db: &Db, t: &T) -> Result<usize> {
 
 impl<T: Transport> Run<'_, T> {
     /// Reads the given documents from every relay and merges new versions.
-    async fn read(&mut self, targets: &BTreeMap<String, Target>) -> Result<View> {
+    async fn read(&mut self, targets: &BTreeMap<String, Target>, reading: &Counter<'_>) -> Result<View> {
         let mut known = BTreeMap::new();
         let mut requests = Vec::new();
         for relay in &self.relays {
@@ -393,7 +492,7 @@ impl<T: Transport> Run<'_, T> {
         }
         let t = self.t;
         let results =
-            join_all(self.relays.iter().zip(&requests).map(|(relay, wanted)| fetch_chunked(t, relay, wanted)));
+            join_all(self.relays.iter().zip(&requests).map(|(relay, wanted)| fetch_chunked(t, relay, wanted, reading)));
         let results = results.await;
         let decrypted = self.decrypt_new(&results).await?;
 
@@ -460,8 +559,10 @@ impl<T: Transport> Run<'_, T> {
             }
         }
         let t = self.t;
+        let counter = &Counter::new(Step::Decrypting, todo.len(), self.progress);
         let decrypts = stream::iter(todo).map(|(id, payload)| async move {
             let content = t.decrypt(payload).await.map_err(|e| format!("{e:#}"));
+            counter.tick();
             (id, content)
         });
         Ok(decrypts.buffer_unordered(DECRYPTS_IN_FLIGHT).collect().await)
@@ -556,7 +657,12 @@ impl<T: Transport> Run<'_, T> {
     /// then on: hitting a limit repeatedly can get us banned for a while.
     async fn publish(&mut self, jobs: Vec<Job>) -> Result<()> {
         let t = self.t;
-        let prepares = stream::iter(&jobs).map(|job| t.prepare(&job.d, job.created_at, &job.content));
+        let encrypting = &Counter::new(Step::Encrypting, jobs.len(), self.progress);
+        let prepares = stream::iter(&jobs).map(|job| async move {
+            let result = t.prepare(&job.d, job.created_at, &job.content).await;
+            encrypting.tick();
+            result
+        });
         let prepared: Vec<_> = prepares.buffered(PREPARES_IN_FLIGHT).collect().await;
         let mut ready = Vec::new();
         for (job, result) in jobs.iter().zip(prepared) {
@@ -570,8 +676,12 @@ impl<T: Transport> Run<'_, T> {
             }
         }
         let ready = &ready;
+        let sending_to = |relay: &String| !self.backed_off.contains(relay);
+        let sends = (self.relays.iter().filter(|relay| sending_to(relay)))
+            .map(|relay| ready.iter().filter(|(job, ..)| job.relays.contains(relay)).count());
+        let uploading = &Counter::new(Step::Uploading, sends.sum(), self.progress);
         let mut lanes = Vec::new();
-        for relay in self.relays.iter().filter(|relay| !self.backed_off.contains(*relay)) {
+        for relay in self.relays.iter().filter(|relay| sending_to(relay)) {
             let window = match self.db.relay_state(relay)?.send_window {
                 0 => FIRST_SEND_WINDOW,
                 window => window as usize,
@@ -583,6 +693,7 @@ impl<T: Transport> Run<'_, T> {
                     let batch: Vec<_> = todo.by_ref().take(window).collect();
                     let sends = batch.iter().map(|(_, (_, _, event))| t.send(relay, event));
                     for ((i, _), result) in batch.iter().zip(join_all(sends).await) {
+                        uploading.tick();
                         stopped |= result.as_ref().is_err_and(|reason| asks_to_slow_down(reason));
                         results.push((*i, result));
                     }
@@ -815,6 +926,41 @@ mod tests {
         // Nothing left to publish once everyone agrees.
         assert_eq!(sync_ok(&a, &net).await.published, 0);
         assert_eq!(sync_ok(&b, &net).await.published, 0);
+    }
+
+    #[tokio::test]
+    async fn progress_counts_each_step_to_the_end() {
+        async fn steps(db: &Db, net: &FakeNet) -> (Report, Vec<Progress>) {
+            let seen = std::cell::RefCell::new(Vec::new());
+            let report = sync_reporting(db, net, PUSH, &|p| seen.borrow_mut().push(p)).await.unwrap();
+            (report, seen.into_inner())
+        }
+        fn last(seen: &[Progress], step: Step) -> Progress {
+            *seen.iter().rev().find(|p| p.step == step).unwrap()
+        }
+        let net = FakeNet::new(2);
+        let a = client_with_items();
+        let (report, seen) = steps(&a, &net).await;
+        assert!(report.published > 0);
+        assert!(seen.iter().all(|p| p.done <= p.total));
+        let reading = last(&seen, Step::Reading);
+        assert_eq!(reading.done, reading.total);
+        assert_eq!(
+            last(&seen, Step::Encrypting),
+            Progress { step: Step::Encrypting, done: report.published, total: report.published }
+        );
+        let uploads = 2 * report.published;
+        assert_eq!(last(&seen, Step::Uploading), Progress { step: Step::Uploading, done: uploads, total: uploads });
+
+        // A new device decrypts everything, and has nothing to upload.
+        let b = Db::open_memory().unwrap();
+        let (report, seen) = steps(&b, &net).await;
+        assert_eq!(report.published, 0);
+        let decrypting = last(&seen, Step::Decrypting);
+        assert!(decrypting.total > 0 && decrypting.done == decrypting.total);
+        assert!(!seen.iter().any(|p| p.step == Step::Uploading));
+        let reading = last(&seen, Step::Reading);
+        assert_eq!(reading.done, reading.total);
     }
 
     #[tokio::test]
@@ -1156,6 +1302,40 @@ mod tests {
         let d = docs::items_d(&a.salt().unwrap().unwrap().0, FEED);
         let cache: docs::FeedItems = docs::decode(&net.get("r0", &d).unwrap().1).unwrap();
         assert_eq!(cache.items.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn relay_list_changes_reach_other_devices() {
+        use crate::nostr::DEFAULT_RELAYS;
+        use crate::worker::{custom_relays, relays, set_relays};
+        let net = FakeNet::new(1);
+        let a = client_with_items();
+        let b = Db::open_memory().unwrap();
+        sync_ok(&a, &net).await;
+        sync_ok(&b, &net).await;
+        // Both on the defaults: nothing about relays is synced.
+        assert!(relay_subscriptions(&net, "r0").relays.is_empty());
+        let mut list = relays(&a);
+        list.push("wss://added.example".into());
+        set_relays(&a, &list).unwrap();
+        sync_ok(&a, &net).await;
+        sync_ok(&b, &net).await;
+        assert_eq!(relays(&b), list);
+        // Concurrent edits: one removes a relay, the other adds one.
+        let removed = list[0].clone();
+        set_relays(&a, &list[1..]).unwrap();
+        set_relays(&b, &[list.clone(), vec!["wss://more.example".into()]].concat()).unwrap();
+        for db in [&a, &b, &a] {
+            sync_ok(db, &net).await;
+        }
+        assert_eq!(relays(&a), relays(&b));
+        assert!(!relays(&a).contains(&removed) && relays(&a).contains(&"wss://more.example".to_string()));
+        // Going back to the defaults goes everywhere too.
+        set_relays(&b, &DEFAULT_RELAYS.iter().map(|r| r.to_string()).collect::<Vec<_>>()).unwrap();
+        sync_ok(&b, &net).await;
+        sync_ok(&a, &net).await;
+        assert!(!custom_relays(&a));
+        assert_eq!(relays(&a), DEFAULT_RELAYS);
     }
 
     #[tokio::test]
