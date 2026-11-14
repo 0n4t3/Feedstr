@@ -8,6 +8,7 @@ import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.graphics.Insets;
 import android.net.Uri;
@@ -51,7 +52,8 @@ public class MainActivity extends NativeActivity {
     /** Typing on the keyboard (see TextInput): text, or one of the keys below with text null. */
     private static native void nativeTyped(int key, String text);
     private static final int TEXT = 0, BACKSPACE = 1, DELETE = 2, ENTER = 3;
-    private static native void nativePaused();
+    /** Whether the app got it: it then stops SyncService once it's idle. */
+    private static native boolean nativePaused();
     private static native void nativeResumed();
     /** data is null if the user cancelled. */
     private static native void nativeFileOpened(int request, byte[] data);
@@ -62,6 +64,8 @@ public class MainActivity extends NativeActivity {
     private static native void nativeSignerAnswer(int request, String answer);
 
     private TextInput input;
+    /** Between onResume and onPause (main thread only). */
+    private boolean onScreen;
     /** Files waiting for the user to pick where they go, by request. */
     private final HashMap<Integer, byte[]> toSave = new HashMap<>();
     /** Requests that went to a signer app. */
@@ -93,7 +97,13 @@ public class MainActivity extends NativeActivity {
                 return insets;
             });
         }
-        // Take the keyboard's text: see TextInput.
+        // Take the keyboard's text: see TextInput. Android would open the keyboard
+        // whenever the app comes to the front, for a focused text editor like this
+        // one. "Always hidden" stops that, so it only opens when a text field is
+        // tapped. (NativeActivity.onCreate sets its own mode, overriding the
+        // manifest's, so it's set here.)
+        getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+                | WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN);
         input = new TextInput(this);
         addContentView(input, new ViewGroup.LayoutParams(1, 1));
         input.requestFocus();
@@ -113,12 +123,22 @@ public class MainActivity extends NativeActivity {
     @Override
     protected void onPause() {
         super.onPause();
-        nativePaused();
+        onScreen = false;
+        // Started now, while Android still allows it: a sync under way, or the
+        // upload of changes on leaving, can then finish in the background.
+        // Only if there's something to finish (an idle switch needs nothing),
+        // and the app got the news, since it's what stops the service once it
+        // has nothing to do. (Its stop comes through the main thread, so it
+        // can't come before this start.)
+        if (nativePaused()) {
+            SyncService.start(this);
+        }
     }
 
     @Override
     protected void onResume() {
         super.onResume();
+        onScreen = true;
         nativeResumed();
     }
 
@@ -327,6 +347,60 @@ public class MainActivity extends NativeActivity {
         runOnUiThread(() -> {
             input.password = password;
             getSystemService(InputMethodManager.class).restartInput(input);
+        });
+    }
+
+    // ---- Syncing in the background ----
+
+    private static final int NOTIFICATION_PERMISSION = 0x5e7c;
+
+    /** Keeps the app running while it syncs (on), or lets it be frozen again (off). See SyncService. */
+    public void keepRunning(boolean on) {
+        // Both on the main thread, so they happen in the order they were asked for.
+        if (!on) {
+            runOnUiThread(SyncService::stop);
+            return;
+        }
+        runOnUiThread(() -> {
+            if (!onScreen) {
+                // In the background, Android doesn't allow starting it (onPause did, if it could).
+                return;
+            }
+            askForNotifications();
+            SyncService.start(this);
+        });
+    }
+
+    /**
+     * Asks once (Android 13 and later) to show the syncing notification. The
+     * service keeps the app running either way; without permission, it's only
+     * listed under the running apps.
+     */
+    private void askForNotifications() {
+        if (Build.VERSION.SDK_INT < 33
+                || checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
+                        == PackageManager.PERMISSION_GRANTED) {
+            return;
+        }
+        SharedPreferences prefs = getSharedPreferences("notifications", MODE_PRIVATE);
+        if (prefs.getBoolean("asked", false)) {
+            return;
+        }
+        prefs.edit().putBoolean("asked", true).apply();
+        requestPermissions(new String[] {android.Manifest.permission.POST_NOTIFICATIONS}, NOTIFICATION_PERMISSION);
+    }
+
+    /**
+     * While the Sync Key is on screen (on), keeps the window out of screenshots,
+     * screen recordings and the app's preview in the list of recent apps.
+     */
+    public void setSecure(boolean on) {
+        runOnUiThread(() -> {
+            if (on) {
+                getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
+            } else {
+                getWindow().clearFlags(WindowManager.LayoutParams.FLAG_SECURE);
+            }
         });
     }
 

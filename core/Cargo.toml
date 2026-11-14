@@ -16,11 +16,11 @@ flate2 = "1.1.10"
 futures = "0.3.34"
 log = "0.4.34"
 nostr-connect = "0.45.2"
-nostr-sdk = "0.45.4"
-pulldown-cmark = { version = "0.13.5", default-features = false, features = ["html"] }
+nostr-sdk = "0.45.6"
+pulldown-cmark = { version = "0.13.6", default-features = false, features = ["html"] }
 quick-xml = "0.42"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "gzip", "brotli"] }
-rusqlite = { version = "0.40.2", features = ["bundled", "serialize"] }
+rusqlite = { version = "0.42.0", features = ["backup", "bundled", "serialize"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
@@ -51,8 +51,11 @@ getrandom = { version = "0.4.3", features = ["wasm_js"] }
 getrandom02 = { package = "getrandom", version = "0.2.17", features = ["js"] }
 js-sys = "0.3"
 nostr-browser-signer = "0.45.1"
+# SQLite in the browser (rusqlite brings it in) asks its host for the time and
+# for randomness: this has it use the browser's.
+sqlite-wasm-rs = { version = "0.6.3", default-features = false, features = ["wasm-bindgen"] }
 uuid = { version = "1.29.0", features = ["js"] }
 wasm-bindgen-futures = "0.4"
 
 [dev-dependencies]
-nostr-sdk = { version = "0.45.4", features = ["local-relay"] }
+nostr-sdk = { version = "0.45.6", features = ["local-relay"] }

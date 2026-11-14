@@ -147,7 +147,8 @@ impl Session {
     }
 
     /// Events matching `filter` on these relays. Best effort: relays that
-    /// can't be reached are skipped.
+    /// can't be reached are skipped, and so is anything a relay sends that
+    /// wasn't asked for (see [`asked_for`]).
     async fn query(&self, relays: &[String], filter: Filter) -> Vec<Event> {
         let mut targets = Vec::new();
         for relay in relays {
@@ -157,7 +158,7 @@ impl Session {
         }
         self.client.try_connect().timeout(CONNECT_TIMEOUT).await;
         match self.client.fetch_events(targets).timeout(TIMEOUT).await {
-            Ok(events) => events.into_iter().collect(),
+            Ok(events) => events.into_iter().filter(|event| asked_for(&filter, event)).collect(),
             Err(e) => {
                 log::warn!("reading long-form posts failed: {e}");
                 Vec::new()
@@ -182,12 +183,13 @@ impl Session {
             if kind == Kind::RelayList {
                 let writes = nip65::extract_relay_list(&event)
                     .filter(|(_, marker)| *marker != Some(RelayMetadata::Read))
-                    .map(|(url, _)| url.to_string());
+                    .map(|(url, _)| url.to_string())
+                    .filter(|url| public_relay(url));
                 relays.insert(author, writes.collect());
             } else if let Ok(profile) = Metadata::from_json(&event.content) {
                 let name = profile.display_name.filter(|n| !n.trim().is_empty()).or(profile.name);
                 if let Some(name) = name.filter(|n| !n.trim().is_empty()) {
-                    names.insert(author, name.trim().to_string());
+                    names.insert(author, feeds::truncate(name.trim().to_string(), feeds::MAX_AUTHOR_BYTES));
                 }
             }
         }
@@ -280,6 +282,22 @@ impl Session {
     }
 }
 
+/// Whether an event a relay sent is one `filter` asked for. A relay can send
+/// anything, and only signatures are checked on the way in: without this, any
+/// relay asked could pass off someone else's posts (and a profile giving them
+/// the writer's name) as a writer's, or another person's follow list as the
+/// user's.
+fn asked_for(filter: &Filter, event: &Event) -> bool {
+    filter.match_event(event, MatchEventOptions::new().nip50(false))
+}
+
+/// Whether a relay someone else lists as theirs is one to connect to: an
+/// encrypted connection to a relay out on the internet. Otherwise a writer's
+/// relay list could point Feedstr at this device or its local network.
+fn public_relay(url: &str) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|url| url.scheme() == "wss" && !feeds::is_local_address(&url))
+}
+
 /// The list without repeats, in its order.
 fn unique(mut list: Vec<String>) -> Vec<String> {
     let mut seen = HashSet::new();
@@ -333,7 +351,7 @@ fn item(post: &Event, names: &HashMap<PublicKey, String>) -> (String, Item) {
     let author =
         names.get(&post.pubkey).cloned().unwrap_or_else(|| short(&post.pubkey.to_bech32().unwrap_or_default()));
     let item = Item {
-        title: tag("title").unwrap_or_default(),
+        title: feeds::truncate(tag("title").unwrap_or_default(), feeds::MAX_TITLE_BYTES),
         link: format!("{WEB_VIEWER}/{naddr}"),
         author,
         published,
@@ -420,6 +438,48 @@ mod tests {
         assert!(reader.follows_anyone(follower.public_key()).await);
         assert!(!reader.follows_anyone(empty.public_key()).await);
         assert!(!reader.follows_anyone(nobody.public_key()).await);
+    }
+
+    #[test]
+    fn other_peoples_relays_must_be_public() {
+        assert!(public_relay("wss://relay.example") && public_relay("wss://relay.example:444/path"));
+        for relay in
+            ["ws://relay.example", "wss://localhost:7777", "wss://192.168.1.5", "wss://[::1]", "https://a.example"]
+        {
+            assert!(!public_relay(relay), "{relay}");
+        }
+    }
+
+    #[test]
+    fn only_what_was_asked_for_counts() {
+        let (writer, other) = (Keys::generate(), Keys::generate());
+        let event = |kind: Kind, keys: &Keys| EventBuilder::new(kind, "text").finalize(keys).unwrap();
+        let posts = Filter::new().kind(Kind::LongFormTextNote).author(writer.public_key());
+        assert!(asked_for(&posts, &event(Kind::LongFormTextNote, &writer)));
+        // Someone else's post, or the writer's other notes, aren't the writer's posts.
+        assert!(!asked_for(&posts, &event(Kind::LongFormTextNote, &other)));
+        assert!(!asked_for(&posts, &event(Kind::TextNote, &writer)));
+        // Nor is someone else's follow list or profile the one asked for.
+        let follows = Filter::new().kind(Kind::ContactList).author(writer.public_key());
+        assert!(asked_for(&follows, &event(Kind::ContactList, &writer)));
+        assert!(!asked_for(&follows, &event(Kind::ContactList, &other)));
+        let profiles = Filter::new().kinds([Kind::RelayList, Kind::Metadata]).author(writer.public_key());
+        assert!(!asked_for(&profiles, &event(Kind::Metadata, &other)));
+    }
+
+    #[tokio::test]
+    async fn a_relay_cant_slip_in_events_nobody_asked_for() {
+        use nostr_sdk::local_relay::{LocalRelayTestOptions, MockRelay};
+        // Whatever it's asked, this relay answers with (properly signed) notes by a stranger.
+        let opts = LocalRelayTestOptions { unresponsive_connection: None, send_random_events: true };
+        let relay = MockRelay::run_with_opts(opts).await.unwrap();
+        let reader = Reader { index: vec![relay.url().await.to_string()] };
+        let user = Keys::generate().public_key();
+        // They don't become a writer's posts...
+        assert!(reader.fetch_author(user, None).await.unwrap().items.is_empty());
+        // ...or the user's follow list.
+        assert!(!reader.follows_anyone(user).await);
+        assert!(reader.fetch_follows(user, None).await.is_err());
     }
 
     /// Open TCP connections to or from a local port (Linux).

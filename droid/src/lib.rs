@@ -55,7 +55,7 @@ fn android_main(app: AndroidApp) {
             *EGUI.lock().unwrap() = Some(cc.egui_ctx.clone());
             let app = App::new(cc, dir.join("feedstr.db"), Arc::new(Android))?;
             *REMOTE.lock().unwrap() = Some(app.remote());
-            Ok(Box::new(Droid { app, editing: None, password: false, paste: None }))
+            Ok(Box::new(Droid { app, editing: None, password: false, paste: None, secure: false }))
         }),
     );
     if let Err(e) = result {
@@ -72,6 +72,8 @@ struct Droid {
     password: bool,
     /// Text to paste in the next frame.
     paste: Option<String>,
+    /// Whether the window is being kept out of screenshots (the Sync Key is shown).
+    secure: bool,
 }
 
 impl eframe::App for Droid {
@@ -89,6 +91,19 @@ impl eframe::App for Droid {
         let ctx = ui.ctx().clone();
         ui.scope_builder(egui::UiBuilder::new().max_rect(ctx.content_rect()), |ui| self.app.ui(ui, frame));
         self.clipboard(&ctx);
+        // While the Sync Key is shown, keep it out of screenshots, screen
+        // recordings and the app's preview in the list of recent apps.
+        let secure = self.app.shows_sync_key();
+        if secure != self.secure {
+            let set = with_activity(|env, activity| {
+                env.call_method(activity, jni_str!("setSecure"), jni_sig!("(Z)V"), &[JValue::Bool(secure)])?;
+                Ok(())
+            });
+            match set {
+                Ok(()) => self.secure = secure,
+                Err(e) => log::error!("hiding the Sync Key from screenshots failed: {e:#}"),
+            }
+        }
     }
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
@@ -281,6 +296,8 @@ impl Platform for Android {
     }
 
     fn open_nostr_link(&self, link: &str) -> Result<()> {
+        // Only ever Nostr links: anything else could start some other app.
+        anyhow::ensure!(link.starts_with("nostr:"), "not a Nostr link");
         let opened = with_activity(|env, activity| {
             let link = env.new_string(link)?;
             let sig = jni_sig!("(Ljava/lang/String;)Z");
@@ -324,6 +341,18 @@ impl Platform for Android {
         });
         if let Err(e) = forget {
             log::error!("forgetting the signer app failed: {e:#}");
+        }
+    }
+
+    /// A foreground service (see `SyncService`) keeps Android from freezing
+    /// the app while it syncs in the background.
+    fn keep_running(&self, on: bool) {
+        let call = with_activity(|env, activity| {
+            env.call_method(activity, jni_str!("keepRunning"), jni_sig!("(Z)V"), &[JValue::Bool(on)])?;
+            Ok(())
+        });
+        if let Err(e) = call {
+            log::error!("keeping the app running failed: {e:#}");
         }
     }
 }
@@ -490,10 +519,9 @@ extern "system" fn Java_top_dns7_feedstr_MainActivity_nativeTyped<'caller>(
 }
 
 #[unsafe(no_mangle)]
-extern "system" fn Java_top_dns7_feedstr_MainActivity_nativePaused(_env: EnvUnowned, _class: JClass) {
-    if let Some(remote) = REMOTE.lock().unwrap().as_ref() {
-        remote.paused();
-    }
+/// Whether the app got it, and so will stop `SyncService` once it's idle.
+extern "system" fn Java_top_dns7_feedstr_MainActivity_nativePaused(_env: EnvUnowned, _class: JClass) -> bool {
+    REMOTE.lock().unwrap().as_ref().is_some_and(|remote| remote.paused())
 }
 
 #[unsafe(no_mangle)]

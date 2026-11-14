@@ -1,26 +1,30 @@
 //! Two-way sync of the local database with a set of relays.
 //!
-//! Each round:
 //! 1. Read our documents from every relay separately, asking each relay only
 //!    for versions newer than the one we know it has (plus a full read once a
 //!    day, to notice relays that lost data). A relay that can't be read
-//!    completely is left alone for the rest of the round.
+//!    completely is left alone for the rest of the sync.
 //! 2. Merge every new version into the local database (see [`crate::docs`]).
 //! 3. Publish the merged document to each relay whose copy differs from it
 //!    (missing, out of date, or overwritten by a concurrent writer).
+//! 4. Read back just the documents published, and repeat from step 3 (a few
+//!    times at most), which catches another device publishing between our
+//!    read and our write.
 //!
-//! Rounds repeat until no relay needs an update, which also catches another
-//! device publishing between our read and our write. Local data is never
-//! replaced by remote data, only merged with it, so an offline or stale relay
-//! can at worst delay a change, never undo it. A document we fail to decrypt
-//! or decode is never overwritten, because we can't know what it contains.
+//! Local data is never replaced by remote data, only merged with it, so an
+//! offline or stale relay can at worst delay a change, never undo it. A
+//! document we fail to decrypt or decode is never overwritten, because we
+//! can't know what it contains.
 //!
 //! To be quick without hammering relays: documents are only rebuilt and
 //! compared when their local revision changed, unchanged documents aren't
 //! downloaded again, feed caches are republished at most every few hours,
-//! requests and publishes run a few at a time, and relays that rate-limit us
-//! are given a growing break.
+//! requests and publishes run a few at a time, relays that rate-limit us
+//! are given a growing break, a relay that turns an update down isn't sent
+//! it again in the same sync, and a relay that fails a read (or several
+//! sends in a row) is left alone for the rest of the sync.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -31,9 +35,11 @@ use futures::{StreamExt, stream};
 use crate::db::{self, Db, KnownDoc, now_ms};
 use crate::docs::{self, FeedItems, Lww, StateShard, Subscriptions};
 
+/// Publish rounds per sync (see step 4 above).
 const MAX_ROUNDS: usize = 3;
-/// Most events published per sync; the rest waits for the next one.
-const MAX_PUBLISHES: usize = 500;
+/// Events encrypted and sent per batch. A large upload goes out in several
+/// batches in one sync, without reading the relays again in between.
+const PUBLISH_BATCH: usize = 500;
 /// Documents asked for per request (one filter each, so result limits can't cut answers short).
 const FILTERS_PER_REQ: usize = 10;
 /// Requests waiting for an answer at once, per relay.
@@ -47,6 +53,8 @@ const PREPARES_IN_FLIGHT: usize = 8;
 /// one (remembered) once it asks us to slow down.
 const FIRST_SEND_WINDOW: usize = 4;
 const MAX_SEND_WINDOW: usize = 16;
+/// Sends failing in a row after which a relay gets nothing more in this sync.
+const GIVE_UP_AFTER: usize = 4;
 /// A feed's cache is republished at most this often (it only matters to clients that can't fetch feeds).
 const ITEMS_PUBLISH_INTERVAL_SECS: u64 = 3 * 3600;
 const FULL_FETCH_INTERVAL_MS: i64 = 24 * 3600 * 1000;
@@ -126,7 +134,11 @@ impl<'a> Counter<'a> {
     }
 
     fn tick(&self) {
-        self.done.fetch_add(1, Ordering::Relaxed);
+        self.tick_by(1);
+    }
+
+    fn tick_by(&self, n: usize) {
+        self.done.fetch_add(n, Ordering::Relaxed);
         self.report();
     }
 
@@ -148,8 +160,6 @@ pub struct Report {
     pub relays_ok: usize,
     pub relays_total: usize,
     pub published: usize,
-    /// Changes are waiting because this sync hit its publishing limit.
-    pub more_pending: bool,
     pub problems: Vec<String>,
 }
 
@@ -276,10 +286,15 @@ struct Run<'a, T> {
     full: BTreeSet<String>,
     /// Relays that asked us to slow down.
     backed_off: BTreeSet<String>,
+    /// Relays that failed a read, or several sends in a row: asked nothing
+    /// more in this sync, since a relay that doesn't answer makes every
+    /// request wait for the full timeout.
+    unreachable: BTreeSet<String>,
+    /// Relays that turned down an update: sent nothing more in later rounds,
+    /// or every round would find them out of date and publish again.
+    refused: BTreeSet<String>,
     /// Documents we couldn't read, and so must not overwrite.
     blocked: BTreeSet<String>,
-    /// Events planned for publishing in this sync.
-    planned: usize,
     /// Events published in this sync.
     publishes: usize,
     report: Report,
@@ -289,6 +304,7 @@ struct Run<'a, T> {
 /// An event to publish.
 struct Job {
     d: String,
+    target: Target,
     rev: i64,
     relays: Vec<String>,
     created_at: u64,
@@ -296,14 +312,20 @@ struct Job {
 }
 
 /// Reads from one relay, a few requests at a time, ticking after each one.
+/// Once a request fails, the ones not yet sent are skipped.
 async fn fetch_chunked<T: Transport>(
     t: &T,
     relay: &str,
     wanted: &[(String, Option<u64>)],
     counter: &Counter<'_>,
 ) -> Result<Vec<RawEvent>> {
+    let failed = &Cell::new(false);
     let chunks = stream::iter(wanted.chunks(FILTERS_PER_REQ)).map(|chunk| async move {
-        let result = t.fetch(relay, chunk).await;
+        let result = match failed.get() {
+            true => Err(anyhow!("skipped after a failed request")),
+            false => t.fetch(relay, chunk).await,
+        };
+        failed.set(failed.get() || result.is_err());
         counter.tick();
         result
     });
@@ -355,60 +377,43 @@ async fn sync_at_reporting<T: Transport>(
         }
     }
     let report = Report { relays_total: relays.len(), ..Default::default() };
-    let blocked = BTreeSet::new();
-    let mut run =
-        Run { db, t, options, now, relays, full, backed_off, blocked, planned: 0, publishes: 0, report, progress };
-    let mut all_ds = BTreeSet::new();
-    for _ in 0..MAX_ROUNDS {
-        run.blocked.clear();
-        // The documents to read aren't all known until the feed list is read:
-        // until then, guess that it lists the feeds this device knows.
-        let first_reads = requests(&run.relays, 1) + requests(&run.relays, docs::FEED_SHARDS as usize);
-        let rest_guess = requests(&run.relays, docs::STATE_SHARDS as usize + db.synced_feeds()?.len());
-        let reading = Counter::new(Step::Reading, first_reads + rest_guess, progress);
-
-        // The subscriptions document comes first: it holds the salt that names
-        // the other documents.
-        let subs = BTreeMap::from([(docs::SUBSCRIPTIONS_D.to_string(), Target::Subscriptions)]);
-        let mut view = run.read(&subs, &reading).await?;
-        if run.blocked.contains(docs::SUBSCRIPTIONS_D) && db.salt()?.is_none() {
-            // Without the salt we'd invent a new one and orphan everything.
-            anyhow::bail!("{}", run.report.problems.join("; "));
-        }
-        let salt = db.ensure_salt()?;
-        // Then the feed list, which says which feeds' caches there are.
-        let feeds: BTreeMap<String, Target> =
-            (0..docs::FEED_SHARDS).map(|shard| (docs::feeds_d(&salt, shard), Target::Feeds(shard))).collect();
-        join(&mut view, run.read(&feeds, &reading).await?);
-        // Read state before feed caches, so it is published first if there is a lot to publish.
-        let mut rest = Vec::new();
-        for shard in 0..docs::STATE_SHARDS {
-            rest.push((docs::state_d(&salt, shard), Target::State(shard)));
-        }
-        for url in db.synced_feeds()? {
-            rest.push((docs::items_d(&salt, &url), Target::Items(url)));
-        }
-        reading.set_total(first_reads + requests(&run.relays, rest.len()));
-        join(&mut view, run.read(&rest.iter().cloned().collect(), &reading).await?);
-        let targets: Vec<(String, Target)> = subs.into_iter().chain(feeds).chain(rest).collect();
-        for (relay, versions) in &view {
-            if versions.is_some() && run.full.remove(relay) {
-                let state = db::RelayState { full_fetch_at: now, ..db.relay_state(relay)? };
-                db.set_relay_state(relay, &state)?;
-            }
-        }
+    let (unreachable, refused, blocked) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
+    let mut run = Run {
+        db,
+        t,
+        options,
+        now,
+        relays,
+        full,
+        backed_off,
+        unreachable,
+        refused,
+        blocked,
+        publishes: 0,
+        report,
+        progress,
+    };
+    let (mut view, mut targets) = run.read_all().await?;
+    let all_ds: BTreeSet<String> = targets.iter().map(|(d, _)| d.clone()).collect();
+    for round in 1..=MAX_ROUNDS {
         run.report.relays_ok = view.values().filter(|v| v.is_some()).count();
-        all_ds = targets.iter().map(|(d, _)| d.clone()).collect();
-
-        let before = run.publishes;
         let mut jobs = Vec::new();
         for (d, target) in &targets {
             jobs.extend(run.plan(d, target, &view)?);
         }
-        run.publish(jobs).await?;
-        if run.publishes == before || run.planned >= MAX_PUBLISHES {
+        if jobs.is_empty() {
             break;
         }
+        targets = jobs.iter().map(|job| (job.d.clone(), job.target.clone())).collect();
+        run.publish(jobs).await?;
+        if round == MAX_ROUNDS {
+            break;
+        }
+        // Read back only what was just published: another device writing the
+        // same document in between would have replaced our version.
+        let published: BTreeMap<String, Target> = targets.iter().cloned().collect();
+        let reading = Counter::new(Step::Reading, requests(&run.relays, published.len()), progress);
+        view = run.read(&published, &reading).await?;
     }
     db.prune_sync_cache(&run.relays, &all_ds)?;
     run.report.published = run.publishes;
@@ -478,11 +483,59 @@ pub async fn erase<T: Transport>(db: &Db, t: &T) -> Result<usize> {
 }
 
 impl<T: Transport> Run<'_, T> {
+    /// Reads every document from every relay: the subscriptions document,
+    /// then the feed list, then read state and feed caches.
+    async fn read_all(&mut self) -> Result<(View, Vec<(String, Target)>)> {
+        let (db, relays) = (self.db, self.relays.clone());
+        // The documents to read aren't all known until the feed list is read:
+        // until then, guess that it lists the feeds this device knows.
+        let first_reads = requests(&relays, 1) + requests(&relays, docs::FEED_SHARDS as usize);
+        let rest_guess = requests(&relays, docs::STATE_SHARDS as usize + db.synced_feeds()?.len());
+        let reading = Counter::new(Step::Reading, first_reads + rest_guess, self.progress);
+
+        // The subscriptions document comes first: it holds the salt that names
+        // the other documents.
+        let subs = BTreeMap::from([(docs::SUBSCRIPTIONS_D.to_string(), Target::Subscriptions)]);
+        let mut view = self.read(&subs, &reading).await?;
+        if self.blocked.contains(docs::SUBSCRIPTIONS_D) && db.salt()?.is_none() {
+            // Without the salt we'd invent a new one and orphan everything.
+            anyhow::bail!("{}", self.report.problems.join("; "));
+        }
+        let salt = db.ensure_salt()?;
+        // Then the feed list, which says which feeds' caches there are.
+        let feeds: BTreeMap<String, Target> =
+            (0..docs::FEED_SHARDS).map(|shard| (docs::feeds_d(&salt, shard), Target::Feeds(shard))).collect();
+        join(&mut view, self.read(&feeds, &reading).await?);
+        // Read state before feed caches, so it is published first if there is a lot to publish.
+        let mut rest = Vec::new();
+        for shard in 0..docs::STATE_SHARDS {
+            rest.push((docs::state_d(&salt, shard), Target::State(shard)));
+        }
+        for url in db.synced_feeds()? {
+            rest.push((docs::items_d(&salt, &url), Target::Items(url)));
+        }
+        reading.set_total(first_reads + requests(&relays, rest.len()));
+        join(&mut view, self.read(&rest.iter().cloned().collect(), &reading).await?);
+        for (relay, versions) in &view {
+            if versions.is_some() && self.full.remove(relay) {
+                let state = db::RelayState { full_fetch_at: self.now, ..db.relay_state(relay)? };
+                db.set_relay_state(relay, &state)?;
+            }
+        }
+        Ok((view, subs.into_iter().chain(feeds).chain(rest).collect()))
+    }
+
     /// Reads the given documents from every relay and merges new versions.
     async fn read(&mut self, targets: &BTreeMap<String, Target>, reading: &Counter<'_>) -> Result<View> {
-        let mut known = BTreeMap::new();
-        let mut requests = Vec::new();
+        let mut view = View::new();
+        let (mut asking, mut known, mut requests) = (Vec::new(), BTreeMap::new(), Vec::new());
         for relay in &self.relays {
+            if self.unreachable.contains(relay) {
+                view.insert(relay.clone(), None);
+                reading.tick_by(targets.len().div_ceil(FILTERS_PER_REQ));
+                continue;
+            }
+            asking.push(relay.clone());
             let docs = self.db.known_docs(relay)?;
             let full = self.full.contains(relay);
             let wanted: Vec<(String, Option<u64>)> =
@@ -492,16 +545,16 @@ impl<T: Transport> Run<'_, T> {
         }
         let t = self.t;
         let results =
-            join_all(self.relays.iter().zip(&requests).map(|(relay, wanted)| fetch_chunked(t, relay, wanted, reading)));
+            join_all(asking.iter().zip(&requests).map(|(relay, wanted)| fetch_chunked(t, relay, wanted, reading)));
         let results = results.await;
         let decrypted = self.decrypt_new(&results).await?;
 
-        let mut view = View::new();
-        for (relay, result) in self.relays.clone().iter().zip(results) {
+        for (relay, result) in asking.iter().zip(results) {
             let mut events = match result {
                 Ok(events) => events,
                 Err(e) => {
                     log::warn!("relay {relay}: {e:#}");
+                    self.unreachable.insert(relay.clone());
                     view.insert(relay.clone(), None);
                     continue;
                 }
@@ -630,12 +683,8 @@ impl<T: Transport> Run<'_, T> {
                 },
             }
         }
-        stale.retain(|relay| !self.backed_off.contains(relay));
+        stale.retain(|relay| !self.backed_off.contains(relay) && !self.refused.contains(relay));
         if stale.is_empty() {
-            return Ok(None);
-        }
-        if self.planned >= MAX_PUBLISHES {
-            self.report.more_pending = true;
             return Ok(None);
         }
         let content = local.encode();
@@ -643,22 +692,40 @@ impl<T: Transport> Run<'_, T> {
             self.report.problems.push(format!("{d} is too large to sync"));
             return Ok(None);
         }
-        self.planned += 1;
         // Relays keep only the newest version of a replaceable event, so ours
         // must be newer than anything seen, even if our clock is behind.
         let created_at = now_secs.max(newest + 1);
-        Ok(Some(Job { d: d.to_string(), rev, relays: stale, created_at, content }))
+        Ok(Some(Job { d: d.to_string(), target: target.clone(), rev, relays: stale, created_at, content }))
     }
 
-    /// Publishes the jobs. Each event is encrypted and signed once (a few at a
-    /// time), then every relay gets its events in batches of its own size, so
-    /// a slow or strict relay doesn't hold up the others. A relay that asks us
-    /// to slow down gets nothing more in this sync, and smaller batches from
-    /// then on: hitting a limit repeatedly can get us banned for a while.
+    /// Publishes the jobs, [`PUBLISH_BATCH`] at a time. Each event is
+    /// encrypted and signed once (a few at a time), then every relay gets its
+    /// events in batches of its own size, so a slow or strict relay doesn't
+    /// hold up the others. A relay that asks us to slow down gets nothing more
+    /// in this sync, and smaller batches from then on: hitting a limit
+    /// repeatedly can get us banned for a while.
     async fn publish(&mut self, jobs: Vec<Job>) -> Result<()> {
+        let progress = self.progress;
+        let encrypting = Counter::new(Step::Encrypting, jobs.len(), progress);
+        let sending: Vec<String> =
+            self.relays.iter().filter(|relay| !self.backed_off.contains(*relay)).cloned().collect();
+        let sends = sending.iter().map(|relay| jobs.iter().filter(|job| job.relays.contains(relay)).count());
+        let uploading = Counter::new(Step::Uploading, sends.sum(), progress);
+        for batch in jobs.chunks(PUBLISH_BATCH) {
+            self.publish_batch(batch, &sending, &encrypting, &uploading).await?;
+        }
+        Ok(())
+    }
+
+    async fn publish_batch(
+        &mut self,
+        jobs: &[Job],
+        sending: &[String],
+        encrypting: &Counter<'_>,
+        uploading: &Counter<'_>,
+    ) -> Result<()> {
         let t = self.t;
-        let encrypting = &Counter::new(Step::Encrypting, jobs.len(), self.progress);
-        let prepares = stream::iter(&jobs).map(|job| async move {
+        let prepares = stream::iter(jobs).map(|job| async move {
             let result = t.prepare(&job.d, job.created_at, &job.content).await;
             encrypting.tick();
             result
@@ -676,35 +743,47 @@ impl<T: Transport> Run<'_, T> {
             }
         }
         let ready = &ready;
-        let sending_to = |relay: &String| !self.backed_off.contains(relay);
-        let sends = (self.relays.iter().filter(|relay| sending_to(relay)))
-            .map(|relay| ready.iter().filter(|(job, ..)| job.relays.contains(relay)).count());
-        let uploading = &Counter::new(Step::Uploading, sends.sum(), self.progress);
         let mut lanes = Vec::new();
-        for relay in self.relays.iter().filter(|relay| sending_to(relay)) {
+        for relay in sending {
+            // Sends that won't happen still count as done, so the bar reaches the end.
+            let todo: Vec<_> = ready.iter().enumerate().filter(|(_, (job, ..))| job.relays.contains(relay)).collect();
+            uploading.tick_by(jobs.iter().filter(|job| job.relays.contains(relay)).count() - todo.len());
+            if self.backed_off.contains(relay) || self.unreachable.contains(relay) {
+                uploading.tick_by(todo.len());
+                continue;
+            }
             let window = match self.db.relay_state(relay)?.send_window {
                 0 => FIRST_SEND_WINDOW,
                 window => window as usize,
             };
             lanes.push(async move {
-                let mut todo = ready.iter().enumerate().filter(|(_, (job, ..))| job.relays.contains(relay)).peekable();
+                let mut todo = todo.into_iter().peekable();
                 let (mut window, mut stopped, mut results) = (window, false, Vec::new());
-                while !stopped && todo.peek().is_some() {
+                let (mut failed_in_a_row, mut gave_up) = (0, false);
+                while !stopped && !gave_up && todo.peek().is_some() {
                     let batch: Vec<_> = todo.by_ref().take(window).collect();
                     let sends = batch.iter().map(|(_, (_, _, event))| t.send(relay, event));
                     for ((i, _), result) in batch.iter().zip(join_all(sends).await) {
                         uploading.tick();
                         stopped |= result.as_ref().is_err_and(|reason| asks_to_slow_down(reason));
+                        failed_in_a_row = if result.is_ok() { 0 } else { failed_in_a_row + 1 };
                         results.push((*i, result));
                     }
-                    if !stopped && batch.len() == window {
+                    // One refused event can be about that event; many in a
+                    // row means the relay isn't taking anything right now.
+                    gave_up = failed_in_a_row >= GIVE_UP_AFTER;
+                    if !stopped && !gave_up && batch.len() == window {
                         window = (window * 2).min(MAX_SEND_WINDOW);
                     }
                 }
-                (relay.clone(), results, if stopped { 1 } else { window })
+                uploading.tick_by(todo.count());
+                (relay.clone(), results, if stopped { 1 } else { window }, gave_up)
             });
         }
-        for (relay, results, window) in join_all(lanes).await {
+        for (relay, results, window, gave_up) in join_all(lanes).await {
+            if gave_up {
+                self.unreachable.insert(relay.clone());
+            }
             for (i, result) in results {
                 let (job, id, _) = &ready[i];
                 self.record(job, id, &relay, result)?;
@@ -735,6 +814,7 @@ impl<T: Transport> Run<'_, T> {
                     self.db.set_relay_state(relay, &state)?;
                     self.backed_off.insert(relay.to_string());
                 }
+                self.refused.insert(relay.to_string());
                 self.report.problems.push(format!("{relay} rejected an update: {reason}"));
             }
         }
@@ -768,6 +848,8 @@ mod tests {
     struct FakeRelay {
         online: bool,
         rate_limited: bool,
+        /// The d-tag of a document it turns down, or "*" for everything.
+        refuses: Option<String>,
         events: BTreeMap<String, (u64, String)>,
     }
 
@@ -775,6 +857,8 @@ mod tests {
     struct Stats {
         events_sent: usize,
         decrypts: usize,
+        /// Read requests per relay, answered or not.
+        fetches: BTreeMap<String, usize>,
         publish_attempts: BTreeMap<String, usize>,
     }
 
@@ -821,6 +905,7 @@ mod tests {
             self.relays.borrow().keys().cloned().collect()
         }
         async fn fetch(&self, relay: &str, wanted: &[(String, Option<u64>)]) -> Result<Vec<RawEvent>> {
+            *self.stats.borrow_mut().fetches.entry(relay.to_string()).or_default() += 1;
             let relays = self.relays.borrow();
             let relay = &relays[relay];
             anyhow::ensure!(relay.online, "offline");
@@ -858,6 +943,9 @@ mod tests {
             }
             if relay.rate_limited {
                 return Err("rate-limited: slow down".to_string());
+            }
+            if relay.refuses.as_ref().is_some_and(|refused| refused == "*" || refused == d) {
+                return Err("blocked: not taking this".to_string());
             }
             if d == DELETE {
                 for d in content.lines() {
@@ -1202,27 +1290,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publishing_is_spread_over_several_syncs() {
+    async fn large_upload_goes_out_in_batches_in_one_sync() {
         let net = FakeNet::new(1);
-        let a = Db::open_memory().unwrap();
-        let feeds = MAX_PUBLISHES + 20;
-        for i in 0..feeds {
-            let url = format!("https://example.com/{i}.xml");
-            a.set_subscribed(&url, true).unwrap();
-            let published = now_ms() / 1000;
-            let item = Item { title: "Hello".into(), published, t: published * 1000, ..Default::default() };
-            a.store_fetched(&url, "Feed", "", &[("1".into(), item)]).unwrap();
+        let feeds = 2 * PUBLISH_BATCH + 20;
+        let a = client_with_feeds(feeds);
+        let seen = RefCell::new(Vec::new());
+        let report = sync_reporting(&a, &net, PUSH, &|p| seen.borrow_mut().push(p)).await.unwrap();
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        assert!(report.published > feeds);
+        // Read everything once, then read back what was published to check:
+        // not again before every batch.
+        let docs_read = 1 + docs::FEED_SHARDS as usize + docs::STATE_SHARDS as usize + feeds;
+        let one_read = 1
+            + (docs::FEED_SHARDS as usize).div_ceil(FILTERS_PER_REQ)
+            + (docs_read - 1 - docs::FEED_SHARDS as usize).div_ceil(FILTERS_PER_REQ);
+        assert_eq!(net.stats.borrow().fetches["r0"], one_read + report.published.div_ceil(FILTERS_PER_REQ));
+        // One bar for the whole upload, not one per batch.
+        let seen = seen.into_inner();
+        for step in [Step::Encrypting, Step::Uploading] {
+            assert!(seen.iter().filter(|p| p.step == step).all(|p| p.total == report.published));
         }
-        let mut syncs = 0;
-        loop {
-            let report = sync_ok(&a, &net).await;
-            assert!(report.published <= MAX_PUBLISHES);
-            syncs += 1;
-            if !report.more_pending {
-                break;
-            }
-        }
-        assert!(syncs > 1);
+        assert_eq!(sync_ok(&a, &net).await.published, 0);
         let b = Db::open_memory().unwrap();
         sync_ok(&b, &net).await;
         assert_eq!(b.items(&View::All, false).unwrap().len(), feeds);
@@ -1280,6 +1368,91 @@ mod tests {
         let b = Db::open_memory().unwrap();
         sync(&b, &net, PUSH).await.unwrap();
         assert!(!read(&b, 0));
+    }
+
+    #[tokio::test]
+    async fn relay_that_fails_a_read_is_left_alone_for_the_rest_of_the_sync() {
+        let net = FakeNet::new(2);
+        let a = client_with_items();
+        for i in 0..50 {
+            a.set_subscribed(&format!("https://site{i}.example.com/feed.xml"), true).unwrap();
+        }
+        net.set_online("r1", false);
+        let seen = RefCell::new(Vec::new());
+        let report = sync_reporting(&a, &net, PUSH, &|p| seen.borrow_mut().push(p)).await.unwrap();
+        assert!(report.published > 0);
+        assert_eq!((report.relays_ok, report.relays_total), (1, 2));
+        // Every step of every round read from r0; r1 was asked once.
+        assert!(net.stats.borrow().fetches["r0"] > 3);
+        assert_eq!(net.stats.borrow().fetches["r1"], 1);
+        let reading = *seen.borrow().iter().rev().find(|p| p.step == Step::Reading).unwrap();
+        assert_eq!(reading.done, reading.total);
+
+        // Within one step too: after a failed request, the rest aren't sent.
+        net.reset_stats();
+        let wanted: Vec<(String, Option<u64>)> = (0..40).map(|i| (format!("d{i}"), None)).collect();
+        let counter = Counter::new(Step::Reading, 4, &|_| {});
+        assert!(fetch_chunked(&net, "r1", &wanted, &counter).await.is_err());
+        assert_eq!(net.stats.borrow().fetches["r1"], 1);
+        assert_eq!(counter.done.load(Ordering::Relaxed), 4);
+    }
+
+    /// A device with a feed cache for each of `feeds` feeds.
+    fn client_with_feeds(feeds: usize) -> Db {
+        let db = Db::open_memory().unwrap();
+        for i in 0..feeds {
+            let url = format!("https://example.com/{i}.xml");
+            db.set_subscribed(&url, true).unwrap();
+            let published = now_ms() / 1000;
+            let item = Item { title: "Hello".into(), published, t: published * 1000, ..Default::default() };
+            db.store_fetched(&url, "Feed", "", &[("1".into(), item)]).unwrap();
+        }
+        db
+    }
+
+    #[tokio::test]
+    async fn only_what_was_published_is_read_back() {
+        let net = FakeNet::new(2);
+        let a = client_with_feeds(100);
+        sync_ok(&a, &net).await;
+        net.reset_stats();
+        assert_eq!(sync_ok(&a, &net).await.published, 0);
+        let one_read = net.stats.borrow().fetches["r0"];
+
+        net.reset_stats();
+        let item = a.items(&View::All, false).unwrap()[0].key.clone();
+        a.set_read(&[item], true).unwrap();
+        assert_eq!(sync_ok(&a, &net).await.published, 1);
+        // One more request, for the one document published: not a second full read.
+        assert_eq!(net.stats.borrow().fetches["r0"], one_read + 1);
+    }
+
+    #[tokio::test]
+    async fn relay_that_refuses_an_update_is_not_sent_it_again_in_the_same_sync() {
+        let net = FakeNet::new(2);
+        net.relay("r1").refuses = Some(docs::SUBSCRIPTIONS_D.to_string());
+        let a = client_with_feeds(10);
+        let report = sync(&a, &net, PUSH).await.unwrap();
+        assert!(report.problems.iter().any(|p| p.contains("r1 rejected an update")), "{:?}", report.problems);
+        // Everything else went to r1, and the refused document wasn't sent again.
+        assert_eq!(net.len("r1"), net.len("r0") - 1);
+        assert_eq!(net.stats.borrow().publish_attempts["r1"], net.len("r0"));
+    }
+
+    #[tokio::test]
+    async fn relay_that_refuses_everything_is_given_up_on_for_the_sync() {
+        let net = FakeNet::new(2);
+        net.relay("r1").refuses = Some("*".to_string());
+        let a = client_with_feeds(100);
+        let report = sync(&a, &net, PUSH).await.unwrap();
+        assert!(report.problems.iter().any(|p| p.contains("r1 rejected an update")));
+        assert!(net.len("r0") > 100);
+        // A few tries, not one per document.
+        assert_eq!(net.stats.borrow().publish_attempts["r1"], GIVE_UP_AFTER);
+        // It's tried again next time.
+        net.relay("r1").refuses = None;
+        sync_ok(&a, &net).await;
+        assert_eq!(net.len("r1"), net.len("r0"));
     }
 
     #[tokio::test]

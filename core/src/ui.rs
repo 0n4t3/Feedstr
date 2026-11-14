@@ -19,6 +19,7 @@ use crate::db::{self, Conn, FeedRow, ItemRow, ReportRow, Store, View, now_ms};
 use crate::html::{self, Block, Style};
 use crate::longform;
 use crate::worker::{self, Cmd, FileKind, Login, Msg};
+use crate::youtube;
 
 const ACCENT: Color32 = Color32::from_rgb(0x7c, 0x4d, 0xff);
 const READER_WIDTH: f32 = 700.0;
@@ -124,6 +125,15 @@ enum Dialog {
         error: Option<String>,
         focus: bool,
     },
+    /// Subscribing to a YouTube channel pasted into [`Dialog::AddFeed`].
+    Youtube {
+        channel: youtube::Channel,
+        category: String,
+        /// Leave out Shorts and livestreams.
+        videos_only: bool,
+        busy: bool,
+        error: Option<String>,
+    },
     RenameCategory {
         from: String,
         to: String,
@@ -150,8 +160,10 @@ enum Dialog {
         view: View,
         search: String,
         days: u32,
-        /// The number of articles it would mark, and for how many days it was counted.
-        count: Option<(u32, usize)>,
+        /// For how many days the articles were counted, the cutoff that gave
+        /// (seconds), and how many there are. Marking uses the same cutoff, so
+        /// it marks what was counted even if the dialog stayed open a while.
+        count: Option<(u32, i64, usize)>,
     },
     ConfirmErase {
         understood: bool,
@@ -231,6 +243,7 @@ struct LoginForm {
 pub struct App {
     db: Conn,
     tx: UnboundedSender<Cmd>,
+    remote: worker::Remote,
     /// Stops a QR code sign-in (not offered on phones).
     #[cfg_attr(target_os = "android", allow(dead_code))]
     cancel_connect: Arc<tokio::sync::Notify>,
@@ -311,7 +324,7 @@ impl App {
     /// The app, keeping its data in `store`, with what differs between platforms in `platform`.
     pub fn new(cc: &eframe::CreationContext, store: Store, platform: Arc<dyn worker::Platform>) -> Result<Self> {
         let db = db::connect(&store)?;
-        let worker::Handle { tx, rx, closing, cancel_connect } =
+        let worker::Handle { tx, rx, remote, closing, cancel_connect } =
             worker::spawn(&store, cc.egui_ctx.clone(), platform.clone())?;
         setup_style(&cc.egui_ctx);
         let theme = match db.meta("theme")?.as_deref() {
@@ -337,6 +350,7 @@ impl App {
         let mut app = Self {
             db,
             tx,
+            remote,
             cancel_connect,
             has_signer_app: platform.signer_app().is_some(),
             platform,
@@ -387,7 +401,14 @@ impl App {
 
     /// For telling the app about going to the background and back, from any thread.
     pub fn remote(&self) -> worker::Remote {
-        worker::Remote(self.tx.clone())
+        self.remote.clone()
+    }
+
+    /// Whether the Sync Key is on screen in full, so a platform can keep it out
+    /// of screenshots and previews of the app (Android does).
+    pub fn shows_sync_key(&self) -> bool {
+        matches!(self.dialog, Some(Dialog::NewSyncKey { .. }))
+            || self.settings.as_ref().is_some_and(|page| page.show_key)
     }
 
     /// Shown when signing in again failed: nothing syncs until it works.
@@ -446,6 +467,10 @@ impl App {
             self.categories = self.db.categories()?;
             self.local_categories = self.db.local_categories()?;
             self.items = self.db.items_matching(&self.view, self.unread_only, &self.search, self.limit)?;
+            // Only what can still be seen stays picked (after a search, say), so
+            // the bulk buttons never act on articles out of sight.
+            let shown: HashSet<&str> = self.items.iter().map(|i| i.key.as_str()).collect();
+            self.picked.retain(|key| shown.contains(key.as_str()));
             Ok(())
         })();
         if let Err(e) = result {
@@ -497,9 +522,31 @@ impl App {
                     self.reload();
                 }
                 Msg::FeedAdded(Err(error)) => {
-                    if let Some(Dialog::AddFeed { busy, error: e, .. }) = &mut self.dialog {
+                    if let Some(Dialog::AddFeed { busy, error: e, .. } | Dialog::Youtube { busy, error: e, .. }) =
+                        &mut self.dialog
+                    {
                         *busy = false;
                         *e = Some(error);
+                    }
+                }
+                Msg::YoutubeChannel(result) => {
+                    if let Some(Dialog::AddFeed { category, busy, error, .. }) = &mut self.dialog {
+                        match result {
+                            Ok(channel) => {
+                                let category = std::mem::take(category);
+                                self.dialog = Some(Dialog::Youtube {
+                                    channel,
+                                    category,
+                                    videos_only: false,
+                                    busy: false,
+                                    error: None,
+                                });
+                            }
+                            Err(e) => {
+                                *busy = false;
+                                *error = Some(e);
+                            }
+                        }
                     }
                 }
                 Msg::Changed => {
@@ -1096,9 +1143,9 @@ impl App {
     /// Taps, long presses and swipes on an article in the list (drawn at `response.rect`).
     fn row_event(&self, ui: &Ui, item: &ItemRow, response: &Response) -> Option<RowEvent> {
         let rect = response.rect;
-        // A press on the article may start a swipe.
+        // A press on the article may start a swipe (not a right or middle button drag).
         let pressed_here = ui
-            .input(|i| i.pointer.any_pressed().then(|| i.pointer.press_origin()).flatten())
+            .input(|i| i.pointer.primary_pressed().then(|| i.pointer.press_origin()).flatten())
             // Not when the press was on a menu or dialog above the list.
             .filter(|&origin| {
                 rect.contains(origin)
@@ -1151,7 +1198,7 @@ impl App {
     /// Once a swipe ends: marks the article read or unread (swiped left) or stars or
     /// unstars it (swiped right), if it was swiped far enough.
     fn finish_swipe(&mut self, ui: &Ui) {
-        if ui.input(|i| i.pointer.any_down()) {
+        if ui.input(|i| i.pointer.primary_down()) {
             return;
         }
         let Some(swipe) = self.swipe.take() else { return };
@@ -1164,12 +1211,24 @@ impl App {
         }
     }
 
+    /// The list's scroll area. While an article is swiped sideways, dragging doesn't
+    /// scroll it, so the article stays under the finger.
+    fn list_scroll(&self) -> ScrollArea {
+        let scroll = ScrollArea::vertical().auto_shrink(false);
+        if self.swipe.borrow().as_ref().is_some_and(|swipe| swipe.sideways == Some(true)) {
+            use egui::scroll_area::{DragScroll, ScrollSource};
+            scroll.scroll_source(ScrollSource { drag: DragScroll::Never, ..ScrollSource::default() })
+        } else {
+            scroll
+        }
+    }
+
     /// Rows of varying height (titles wrap); only the visible ones are laid out.
     /// Returns what happened to an article, and whether the end of the list is in view.
     fn standard_list(&self, ui: &mut Ui) -> (Option<RowEvent>, bool) {
         let (mut event, mut at_end) = (None, false);
         let heights = &mut *self.row_heights.borrow_mut();
-        ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+        self.list_scroll().show(ui, |ui| {
             heights.check_width(ui.available_width());
             for item in &self.items {
                 let selected = self.is_selected(item);
@@ -1192,7 +1251,7 @@ impl App {
         let (mut event, mut at_end) = (None, false);
         ui.spacing_mut().item_spacing.y = 0.0;
         let selected_row = self.selected.as_ref().and_then(|s| self.items.iter().position(|i| i.key == s.key));
-        let mut scroll = ScrollArea::vertical().auto_shrink(false);
+        let mut scroll = self.list_scroll();
         if let Some(row) = selected_row.filter(|_| self.scroll_to_selected) {
             scroll = scroll.vertical_scroll_offset((row as f32 * height - ui.available_height() / 2.0).max(0.0));
         }
@@ -1217,7 +1276,7 @@ impl App {
         ui.spacing_mut().item_spacing = vec2(CARD_GAP, CARD_GAP);
         let selected_row =
             self.selected.as_ref().and_then(|s| self.items.iter().position(|i| i.key == s.key)).map(|i| i / columns);
-        let mut scroll = ScrollArea::vertical().auto_shrink(false);
+        let mut scroll = self.list_scroll();
         if let Some(row) = selected_row.filter(|_| self.scroll_to_selected) {
             let offset = row as f32 * (card.y + CARD_GAP) - (ui.available_height() - card.y) / 2.0;
             scroll = scroll.vertical_scroll_offset(offset.max(0.0));
@@ -1364,258 +1423,306 @@ impl App {
         let frame = Frame::popup(&ctx.global_style()).inner_margin(20).corner_radius(12);
         let modal = Modal::new(Id::unique("dialog")).frame(frame).show(ctx, |ui| {
             ui.set_width(440.0_f32.min(ctx.content_rect().width() - 72.0));
-            match &mut dialog {
-                Dialog::AddFeed { input, category, busy, error, focus } => {
-                    ui.label(RichText::new("Add a feed").size(18.0).strong());
-                    let hint = "Paste a feed address or a website that has one. For a Nostr writer's long-form posts, \
-                                paste their npub or NIP-05 address (like name@example.com).";
-                    ui.add(Label::new(RichText::new(hint).weak()).wrap());
-                    ui.add_space(8.0);
-                    let edit =
-                        TextEdit::singleline(input).hint_text("https://example.com").desired_width(f32::INFINITY);
-                    let response = ui.add_enabled(!*busy, edit);
-                    focus_on_open(&response, focus);
-                    let enter = response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                    ui.add_space(4.0);
-                    let edit =
-                        TextEdit::singleline(category).hint_text("Category (optional)").desired_width(f32::INFINITY);
-                    ui.add_enabled(!*busy, edit);
-                    let categories = self.categories.clone();
-                    if !categories.is_empty() {
-                        ui.horizontal_wrapped(|ui| {
-                            for name in categories {
-                                if ui.add(Button::selectable(*category == name, name.as_str()).small()).clicked() {
-                                    *category = name;
+            // Scrolls when the dialog is taller than the space left, such as above
+            // the on-screen keyboard, so the field being typed into can be shown.
+            let max_height = ctx.content_rect().height() - 72.0;
+            ScrollArea::vertical().max_height(max_height).show(ui, |ui| {
+                match &mut dialog {
+                    Dialog::AddFeed { input, category, busy, error, focus } => {
+                        ui.label(RichText::new("Add a feed").size(18.0).strong());
+                        let hint = "Paste a feed address or a website that has one, like a YouTube channel. For a \
+                                    Nostr writer's long-form posts, paste their npub or NIP-05 address (like \
+                                    name@example.com).";
+                        ui.add(Label::new(RichText::new(hint).weak()).wrap());
+                        ui.add_space(8.0);
+                        let edit =
+                            TextEdit::singleline(input).hint_text("https://example.com").desired_width(f32::INFINITY);
+                        let response = ui.add_enabled(!*busy, edit);
+                        focus_on_open(&response, focus);
+                        let enter = response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                        ui.add_space(4.0);
+                        category_picker(ui, category, &self.categories, *busy);
+                        if let Some(error) = error {
+                            ui.colored_label(ui.visuals().error_fg_color, error.as_str());
+                        }
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            let add = ui.add_enabled(!*busy && !input.trim().is_empty(), primary_button("Add"));
+                            if (add.clicked() || enter) && !input.trim().is_empty() {
+                                *busy = true;
+                                *error = None;
+                                // A channel's page, not its feed: look it up and ask how to subscribe.
+                                if youtube::channel_url(input).is_some() {
+                                    self.send(Cmd::LookUpYoutube(input.clone()));
+                                } else {
+                                    self.send(Cmd::AddFeed { input: input.clone(), category: category.clone() });
                                 }
+                            }
+                            if ui.button("Cancel").clicked() {
+                                open = false;
+                            }
+                            if *busy {
+                                ui.spinner();
                             }
                         });
                     }
-                    if let Some(error) = error {
-                        ui.colored_label(ui.visuals().error_fg_color, error.as_str());
-                    }
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        let add = ui.add_enabled(!*busy && !input.trim().is_empty(), primary_button("Add"));
-                        if (add.clicked() || enter) && !input.trim().is_empty() {
-                            *busy = true;
-                            *error = None;
-                            self.send(Cmd::AddFeed { input: input.clone(), category: category.clone() });
-                        }
-                        if ui.button("Cancel").clicked() {
-                            open = false;
-                        }
-                        if *busy {
-                            ui.spinner();
-                        }
-                    });
-                }
-                Dialog::NewCategory { url, name, focus } => {
-                    ui.label(RichText::new("New category").size(18.0).strong());
-                    ui.add_space(8.0);
-                    let response = ui.add(TextEdit::singleline(name).desired_width(f32::INFINITY));
-                    focus_on_open(&response, focus);
-                    let enter = response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        let valid = !name.trim().is_empty();
-                        if (ui.add_enabled(valid, primary_button("Create")).clicked() || enter)
-                            && valid
-                            && self.db.set_category(url, name).is_ok()
-                        {
-                            self.reload();
-                            open = false;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            open = false;
-                        }
-                    });
-                }
-                Dialog::RenameCategory { from, to } => {
-                    ui.label(RichText::new(format!("Rename “{from}”")).size(18.0).strong());
-                    ui.add_space(8.0);
-                    let response = ui.add(TextEdit::singleline(to).desired_width(f32::INFINITY));
-                    let enter = response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if (ui.add_enabled(!to.trim().is_empty(), primary_button("Rename")).clicked() || enter)
-                            && !to.trim().is_empty()
-                        {
-                            self.rename_category(from, to);
-                            open = false;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            open = false;
-                        }
-                    });
-                }
-                Dialog::ConfirmErase { understood, busy, error } => {
-                    ui.label(RichText::new("Delete all Feedstr data?").size(18.0).strong());
-                    ui.add(
-                        Label::new(
-                            "This deletes your feeds, categories, stored articles, read/unread state, favorites and \
-                             settings from your relays and from this device, and signs you out. Your other devices \
-                             erase their copies the next time they sync. This can't be undone.",
-                        )
-                        .wrap(),
-                    );
-                    ui.add_space(4.0);
-                    let note = "Only Feedstr's data is deleted: your Nostr profile and posts are not affected. If you \
-                                sign in with a Sync Key, make sure you have saved it somewhere else.";
-                    ui.add(Label::new(RichText::new(note).weak()).wrap());
-                    ui.add_space(8.0);
-                    ui.add_enabled(!*busy, egui::Checkbox::new(understood, "I understand this can't be undone"));
-                    if let Some(error) = error {
-                        ui.colored_label(ui.visuals().error_fg_color, error.as_str());
-                    }
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        let enabled = *understood && !*busy;
-                        // Red only once it can be pressed, so it doesn't look ready before.
-                        let delete = if enabled {
-                            Button::new(RichText::new("Delete everything").color(Color32::WHITE))
-                                .fill(ui.visuals().error_fg_color)
-                        } else {
-                            Button::new("Delete everything")
+                    Dialog::Youtube { channel, category, videos_only, busy, error } => {
+                        ui.label(RichText::new("Add a YouTube channel").size(18.0).strong());
+                        ui.add_space(8.0);
+                        match &channel.name {
+                            Some(name) => ui.label(RichText::new(name).size(16.0)),
+                            None => ui.add(
+                                Label::new(
+                                    RichText::new(
+                                        "Couldn't load the channel's name. It shows up once the feed is fetched \
+                                         (on the web, by your other devices).",
+                                    )
+                                    .weak(),
+                                )
+                                .wrap(),
+                            ),
                         };
-                        if ui.add_enabled(enabled, delete).clicked() {
-                            *busy = true;
-                            *error = None;
-                            self.send(Cmd::EraseAll);
+                        ui.add_space(8.0);
+                        category_picker(ui, category, &self.categories, *busy);
+                        ui.add_space(4.0);
+                        ui.add_enabled(!*busy, egui::Checkbox::new(videos_only, "Hide livestreams and Shorts"));
+                        if let Some(error) = error {
+                            ui.colored_label(ui.visuals().error_fg_color, error.as_str());
                         }
-                        if ui.add_enabled(!*busy, Button::new("Cancel")).clicked() {
-                            open = false;
-                        }
-                        if *busy {
-                            ui.spinner();
-                            ui.label(RichText::new(&self.status).weak());
-                        }
-                    });
-                }
-                Dialog::ConfirmMarkRead { view, search, count } => {
-                    let articles = if *count == 1 { "1 article".to_string() } else { format!("{count} articles") };
-                    ui.label(RichText::new(format!("Mark {articles} as read?")).size(18.0).strong());
-                    let mut text = format!("Every unread article in “{}”", self.view_title(view));
-                    if !search.trim().is_empty() {
-                        text.push_str(&format!(" matching “{}”", search.trim()));
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(!*busy, primary_button("Add")).clicked() {
+                                *busy = true;
+                                *error = None;
+                                self.send(Cmd::AddYoutube {
+                                    channel: channel.clone(),
+                                    videos_only: *videos_only,
+                                    category: category.clone(),
+                                });
+                            }
+                            if ui.button("Cancel").clicked() {
+                                open = false;
+                            }
+                            if *busy {
+                                ui.spinner();
+                            }
+                        });
                     }
-                    text.push_str(" is marked as read.");
-                    ui.add(Label::new(text).wrap());
-                    ui.add_space(8.0);
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.add(primary_button("Mark as read")).clicked() {
-                            let keys = self.db.unread_keys(view, search).unwrap_or_default();
-                            if self.db.set_read(&keys, true).is_ok() {
+                    Dialog::NewCategory { url, name, focus } => {
+                        ui.label(RichText::new("New category").size(18.0).strong());
+                        ui.add_space(8.0);
+                        let response = ui.add(TextEdit::singleline(name).desired_width(f32::INFINITY));
+                        focus_on_open(&response, focus);
+                        let enter = response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            let valid = !name.trim().is_empty();
+                            if (ui.add_enabled(valid, primary_button("Create")).clicked() || enter)
+                                && valid
+                                && self.db.set_category(url, name).is_ok()
+                            {
                                 self.reload();
+                                open = false;
                             }
-                            open = false;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            open = false;
-                        }
-                    });
-                }
-                Dialog::MarkOlderRead { view, search, days, count } => {
-                    ui.label(RichText::new("Mark older articles as read").size(18.0).strong());
-                    let mut text = format!("Unread articles in “{}”", self.view_title(view));
-                    if !search.trim().is_empty() {
-                        text.push_str(&format!(" matching “{}”", search.trim()));
+                            if ui.button("Cancel").clicked() {
+                                open = false;
+                            }
+                        });
                     }
-                    text.push_str(" published more than this long ago are marked as read.");
-                    ui.add(Label::new(text).wrap());
-                    ui.add_space(8.0);
-                    ui.horizontal_wrapped(|ui| {
-                        for &(choice, label) in OLDER_CHOICES {
-                            if ui.add(Button::selectable(*days == choice, label)).clicked() {
-                                *days = choice;
+                    Dialog::RenameCategory { from, to } => {
+                        ui.label(RichText::new(format!("Rename “{from}”")).size(18.0).strong());
+                        ui.add_space(8.0);
+                        let response = ui.add(TextEdit::singleline(to).desired_width(f32::INFINITY));
+                        let enter = response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if (ui.add_enabled(!to.trim().is_empty(), primary_button("Rename")).clicked() || enter)
+                                && !to.trim().is_empty()
+                            {
+                                self.rename_category(from, to);
+                                open = false;
                             }
-                        }
-                    });
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label("Older than");
-                        ui.add(DragValue::new(days).range(1..=3650));
-                        ui.label(if *days == 1 { "day" } else { "days" });
-                    });
-                    let before = now_ms() / 1000 - i64::from(*days) * 24 * 3600;
-                    // Counted again only when the number of days changes, not on every frame.
-                    if count.is_none_or(|(counted, _)| counted != *days) {
-                        let found = self.db.unread_keys_before(view, search, before).map_or(0, |keys| keys.len());
-                        *count = Some((*days, found));
+                            if ui.button("Cancel").clicked() {
+                                open = false;
+                            }
+                        });
                     }
-                    let found = count.map_or(0, |(_, found)| found);
-                    let articles = if found == 1 { "1 article".to_string() } else { format!("{found} articles") };
-                    ui.label(RichText::new(format!("{articles} to mark")).weak());
-                    ui.add_space(8.0);
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.add_enabled(found > 0, primary_button("Mark as read")).clicked() {
-                            let keys = self.db.unread_keys_before(view, search, before).unwrap_or_default();
-                            if self.db.set_read(&keys, true).is_ok() {
-                                self.reload();
+                    Dialog::ConfirmErase { understood, busy, error } => {
+                        ui.label(RichText::new("Delete all Feedstr data?").size(18.0).strong());
+                        ui.add(
+                            Label::new(
+                                "This deletes your feeds, categories, stored articles, read/unread state, favorites \
+                                 and settings from your relays and from this device, and signs you out. Your other \
+                                 devices erase their copies the next time they sync. This can't be undone.",
+                            )
+                            .wrap(),
+                        );
+                        ui.add_space(4.0);
+                        let note = "Only Feedstr's data is deleted: your Nostr profile and posts are not affected. If \
+                                    you sign in with a Sync Key, make sure you have saved it somewhere else.";
+                        ui.add(Label::new(RichText::new(note).weak()).wrap());
+                        ui.add_space(8.0);
+                        ui.add_enabled(!*busy, egui::Checkbox::new(understood, "I understand this can't be undone"));
+                        if let Some(error) = error {
+                            ui.colored_label(ui.visuals().error_fg_color, error.as_str());
+                        }
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            let enabled = *understood && !*busy;
+                            // Red only once it can be pressed, so it doesn't look ready before.
+                            let delete = if enabled {
+                                Button::new(RichText::new("Delete everything").color(Color32::WHITE))
+                                    .fill(ui.visuals().error_fg_color)
+                            } else {
+                                Button::new("Delete everything")
+                            };
+                            if ui.add_enabled(enabled, delete).clicked() {
+                                *busy = true;
+                                *error = None;
+                                self.send(Cmd::EraseAll);
                             }
-                            let _ = self.db.set_meta("older_days", &days.to_string());
-                            open = false;
+                            if ui.add_enabled(!*busy, Button::new("Cancel")).clicked() {
+                                open = false;
+                            }
+                            if *busy {
+                                ui.spinner();
+                                ui.label(RichText::new(&self.status).weak());
+                            }
+                        });
+                    }
+                    Dialog::ConfirmMarkRead { view, search, count } => {
+                        let articles = if *count == 1 { "1 article".to_string() } else { format!("{count} articles") };
+                        ui.label(RichText::new(format!("Mark {articles} as read?")).size(18.0).strong());
+                        let mut text = format!("Every unread article in “{}”", self.view_title(view));
+                        if !search.trim().is_empty() {
+                            text.push_str(&format!(" matching “{}”", search.trim()));
                         }
-                        if ui.button("Cancel").clicked() {
-                            open = false;
+                        text.push_str(" is marked as read.");
+                        ui.add(Label::new(text).wrap());
+                        ui.add_space(8.0);
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.add(primary_button("Mark as read")).clicked() {
+                                let keys = self.db.unread_keys(view, search).unwrap_or_default();
+                                if self.db.set_read(&keys, true).is_ok() {
+                                    self.reload();
+                                }
+                                open = false;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                open = false;
+                            }
+                        });
+                    }
+                    Dialog::MarkOlderRead { view, search, days, count } => {
+                        ui.label(RichText::new("Mark older articles as read").size(18.0).strong());
+                        let mut text = format!("Unread articles in “{}”", self.view_title(view));
+                        if !search.trim().is_empty() {
+                            text.push_str(&format!(" matching “{}”", search.trim()));
                         }
-                    });
+                        text.push_str(" published more than this long ago are marked as read.");
+                        ui.add(Label::new(text).wrap());
+                        ui.add_space(8.0);
+                        ui.horizontal_wrapped(|ui| {
+                            for &(choice, label) in OLDER_CHOICES {
+                                if ui.add(Button::selectable(*days == choice, label)).clicked() {
+                                    *days = choice;
+                                }
+                            }
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Older than");
+                            ui.add(DragValue::new(days).range(1..=3650));
+                            ui.label(if *days == 1 { "day" } else { "days" });
+                        });
+                        // Counted again only when the number of days changes, not on every frame.
+                        if count.is_none_or(|(counted, _, _)| counted != *days) {
+                            let before = now_ms() / 1000 - i64::from(*days) * 24 * 3600;
+                            let found = self.db.unread_count_before(view, search, before).unwrap_or(0);
+                            *count = Some((*days, before, found));
+                        }
+                        let (_, before, found) = count.unwrap_or_default();
+                        let articles = if found == 1 { "1 article".to_string() } else { format!("{found} articles") };
+                        ui.label(RichText::new(format!("{articles} to mark")).weak());
+                        ui.add_space(8.0);
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.add_enabled(found > 0, primary_button("Mark as read")).clicked() {
+                                let keys = self.db.unread_keys_before(view, search, before).unwrap_or_default();
+                                if self.db.set_read(&keys, true).is_ok() {
+                                    self.reload();
+                                }
+                                let _ = self.db.set_meta("older_days", &days.to_string());
+                                open = false;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                open = false;
+                            }
+                        });
+                    }
+                    Dialog::Status => {
+                        ui.label(RichText::new("Status").size(18.0).strong());
+                        ui.add_space(8.0);
+                        ui.add(Label::new(&self.status).wrap().selectable(true));
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.add(primary_button("Close")).clicked() {
+                                open = false;
+                            }
+                            if ui.button("Copy").clicked() {
+                                ui.ctx().copy_text(self.status.clone());
+                            }
+                        });
+                    }
+                    Dialog::ConfirmSignOut => {
+                        ui.label(RichText::new("Sign out anyway?").size(18.0).strong());
+                        ui.label(
+                            "Feedstr couldn't confirm that your latest changes are saved on a relay. If you sign out \
+                             now, any changes made on this device since the last successful sync are lost.",
+                        );
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.add(primary_button("Stay signed in")).clicked() {
+                                open = false;
+                            }
+                            let warning = ui.visuals().error_fg_color;
+                            let sign_out = Button::new(RichText::new("Sign out anyway").color(warning));
+                            if ui.add(sign_out).clicked() {
+                                self.send(Cmd::Logout { force: true });
+                                open = false;
+                            }
+                        });
+                    }
+                    Dialog::NewSyncKey { nsec } => {
+                        ui.label(RichText::new("Your new Sync Key").size(18.0).strong());
+                        ui.label(
+                            "This key is your account. Save it in a password manager: you need it to sign in on other \
+                             devices, and anyone who has it can read and change your feeds.",
+                        );
+                        ui.add_space(8.0);
+                        ui.add(Label::new(RichText::new(nsec.as_str()).monospace()).wrap());
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Copy").clicked() {
+                                ui.ctx().copy_text(nsec.clone());
+                            }
+                            if ui.add(primary_button("I saved it, continue")).clicked() {
+                                self.sign_in(Login::SyncKey(nsec.clone()));
+                                open = false;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                open = false;
+                            }
+                        });
+                    }
                 }
-                Dialog::Status => {
-                    ui.label(RichText::new("Status").size(18.0).strong());
-                    ui.add_space(8.0);
-                    ui.add(Label::new(&self.status).wrap().selectable(true));
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.add(primary_button("Close")).clicked() {
-                            open = false;
-                        }
-                        if ui.button("Copy").clicked() {
-                            ui.ctx().copy_text(self.status.clone());
-                        }
-                    });
-                }
-                Dialog::ConfirmSignOut => {
-                    ui.label(RichText::new("Sign out anyway?").size(18.0).strong());
-                    ui.label(
-                        "Feedstr couldn't confirm that your latest changes are saved on a relay. If you sign out \
-                         now, any changes made on this device since the last successful sync are lost.",
-                    );
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.add(primary_button("Stay signed in")).clicked() {
-                            open = false;
-                        }
-                        let sign_out = Button::new(RichText::new("Sign out anyway").color(ui.visuals().error_fg_color));
-                        if ui.add(sign_out).clicked() {
-                            self.send(Cmd::Logout { force: true });
-                            open = false;
-                        }
-                    });
-                }
-                Dialog::NewSyncKey { nsec } => {
-                    ui.label(RichText::new("Your new Sync Key").size(18.0).strong());
-                    ui.label(
-                        "This key is your account. Save it in a password manager: you need it to sign in on other \
-                         devices, and anyone who has it can read and change your feeds.",
-                    );
-                    ui.add_space(8.0);
-                    ui.add(Label::new(RichText::new(nsec.as_str()).monospace()).wrap());
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Copy").clicked() {
-                            ui.ctx().copy_text(nsec.clone());
-                        }
-                        if ui.add(primary_button("I saved it, continue")).clicked() {
-                            self.sign_in(Login::SyncKey(nsec.clone()));
-                            open = false;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            open = false;
-                        }
-                    });
-                }
-            }
+                reveal_editing(ui, &mut self.reveal_editing);
+            });
         });
-        let busy = matches!(dialog, Dialog::AddFeed { busy: true, .. } | Dialog::ConfirmErase { busy: true, .. });
+        let busy = matches!(
+            dialog,
+            Dialog::AddFeed { busy: true, .. }
+                | Dialog::Youtube { busy: true, .. }
+                | Dialog::ConfirmErase { busy: true, .. }
+        );
         // Keep the dialog open, unless it was closed or replaced by another one.
         if open && !(modal.should_close() && !busy) && self.dialog.is_none() {
             self.dialog = Some(dialog);
@@ -2013,10 +2120,17 @@ impl App {
         });
         hint(
             ui,
-            if cfg!(target_arch = "wasm32") {
-                "Feedstr syncs when the page opens, and saves your changes to relays a few seconds after you make them."
+            if worker::manual_sync(&self.db) {
+                "Feedstr only syncs when you use the Sync button (or press R). Your changes stay on this device until then."
+            } else if cfg!(target_arch = "wasm32") {
+                "Feedstr syncs when the page opens (unless it synced less than 10 minutes ago), and saves your \
+                 changes to relays a few seconds after you make them."
+            } else if cfg!(target_os = "android") {
+                "Feedstr syncs when it starts (unless it synced less than 10 minutes ago), and saves your \
+                 changes to relays when you leave it."
             } else {
-                "Feedstr always syncs when it starts, and saves your changes to relays when you close it."
+                "Feedstr syncs when it starts (unless it synced less than 10 minutes ago), and saves your \
+                 changes to relays when you close it."
             },
         );
 
@@ -2145,6 +2259,7 @@ fn group_is_local<'a>(category: &str, mut group: impl Iterator<Item = &'a FeedRo
 
 fn schedule_label(minutes: u32) -> String {
     match minutes {
+        worker::MANUAL_SYNC => "Manual only".into(),
         // The web version can't count on being closed properly, so it syncs while open.
         0 if cfg!(target_arch = "wasm32") => format!("Every {} minutes (default)", worker::WEB_SYNC_MINUTES),
         0 => "Only at start and exit".into(),
@@ -2361,7 +2476,8 @@ impl App {
         if ctx.input(|i| i.viewport().close_requested()) && self.exit != Exit::Ready {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             if self.exit == Exit::Running {
-                if self.screen == Screen::Main {
+                // Manual Only saves nothing on closing, so there's nothing to wait for.
+                if self.screen == Screen::Main && !worker::manual_sync(&self.db) {
                     self.send(Cmd::Exit);
                     let _ = self.closing.send(true);
                     self.exit = Exit::Saving(now_ms());
@@ -2409,6 +2525,21 @@ fn card(ui: &mut Ui, contents: impl FnOnce(&mut Ui)) {
         ui.spacing_mut().text_edit_width = ui.available_width();
         contents(ui);
     });
+}
+
+/// A category name to type, with the existing ones to pick from.
+fn category_picker(ui: &mut Ui, category: &mut String, categories: &[String], busy: bool) {
+    let edit = TextEdit::singleline(category).hint_text("Category (optional)").desired_width(f32::INFINITY);
+    ui.add_enabled(!busy, edit);
+    if !categories.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            for name in categories {
+                if ui.add(Button::selectable(*category == *name, name.as_str()).small()).clicked() {
+                    *category = name.clone();
+                }
+            }
+        });
+    }
 }
 
 fn primary_button(text: &str) -> Button<'_> {
@@ -2696,11 +2827,6 @@ fn show_spans(ui: &mut Ui, spans: &[html::Span], size: f32, style: Style, menu: 
     });
 }
 
-/// Puts the cursor in a dialog's text field when it opens, asking until it has
-/// it (a new dialog's first frame is laid out twice). Only until then: every
-/// request also restarts the on-screen keyboard's typing, so asking on every
-/// frame made phone keyboards flicker and drop what was typed, and grabbing
-/// focus back after Enter would hide that Enter was pressed.
 /// The text field (or number being typed into) that has the keyboard focus, if any.
 fn editing_field(ctx: &egui::Context) -> Option<Id> {
     let id = ctx.memory(|m| m.focused())?;
@@ -2752,6 +2878,11 @@ fn reveal_editing(ui: &Ui, reveal: &mut bool) {
     *reveal = false;
 }
 
+/// Puts the cursor in a dialog's text field when it opens, asking until it has
+/// it (a new dialog's first frame is laid out twice). Only until then: every
+/// request also restarts the on-screen keyboard's typing, so asking on every
+/// frame made phone keyboards flicker and drop what was typed, and grabbing
+/// focus back after Enter would hide that Enter was pressed.
 fn focus_on_open(response: &Response, focus: &mut bool) {
     if !*focus {
         return;

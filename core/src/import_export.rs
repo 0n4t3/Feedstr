@@ -170,6 +170,30 @@ struct Backup {
     state: StateShard,
 }
 
+impl Backup {
+    /// Brings timestamps from the future back to `now` (ms). A backup is just a
+    /// file, and a made-up or damaged one could otherwise carry changes that
+    /// win over every later one, on all devices, or dates too large to add to.
+    fn cap_times(&mut self, now: i64) {
+        let cap = |t: &mut i64| *t = (*t).min(now);
+        let subscriptions = &mut self.subscriptions;
+        subscriptions.feeds.values_mut().for_each(|v| cap(&mut v.1));
+        subscriptions.categories.values_mut().for_each(|v| cap(&mut v.1));
+        subscriptions.filters.values_mut().for_each(|v| cap(&mut v.1));
+        subscriptions.cache.iter_mut().for_each(|v| cap(&mut v.1));
+        for feed in self.feeds.values_mut() {
+            cap(&mut feed.meta_t);
+            for item in feed.items.values_mut() {
+                cap(&mut item.t);
+                item.published = item.published.min(now / 1000);
+            }
+        }
+        for state in self.state.items.values_mut() {
+            state.r.iter_mut().chain(state.f.iter_mut()).for_each(|v| cap(&mut v.1));
+        }
+    }
+}
+
 /// Everything Feedstr stores for this account, except the Sync Key and device settings.
 pub fn export_backup(db: &Db) -> Result<String> {
     // Everything this device has, including feeds it doesn't sync.
@@ -227,6 +251,7 @@ pub fn import_backup(db: &Db, json: &str) -> Result<BackupImport> {
         bail!("this backup was made by a newer version of Feedstr");
     }
     let mut backup: Backup = serde_json::from_str(json).context("the backup is damaged")?;
+    backup.cap_times(now_ms());
     backup.subscriptions.salt = None;
     backup.subscriptions.erased_at = None;
     backup.subscriptions.relays = Default::default();
@@ -399,6 +424,31 @@ mod tests {
         let exported = parse_opml(&export_opml(&db).unwrap()).unwrap();
         let categories: Vec<&str> = exported.iter().map(|f| f.category.as_str()).collect();
         assert_eq!(categories, ["Mine", "News"]);
+    }
+
+    #[test]
+    fn times_from_the_future_in_a_backup_dont_stick() {
+        let (db, a, _) = sample();
+        let feed = "https://example.com/feed";
+        let mut json: serde_json::Value = serde_json::from_str(&export_backup(&db).unwrap()).unwrap();
+        // A hand-edited backup whose changes claim to be the newest there can ever be.
+        json["subscriptions"]["feeds"][feed][1] = i64::MAX.into();
+        json["state"]["items"][&a]["r"][1] = i64::MAX.into();
+        json["feeds"][feed]["meta_t"] = i64::MAX.into();
+        for item in json["feeds"][feed]["items"].as_object_mut().unwrap().values_mut() {
+            item["t"] = i64::MAX.into();
+            item["published"] = i64::MAX.into();
+        }
+        let other = Db::open_memory().unwrap();
+        import_backup(&other, &json.to_string()).unwrap();
+        let now = now_ms();
+        assert!(other.all_state().unwrap().items[&a].r.as_ref().unwrap().1 <= now);
+        assert!(other.items(&View::All, false).unwrap().iter().all(|i| i.published <= now / 1000));
+        // Later changes still win.
+        other.set_read(std::slice::from_ref(&a), false).unwrap();
+        assert!(other.items(&View::All, false).unwrap().iter().any(|i| i.key == a && i.unread));
+        other.set_subscribed(feed, false).unwrap();
+        assert!(other.subscribed_feeds().unwrap().is_empty());
     }
 
     #[test]

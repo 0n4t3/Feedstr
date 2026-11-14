@@ -134,8 +134,10 @@ impl Reader {
                 self.flush();
                 self.marker = (!closing).then(|| match self.lists.last_mut() {
                     Some(Some(number)) => {
-                        *number += 1;
-                        format!("{}.", *number - 1)
+                        let marker = format!("{number}.");
+                        // A feed can start a list at any number, the largest included.
+                        *number = number.saturating_add(1);
+                        marker
                     }
                     _ => "•".to_string(),
                 });
@@ -375,6 +377,14 @@ mod tests {
 
     fn texts(html: &str) -> Vec<String> {
         to_blocks(html).iter().map(Block::text).collect()
+    }
+
+    #[test]
+    fn lists_can_start_at_any_number() {
+        let markers = |html: &str| -> Vec<String> { to_blocks(html).into_iter().filter_map(|b| b.marker).collect() };
+        assert_eq!(markers("<ol start=\"7\"><li>a</li><li>b</li></ol>"), ["7.", "8."]);
+        // The largest number there is doesn't overflow.
+        assert_eq!(markers("<ol start=\"4294967295\"><li>a</li><li>b</li></ol>"), ["4294967295.", "4294967295."]);
     }
 
     #[test]

@@ -2,10 +2,13 @@
 //!
 //! A sync cycle pulls the latest changes from relays, fetches every feed, then
 //! publishes what changed. It runs at startup, on demand, and optionally on a
-//! schedule. Closing the app publishes any remaining changes.
+//! schedule. Closing the app publishes any remaining changes. With syncing set
+//! to Manual Only ([`MANUAL_SYNC`]), only [`Cmd::SyncNow`], signing in and
+//! signing out talk to relays.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -25,6 +28,7 @@ use crate::longform;
 pub use crate::nostr::DEFAULT_RELAYS;
 use crate::nostr::{NostrTransport, Signer};
 use crate::sync::{self, Options, Transport};
+use crate::youtube;
 
 /// Feeds downloaded at once, and at most this many from the same site.
 const FEED_FETCHES_IN_FLIGHT: usize = 32;
@@ -56,11 +60,23 @@ async fn upload_tick() {
 /// Coming back after this long in the background counts as starting again (and syncs).
 const RESUME_SYNC_AFTER: Duration = Duration::from_secs(15 * 60);
 
+/// Automatic syncs (at start, on coming back, on a schedule) wait until this
+/// long after the last complete sync, so opening the app again and again (say,
+/// coming back from each article read in the browser) doesn't sync each time.
+/// Syncs the user asks for don't wait.
+const AUTO_SYNC_GAP: Duration = Duration::from_secs(10 * 60);
+
 /// How often the web version syncs while open, unless told otherwise.
 pub const WEB_SYNC_MINUTES: u32 = 10;
 
-/// Choices for how often to sync automatically, in minutes (0 = only at start and exit).
-pub const SYNC_SCHEDULES: &[u32] = &[0, 15, 30, 60, 180];
+/// Never syncs on its own: only the Sync button (or R) syncs. Stored as the
+/// number of minutes, so an older version reading it just never syncs on a
+/// schedule.
+pub const MANUAL_SYNC: u32 = u32::MAX;
+
+/// Choices for how often to sync automatically, in minutes (0 = only at start
+/// and exit, [`MANUAL_SYNC`] = never on its own).
+pub const SYNC_SCHEDULES: &[u32] = &[MANUAL_SYNC, 0, 15, 30, 60, 180];
 
 #[derive(Clone, Copy)]
 pub enum FileKind {
@@ -135,6 +151,10 @@ pub trait Platform: Send + Sync {
     /// Forgets which signer app and account were used (when signing out),
     /// even if the app has been uninstalled since.
     fn forget_signer_app(&self) {}
+    /// Called with `true` when syncing starts and `false` once the worker has
+    /// nothing left to do, so the platform can keep the app running in the
+    /// background meanwhile (Android: a foreground service with a notification).
+    fn keep_running(&self, _on: bool) {}
 }
 
 /// A signer app on the device that holds the user's key (on Android: NIP-55,
@@ -179,6 +199,17 @@ pub enum Cmd {
         input: String,
         category: String,
     },
+    /// Finds the YouTube channel behind a channel's web address (see
+    /// [`youtube::channel_url`]); answers with [`Msg::YoutubeChannel`].
+    LookUpYoutube(String),
+    /// Subscribes to a YouTube channel found by [`Cmd::LookUpYoutube`];
+    /// answers with [`Msg::FeedAdded`].
+    AddYoutube {
+        channel: youtube::Channel,
+        /// Leave out Shorts and livestreams.
+        videos_only: bool,
+        category: String,
+    },
     RelaysChanged,
     /// Fetches one feed now (say, one just switched on).
     FetchFeed(String),
@@ -190,10 +221,12 @@ pub enum Cmd {
     /// Deletes all Feedstr data from relays and this device, and signs out.
     EraseAll,
     /// The app went to the background, where phones may close it without
-    /// notice: saves changes to relays.
-    Paused,
-    /// The app is back from the background: syncs if it was away a while.
-    Resumed,
+    /// notice: saves changes to relays. `kept_running`: the platform was asked
+    /// to keep the app running meanwhile (see [`Remote::paused`]).
+    Paused { kept_running: bool },
+    /// The app is back from the background, after `away_ms` (0 if it wasn't
+    /// known to be away): syncs if that was a while.
+    Resumed { away_ms: i64 },
     /// Publishes remaining changes, answers with [`Msg::ExitReady`] and stops.
     Exit,
 }
@@ -212,6 +245,7 @@ pub enum Msg {
     /// Like [`Msg::Status`], for something under way: how far along it is, from 0 to 1.
     Progress(String, f32),
     FeedAdded(Result<String, String>),
+    YoutubeChannel(Result<youtube::Channel, String>),
     /// The database changed; reload what's on screen.
     Changed,
     /// An import or export finished: what happened, or `None` if the user cancelled.
@@ -259,9 +293,23 @@ pub fn parse_relay(input: &str) -> Option<String> {
     valid.then(|| url.as_str().trim_end_matches('/').to_string())
 }
 
-/// Minutes between automatic sync cycles; 0 means only at start and exit.
+/// Minutes between automatic sync cycles; 0 means only at start and exit,
+/// [`MANUAL_SYNC`] only when asked to.
 pub fn sync_minutes(db: &Db) -> u32 {
     db.meta("sync_minutes").ok().flatten().and_then(|m| m.parse().ok()).unwrap_or(0)
+}
+
+/// Whether syncing is Manual Only: nothing is downloaded or uploaded unless
+/// the Sync button (or R) is used, not at start, in the background or on closing.
+pub fn manual_sync(db: &Db) -> bool {
+    sync_minutes(db) == MANUAL_SYNC
+}
+
+/// Whether anything changed since the relays last took everything (so
+/// going to the background right after a sync doesn't sync again).
+fn has_changes(db: &Db) -> bool {
+    let uploaded = db.meta("uploaded_rev").ok().flatten().and_then(|r| r.parse::<i64>().ok());
+    uploaded.is_none_or(|uploaded| db.revision().ok() != Some(uploaded))
 }
 
 /// The worker's side of the app: commands go in, messages come out. Sending
@@ -270,6 +318,7 @@ pub fn sync_minutes(db: &Db) -> u32 {
 pub struct Handle {
     pub tx: UnboundedSender<Cmd>,
     pub rx: mpsc::Receiver<Msg>,
+    pub remote: Remote,
     pub closing: watch::Sender<bool>,
     /// Stops waiting for a QR code sign-in.
     pub cancel_connect: Arc<tokio::sync::Notify>,
@@ -277,20 +326,47 @@ pub struct Handle {
 
 /// Tells the worker about the app's life cycle from any thread (say, Android's).
 #[derive(Clone)]
-pub struct Remote(pub(crate) UnboundedSender<Cmd>);
+pub struct Remote {
+    tx: UnboundedSender<Cmd>,
+    life: Arc<Lifecycle>,
+    /// To tell whether going to the background leaves changes to upload.
+    store: Store,
+}
+
+/// Whether the app is in the background, and since when. Kept apart from the
+/// commands, which wait while the worker is busy: when it gets to them, it can
+/// tell whether the app is still in the background, and how long it really was.
+#[derive(Default)]
+struct Lifecycle {
+    hidden: AtomicBool,
+    hidden_at: AtomicI64,
+    /// Whether the worker asked to keep the app running (see [`Platform::keep_running`]).
+    busy: AtomicBool,
+}
 
 impl Remote {
-    pub fn paused(&self) {
-        let _ = self.0.send(Cmd::Paused);
+    /// Returns whether the worker has something to finish in the background
+    /// (a sync under way, or changes to upload) and got the news: the app should
+    /// then be kept running, and the worker tells the platform when it can stop.
+    pub fn paused(&self) -> bool {
+        self.life.hidden_at.store(now_ms(), Ordering::Relaxed);
+        self.life.hidden.store(true, Ordering::Relaxed);
+        let work = self.life.busy.load(Ordering::Relaxed)
+            || db::connect(&self.store).is_ok_and(|db| {
+                db.meta("login").ok().flatten().is_some() && !manual_sync(&db) && has_changes(&db)
+            });
+        self.tx.send(Cmd::Paused { kept_running: work }).is_ok() && work
     }
 
     pub fn resumed(&self) {
-        let _ = self.0.send(Cmd::Resumed);
+        let was_hidden = self.life.hidden.swap(false, Ordering::Relaxed);
+        let away_ms = if was_hidden { now_ms() - self.life.hidden_at.load(Ordering::Relaxed) } else { 0 };
+        let _ = self.tx.send(Cmd::Resumed { away_ms });
     }
 
     /// Uploads what's left and stops syncing (say, when another browser tab takes over).
     pub fn exit(&self) {
-        let _ = self.0.send(Cmd::Exit);
+        let _ = self.tx.send(Cmd::Exit);
     }
 }
 
@@ -302,6 +378,7 @@ pub fn spawn(store: &Store, ctx: eframe::egui::Context, platform: Arc<dyn Platfo
     let cancel_connect = Arc::new(tokio::sync::Notify::new());
     let mut worker = Worker::new(db::connect(store)?, msg_tx, ctx, closing, platform);
     worker.cancel_connect = cancel_connect.clone();
+    let remote = Remote { tx: cmd_tx.clone(), life: worker.life.clone(), store: store.clone() };
     #[cfg(not(target_arch = "wasm32"))]
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -309,7 +386,7 @@ pub fn spawn(store: &Store, ctx: eframe::egui::Context, platform: Arc<dyn Platfo
     });
     #[cfg(target_arch = "wasm32")]
     wasm_bindgen_futures::spawn_local(worker.run(cmd_rx));
-    Ok(Handle { tx: cmd_tx, rx: msg_rx, closing: closing_tx, cancel_connect })
+    Ok(Handle { tx: cmd_tx, rx: msg_rx, remote, closing: closing_tx, cancel_connect })
 }
 
 struct Worker {
@@ -324,6 +401,10 @@ struct Worker {
     closing: watch::Receiver<bool>,
     platform: Arc<dyn Platform>,
     cancel_connect: Arc<tokio::sync::Notify>,
+    /// Shared with [`Remote`].
+    life: Arc<Lifecycle>,
+    /// Whether the platform was asked to keep the app running (see [`Platform::keep_running`]).
+    kept_running: std::cell::Cell<bool>,
 }
 
 impl Worker {
@@ -336,7 +417,19 @@ impl Worker {
     ) -> Self {
         let reader = tokio::sync::Mutex::default();
         let cancel_connect = Arc::default();
-        Worker { db, http: feeds::http_client(), nostr: None, reader, msg_tx, ctx, closing, platform, cancel_connect }
+        Worker {
+            db,
+            http: feeds::http_client(),
+            nostr: None,
+            reader,
+            msg_tx,
+            ctx,
+            closing,
+            platform,
+            cancel_connect,
+            life: Arc::default(),
+            kept_running: std::cell::Cell::new(false),
+        }
     }
 
     fn send(&self, msg: Msg) {
@@ -354,10 +447,14 @@ impl Worker {
 
     async fn run(mut self, mut rx: UnboundedReceiver<Cmd>) {
         let mut next_cycle = self.next_cycle();
-        let mut paused_at: Option<i64> = None;
-        // What was last uploaded, for uploading changes soon in the browser.
-        let (mut uploaded, mut retry_at) = (self.db.revision().unwrap_or(0), 0);
+        // When to try again after a failed upload in the browser.
+        let mut retry_at = 0;
         loop {
+            // Nothing left to do (for now): the app needn't be kept running.
+            if self.kept_running.get() && rx.is_empty() {
+                self.platform.keep_running(false);
+                self.set_kept_running(false);
+            }
             // A sync can bring a relay list changed on another device.
             if self.nostr.as_ref().is_some_and(|nostr| nostr.relays() != relays(&self.db)) {
                 self.reconnect().await;
@@ -372,7 +469,16 @@ impl Worker {
                                 if !saved {
                                     self.follows_by_default().await;
                                 }
-                                self.cycle(false).await;
+                                // Signing in on purpose always syncs; starting up only when it's
+                                // automatic, and not again right after the last time.
+                                if !saved || (!manual_sync(&self.db) && self.auto_sync_due()) {
+                                    self.cycle(false).await;
+                                } else if manual_sync(&self.db) {
+                                    // Replaces "Connecting to relays…", which would stay up otherwise.
+                                    self.status("Manual only: Sync to sync now");
+                                } else {
+                                    self.status("Synced less than 10 minutes ago: Sync to sync again now");
+                                }
                                 next_cycle = self.next_cycle();
                             }
                             (_, Err(e)) => self.send(Msg::LoginFailed(format!("{e:#}"))),
@@ -382,13 +488,33 @@ impl Worker {
                             self.cycle(false).await;
                             next_cycle = self.next_cycle();
                         }
+                        // Adding and fetching feeds go on if the app is left meanwhile.
                         Cmd::AddFeed { input, category } => {
+                            self.keep_running();
                             let result = self.add_feed(&input, &category).await.map_err(|e| format!("{e:#}"));
                             self.send(Msg::FeedAdded(result));
                             self.send(Msg::Changed);
                         }
+                        Cmd::LookUpYoutube(input) => {
+                            self.keep_running();
+                            self.status("Looking up the channel…");
+                            let result = match youtube::channel_url(&input) {
+                                Some(url) => youtube::look_up(&self.http, &url).await.map_err(|e| format!("{e:#}")),
+                                None => Err("that is not a YouTube channel's address".to_string()),
+                            };
+                            self.status(if result.is_ok() { "" } else { "Looking up the channel failed" });
+                            self.send(Msg::YoutubeChannel(result));
+                        }
+                        Cmd::AddYoutube { channel, videos_only, category } => {
+                            self.keep_running();
+                            let url = channel.feed_url(videos_only);
+                            let result = self.subscribe(&url, &category, channel.name.as_deref()).await;
+                            self.send(Msg::FeedAdded(result.map(|()| url).map_err(|e| format!("{e:#}"))));
+                            self.send(Msg::Changed);
+                        }
                         Cmd::RelaysChanged => self.reconnect().await,
                         Cmd::FetchFeed(url) => {
+                            self.keep_running();
                             self.status("Fetching…");
                             let status = match self.fetch_feed(&url).await {
                                 Ok(()) => "Fetched".to_string(),
@@ -398,15 +524,22 @@ impl Worker {
                             self.send(Msg::Changed);
                         }
                         Cmd::ScheduleChanged => next_cycle = self.next_cycle(),
-                        Cmd::Paused => {
-                            paused_at = Some(now_ms());
-                            if self.nostr.is_some() {
+                        Cmd::Paused { kept_running } => {
+                            // The platform may have started keeping the app running when it
+                            // went to the background (Android does); stopped once idle.
+                            if kept_running {
+                                self.set_kept_running(true);
+                            }
+                            // Back already (this waited for a sync to finish): nothing to save
+                            // in a hurry, and the sync just uploaded anyway.
+                            let hidden = self.life.hidden.load(Ordering::Relaxed);
+                            if hidden && self.nostr.is_some() && !manual_sync(&self.db) && self.has_changes() {
                                 self.push(true).await;
                             }
                         }
-                        Cmd::Resumed => {
-                            let away = paused_at.take().map(|at| now_ms() - at);
-                            if away.is_some_and(|away| away > RESUME_SYNC_AFTER.as_millis() as i64) {
+                        Cmd::Resumed { away_ms } => {
+                            let long = away_ms > RESUME_SYNC_AFTER.as_millis() as i64;
+                            if long && !manual_sync(&self.db) && self.auto_sync_due() {
                                 self.cycle(false).await;
                                 next_cycle = self.next_cycle();
                             }
@@ -428,9 +561,12 @@ impl Worker {
                             self.send(Msg::Erased(result));
                         }
                         Cmd::Exit => {
-                            if self.nostr.is_some() {
+                            if self.nostr.is_some() && !manual_sync(&self.db) && self.has_changes() {
                                 self.status("Saving changes to relays…");
                                 self.push(true).await;
+                            }
+                            if self.kept_running.get() {
+                                self.platform.keep_running(false);
                             }
                             self.send(Msg::ExitReady);
                             break;
@@ -441,14 +577,9 @@ impl Worker {
                     self.cycle(true).await;
                     next_cycle = self.next_cycle();
                 }
-                _ = upload_tick(), if self.nostr.is_some() => {
-                    let revision = self.db.revision().unwrap_or(0);
-                    if revision != uploaded && now_ms() >= retry_at {
-                        if self.push(true).await {
-                            uploaded = revision;
-                        } else {
-                            retry_at = now_ms() + UPLOAD_RETRY.as_millis() as i64;
-                        }
+                _ = upload_tick(), if self.nostr.is_some() && !manual_sync(&self.db) => {
+                    if self.has_changes() && now_ms() >= retry_at && !self.push(true).await {
+                        retry_at = now_ms() + UPLOAD_RETRY.as_millis() as i64;
                     }
                 }
             }
@@ -470,27 +601,68 @@ impl Worker {
         const NEVER: i64 = 365 * 24 * 3600 * 1000;
         match sync_minutes(&self.db) {
             _ if self.nostr.is_none() => now_ms() + NEVER,
-            0 if cfg!(target_arch = "wasm32") => now_ms() + WEB_SYNC_MINUTES as i64 * 60 * 1000,
+            MANUAL_SYNC => now_ms() + NEVER,
+            0 if cfg!(target_arch = "wasm32") => self.not_before_gap(now_ms() + WEB_SYNC_MINUTES as i64 * 60 * 1000),
             0 => now_ms() + NEVER,
-            minutes => now_ms() + minutes as i64 * 60 * 1000,
+            minutes => self.not_before_gap(now_ms() + minutes as i64 * 60 * 1000),
+        }
+    }
+
+    /// `at`, or later if that is too soon after the last complete sync (see [`AUTO_SYNC_GAP`]).
+    fn not_before_gap(&self, at: i64) -> i64 {
+        at.max(self.synced_at() + AUTO_SYNC_GAP.as_millis() as i64)
+    }
+
+    /// When the last complete sync (download, feeds and upload all done) finished (ms).
+    fn synced_at(&self) -> i64 {
+        self.db.meta("synced_at").ok().flatten().and_then(|t| t.parse().ok()).unwrap_or(0)
+    }
+
+    /// Whether an automatic sync may run now (see [`AUTO_SYNC_GAP`]).
+    fn auto_sync_due(&self) -> bool {
+        now_ms() - self.synced_at() >= AUTO_SYNC_GAP.as_millis() as i64
+    }
+
+    /// Asks the platform to keep the app running until the worker is idle again.
+    fn keep_running(&self) {
+        if !self.kept_running.get() {
+            self.platform.keep_running(true);
+            self.set_kept_running(true);
         }
     }
 
     /// Pulls from relays, fetches every feed, then publishes what changed.
     async fn cycle(&self, throttle_feed_caches: bool) {
-        self.sync(Options { publish: false, throttle_feed_caches }).await;
+        self.keep_running();
+        let read = self.sync(Options { publish: false, throttle_feed_caches }).await.saved;
         self.refresh().await;
-        self.push(throttle_feed_caches).await;
+        let saved = self.push(throttle_feed_caches).await;
+        // Fetching feeds stops early when the app is closing, so that doesn't count as complete.
+        if read && saved && !*self.closing.borrow() {
+            let _ = self.db.set_meta("synced_at", &now_ms().to_string());
+        }
     }
 
-    /// Publishes until nothing is waiting. Returns whether everything was saved.
+    /// Publishes everything waiting. Returns whether it was all saved.
     async fn push(&self, throttle_feed_caches: bool) -> bool {
-        loop {
-            let outcome = self.sync(Options { publish: true, throttle_feed_caches }).await;
-            if !outcome.saved || !outcome.more_pending {
-                break outcome.saved;
-            }
+        self.keep_running();
+        let saved = self.sync(Options { publish: true, throttle_feed_caches }).await.saved;
+        // What the sync merged was published too, so this is the revision after it.
+        // Kept in the database, so a restart doesn't upload again with nothing changed.
+        if saved && let Ok(revision) = self.db.revision() {
+            let _ = self.db.set_meta("uploaded_rev", &revision.to_string());
         }
+        saved
+    }
+
+    fn has_changes(&self) -> bool {
+        has_changes(&self.db)
+    }
+
+    /// Records whether the platform is keeping the app running, for [`Remote::paused`] too.
+    fn set_kept_running(&self, on: bool) {
+        self.kept_running.set(on);
+        self.life.busy.store(on, Ordering::Relaxed);
     }
 
     /// Signing in again with what was saved is tried a few times: a browser
@@ -648,16 +820,26 @@ impl Worker {
                 Err(e) => return Err(e),
             }
         };
-        self.db.set_subscribed(&url, true)?;
+        self.subscribe(&url, category, None).await?;
+        Ok(url)
+    }
+
+    /// Subscribes to a feed and fetches it. `title` names it until the first
+    /// fetch does (which may only happen on another device).
+    async fn subscribe(&self, url: &str, category: &str, title: Option<&str>) -> Result<()> {
+        self.db.set_subscribed(url, true)?;
         if !category.trim().is_empty() {
-            self.db.set_category(&url, category)?;
+            self.db.set_category(url, category)?;
         }
-        if fetchable(&url) {
-            self.fetch_feed(&url).await?;
+        if let Some(title) = title {
+            self.db.set_title_if_empty(url, title)?;
+        }
+        if fetchable(url) {
+            self.fetch_feed(url).await?;
         } else {
             self.status("Added. Your other devices fetch this feed; its articles show up here after they sync.");
         }
-        Ok(url)
+        Ok(())
     }
 
     async fn fetch_feed(&self, url: &str) -> Result<()> {
@@ -810,7 +992,7 @@ impl Worker {
     }
 
     async fn sync(&self, options: Options) -> SyncOutcome {
-        let mut outcome = SyncOutcome { saved: false, more_pending: false };
+        let mut outcome = SyncOutcome { saved: false };
         let Some(nostr) = &self.nostr else { return outcome };
         self.status(if options.publish { "Uploading changes…" } else { "Downloading changes…" });
         let erased_before = self.db.erased_at().unwrap_or(0);
@@ -832,10 +1014,7 @@ impl Worker {
         };
         let status = match sync::sync_reporting(&self.db, nostr, options, &progress).await {
             Ok(report) => {
-                outcome = SyncOutcome {
-                    saved: report.relays_ok > 0 && report.problems.is_empty(),
-                    more_pending: report.more_pending,
-                };
+                outcome = SyncOutcome { saved: report.relays_ok > 0 && report.problems.is_empty() };
                 let time = chrono::Local::now().format("%H:%M");
                 let mut status = format!("Synced at {time} · {}/{} relays", report.relays_ok, report.relays_total);
                 if report.relays_ok == 0 {
@@ -866,8 +1045,6 @@ fn count(n: usize, noun: &str) -> String {
 struct SyncOutcome {
     /// Everything published reached at least one relay without problems.
     saved: bool,
-    /// The sync hit its publishing limit; more changes are waiting.
-    more_pending: bool,
 }
 
 #[cfg(test)]
@@ -957,5 +1134,214 @@ mod tests {
         let started = std::time::Instant::now();
         worker.fetch_feeds(&[url]).await;
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A platform that only notes what the worker asks of it.
+    #[derive(Default)]
+    struct Recorder {
+        kept_running: std::sync::Mutex<Vec<bool>>,
+    }
+
+    impl Platform for Recorder {
+        fn open_file(&self, _: FileKind) -> PlatformFuture<Option<Vec<u8>>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn save_file(&self, _: FileKind, _: String, _: Vec<u8>) -> PlatformFuture<Option<String>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn keep_running(&self, on: bool) {
+            self.kept_running.lock().unwrap().push(on);
+        }
+    }
+
+    /// A signed-in worker that syncs with a relay of its own, with its
+    /// database in a file, so it can be looked at (and reused) after the worker stops.
+    struct TestApp {
+        relay: nostr_sdk::local_relay::MockRelay,
+        keys: Keys,
+        path: std::path::PathBuf,
+    }
+
+    /// What one run of the worker did.
+    struct Ran {
+        statuses: Vec<String>,
+        kept_running: Vec<bool>,
+    }
+
+    impl Ran {
+        fn synced(&self) -> bool {
+            self.statuses.iter().any(|s| s == "Downloading changes…")
+        }
+        fn uploaded(&self) -> bool {
+            self.statuses.iter().any(|s| s == "Uploading changes…")
+        }
+    }
+
+    impl TestApp {
+        async fn new() -> Self {
+            let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+            let path = std::env::temp_dir().join(format!("feedstr-test-{}.db", Keys::generate().public_key().to_hex()));
+            let app = TestApp { relay, keys: Keys::generate(), path };
+            set_relays(&app.db(), &[app.relay.url().await.to_string()]).unwrap();
+            // Signed in with a Sync Key, as if earlier.
+            app.db().set_meta("login", "sync_key").unwrap();
+            app.db().set_meta("sync_key", &app.keys.secret_key().to_bech32().unwrap()).unwrap();
+            app
+        }
+
+        fn db(&self) -> Db {
+            Db::open(&self.path).unwrap()
+        }
+
+        /// Starts the worker (as if signed in already), lets `send` send it
+        /// commands, and runs it until it has handled them all.
+        async fn run(&self, send: impl FnOnce(&Remote)) -> Ran {
+            let (msg_tx, msgs) = mpsc::channel();
+            let (_closing_tx, closing) = watch::channel(false);
+            let platform = Arc::new(Recorder::default());
+            let ctx = eframe::egui::Context::default();
+            let mut worker = Worker::new(self.db(), msg_tx, ctx, closing, platform.clone());
+            let signer = Signer::Keys(self.keys.clone());
+            worker.nostr = Some(NostrTransport::new(signer, relays(&worker.db)).await.unwrap());
+            let (tx, rx) = unbounded_channel();
+            let remote = Remote { tx, life: worker.life.clone(), store: self.path.clone() };
+            send(&remote);
+            drop(remote);
+            worker.run(rx).await;
+            let statuses = msgs
+                .try_iter()
+                .filter_map(|msg| match msg {
+                    Msg::Status(text) => Some(text),
+                    _ => None,
+                })
+                .collect();
+            let kept_running = platform.kept_running.lock().unwrap().clone();
+            Ran { statuses, kept_running }
+        }
+
+        fn synced_minutes_ago(&self, minutes: i64) {
+            self.db().set_meta("synced_at", &(now_ms() - minutes * 60 * 1000).to_string()).unwrap();
+        }
+
+        /// Makes a change that needs uploading.
+        fn change(&self) {
+            self.db().set_subscribed(&format!("https://example.com/{}.xml", now_ms()), true).unwrap();
+        }
+    }
+
+    impl Drop for TestApp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    const LONG_AWAY: i64 = 20 * 60 * 1000;
+
+    #[tokio::test]
+    async fn going_to_the_background_uploads_changes() {
+        let app = TestApp::new().await;
+        app.change();
+        let ran = app.run(|remote| assert!(remote.paused())).await;
+        assert!(ran.uploaded() && !ran.synced());
+        // The platform kept the app running when it left; the worker lets it go once done.
+        assert_eq!(ran.kept_running, [false]);
+    }
+
+    #[tokio::test]
+    async fn going_to_the_background_after_coming_back_already_uploads_nothing() {
+        let app = TestApp::new().await;
+        app.change();
+        // The worker only gets to the command once the app is back (say, after a long sync).
+        let ran = app.run(|remote| {
+            remote.paused();
+            remote.resumed();
+        }).await;
+        assert!(!ran.uploaded(), "{:?}", ran.statuses);
+        assert_eq!(ran.kept_running, [false]);
+    }
+
+    #[tokio::test]
+    async fn coming_back_syncs_only_if_away_long_and_the_last_sync_is_old() {
+        let app = TestApp::new().await;
+        app.synced_minutes_ago(30);
+        let ran = app.run(|remote| remote.tx.send(Cmd::Resumed { away_ms: 60 * 1000 }).unwrap()).await;
+        assert!(!ran.synced(), "away only a minute");
+
+        let ran = app.run(|remote| remote.tx.send(Cmd::Resumed { away_ms: LONG_AWAY }).unwrap()).await;
+        assert!(ran.synced() && ran.uploaded());
+        assert_eq!(ran.kept_running, [true, false]);
+        // That sync was complete, so it counts as the last one.
+        let synced_at: i64 = app.db().meta("synced_at").unwrap().unwrap().parse().unwrap();
+        assert!(now_ms() - synced_at < 60 * 1000);
+
+        // Back again, soon after it: no sync.
+        let ran = app.run(|remote| remote.tx.send(Cmd::Resumed { away_ms: LONG_AWAY }).unwrap()).await;
+        assert!(!ran.synced());
+        // Asked for, it syncs anyway.
+        let ran = app.run(|remote| remote.tx.send(Cmd::SyncNow).unwrap()).await;
+        assert!(ran.synced());
+    }
+
+    #[test]
+    fn coming_back_reports_how_long_the_app_was_away() {
+        let (tx, mut rx) = unbounded_channel();
+        let store = std::env::temp_dir().join(format!("feedstr-test-{}.db", Keys::generate().public_key().to_hex()));
+        let remote = Remote { tx, life: Arc::default(), store };
+        remote.resumed();
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Resumed { away_ms: 0 })));
+        remote.paused();
+        remote.life.hidden_at.store(now_ms() - LONG_AWAY, Ordering::Relaxed);
+        remote.resumed();
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Paused { .. })));
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Resumed { away_ms }) if away_ms >= LONG_AWAY));
+        // Once the worker has stopped, it can't stop keeping the app running either.
+        drop(rx);
+        assert!(!remote.paused());
+    }
+
+    #[tokio::test]
+    async fn manual_only_syncs_only_when_asked() {
+        let app = TestApp::new().await;
+        app.db().set_meta("sync_minutes", &MANUAL_SYNC.to_string()).unwrap();
+        app.change();
+        let ran = app
+            .run(|remote| {
+                remote.paused();
+                remote.tx.send(Cmd::Resumed { away_ms: LONG_AWAY }).unwrap();
+                remote.exit();
+            })
+            .await;
+        assert!(!ran.synced() && !ran.uploaded(), "{:?}", ran.statuses);
+        let ran = app.run(|remote| remote.tx.send(Cmd::SyncNow).unwrap()).await;
+        assert!(ran.synced() && ran.uploaded());
+    }
+
+    #[tokio::test]
+    async fn starting_without_a_sync_says_why() {
+        let app = TestApp::new().await;
+        let start = |remote: &Remote| remote.tx.send(Cmd::Login(Login::Saved)).unwrap();
+        // Not "Connecting to relays…", left up as if it never finished.
+        app.synced_minutes_ago(1);
+        let ran = app.run(start).await;
+        assert!(!ran.synced());
+        assert_eq!(ran.statuses.last().unwrap(), "Synced less than 10 minutes ago: Sync to sync again now");
+        app.db().set_meta("sync_minutes", &MANUAL_SYNC.to_string()).unwrap();
+        app.synced_minutes_ago(60);
+        let ran = app.run(start).await;
+        assert!(!ran.synced());
+        assert_eq!(ran.statuses.last().unwrap(), "Manual only: Sync to sync now");
+    }
+
+    #[tokio::test]
+    async fn nothing_is_uploaded_again_when_nothing_changed() {
+        let app = TestApp::new().await;
+        app.change();
+        let ran = app.run(|remote| assert!(remote.paused())).await;
+        assert!(ran.uploaded());
+        // The app is started again (say, after Android closed it), then leaves without changes:
+        // nothing to upload, so nothing needs to keep it running either.
+        let ran = app.run(|remote| assert!(!remote.paused())).await;
+        assert!(!ran.uploaded(), "uploaded again with nothing changed");
+        assert!(ran.kept_running.is_empty());
     }
 }

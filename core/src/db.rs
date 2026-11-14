@@ -306,7 +306,12 @@ impl Db {
 
     /// The whole database as bytes, to keep a copy elsewhere (like the browser's storage).
     pub fn snapshot(&self) -> Result<Vec<u8>> {
-        Ok(self.conn.serialize("main")?.to_vec())
+        // Serializing takes a connection nothing else is using, so a copy is
+        // made (in one step: the database is in memory, and nothing else writes to it).
+        let mut copy = Connection::open_in_memory()?;
+        let copied = rusqlite::backup::Backup::new(&self.conn, &mut copy)?.step(-1)?;
+        anyhow::ensure!(copied == rusqlite::backup::StepResult::Done, "the database is busy");
+        Ok(copy.serialize("main")?.to_vec())
     }
 
     /// An in-memory database restored from a [`Self::snapshot`].
@@ -367,7 +372,7 @@ impl Db {
         self.store_relay_list(&self.conn, &relays)?;
         let login = if forget_login { ", 'login', 'sync_key', 'bunker_uri', 'bunker_app_key'" } else { "" };
         self.wipe(&format!(
-            "DELETE FROM meta WHERE key IN ('salt', 'salt_t', 'pubkey', 'cache_limits', 'erased_at'{login});"
+            "DELETE FROM meta WHERE key IN ('salt', 'salt_t', 'pubkey', 'cache_limits', 'erased_at', 'synced_at', 'uploaded_rev'{login});"
         ))
     }
 
@@ -866,20 +871,42 @@ impl Db {
 
     /// Every unread item in a view (or those of them matching `search`), for "mark all as read".
     pub fn unread_keys(&self, view: &View, search: &str) -> Result<Vec<String>> {
-        self.unread_keys_before(view, search, i64::MAX)
+        self.unread_query(view, search, None, "i.key", |r| r.get(0))
     }
 
-    /// Like [`Db::unread_keys`], but only items published before `before` (seconds),
-    /// for "mark older articles as read".
+    /// Like [`Db::unread_keys`], but only items published before `before`
+    /// (seconds), for "mark older articles as read". Items without a date are
+    /// left out: there's no telling how old they are.
     pub fn unread_keys_before(&self, view: &View, search: &str, before: i64) -> Result<Vec<String>> {
+        self.unread_query(view, search, Some(before), "i.key", |r| r.get(0))
+    }
+
+    /// How many items [`Db::unread_keys_before`] would return.
+    pub fn unread_count_before(&self, view: &View, search: &str, before: i64) -> Result<usize> {
+        let counts: Vec<i64> = self.unread_query(view, search, Some(before), "count(*)", |r| r.get(0))?;
+        Ok(counts.first().copied().unwrap_or(0) as usize)
+    }
+
+    fn unread_query<T>(
+        &self,
+        view: &View,
+        search: &str,
+        before: Option<i64>,
+        select: &str,
+        row: impl FnMut(&Row) -> rusqlite::Result<T>,
+    ) -> Result<Vec<T>> {
         let (filter, value) = view_filter(view);
+        let older = if before.is_some() { "AND i.published > 0 AND i.published < ?4" } else { "" };
         let sql = format!(
-            "SELECT i.key FROM items i JOIN feeds f ON f.url = i.feed_url LEFT JOIN state s ON s.key = i.key
-             WHERE {filter} AND {UNREAD} AND {VISIBLE} AND {SEARCH} AND i.published < ?4"
+            "SELECT {select} FROM items i JOIN feeds f ON f.url = i.feed_url LEFT JOIN state s ON s.key = i.key
+             WHERE {filter} AND {UNREAD} AND {VISIBLE} AND {SEARCH} {older}"
         );
         let search = search.trim().to_lowercase();
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![unread_cutoff(), value, search, before], |r| r.get(0))?;
+        let rows = match before {
+            Some(before) => stmt.query_map(params![unread_cutoff(), value, search, before], row)?,
+            None => stmt.query_map(params![unread_cutoff(), value, search], row)?,
+        };
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -1700,6 +1727,27 @@ mod tests {
     }
 
     #[test]
+    fn undated_items_dont_count_as_older() {
+        let db = Db::open_memory().unwrap();
+        let feed = "https://a.example/feed";
+        db.set_subscribed(feed, true).unwrap();
+        let old = now_ms() / 1000 - 30 * DAY_SECS;
+        let items = vec![
+            ("old".to_string(), Item { title: "Old".into(), published: old, ..Default::default() }),
+            ("undated".to_string(), Item { title: "Undated".into(), published: 0, ..Default::default() }),
+        ];
+        db.store_fetched(feed, "Feed", "", &items).unwrap();
+        // Fetched undated items are dated when first seen; ones from elsewhere may still have no date.
+        db.conn.execute("UPDATE items SET published = 0 WHERE title = 'Undated'", []).unwrap();
+        let view = View::Feed(feed.into());
+        let before = now_ms() / 1000 - DAY_SECS;
+        assert_eq!(db.unread_keys_before(&view, "", before).unwrap().len(), 1);
+        assert_eq!(db.unread_count_before(&view, "", before).unwrap(), 1);
+        // "Mark all as read" still takes both.
+        assert_eq!(db.unread_keys(&view, "").unwrap().len(), 2);
+    }
+
+    #[test]
     fn marks_only_older_items_read_and_stars_several_at_once() {
         let db = Db::open_memory().unwrap();
         let feed = "https://a.example/feed";
@@ -1714,8 +1762,10 @@ mod tests {
         db.store_fetched(feed, "Feed", "", &items).unwrap();
         let view = View::Feed(feed.into());
         // Posts 4 to 9 are more than 3 days and an hour old.
-        let older = db.unread_keys_before(&view, "", now - 3 * DAY_SECS - 3600).unwrap();
+        let before = now - 3 * DAY_SECS - 3600;
+        let older = db.unread_keys_before(&view, "", before).unwrap();
         assert_eq!(older.len(), 6);
+        assert_eq!(db.unread_count_before(&view, "", before).unwrap(), 6);
         db.set_read(&older, true).unwrap();
         assert_eq!(db.feeds().unwrap()[0].unread, 4);
         let newest: Vec<String> = db.items(&view, true).unwrap().into_iter().map(|i| i.key).collect();

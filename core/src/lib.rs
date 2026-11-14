@@ -14,6 +14,7 @@ mod nostr;
 mod sync;
 mod ui;
 mod worker;
+mod youtube;
 
 pub use db::{Db, Store};
 pub use import_export::MAX_IMPORT_BYTES;
