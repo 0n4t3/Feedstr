@@ -15,7 +15,7 @@ In addition to standard RSS/ATOM feeds, Feedstr supports following additional co
 - **Zero tracking:** no outgoing connections ever, aside from fetching feeds
   and syncing
 - **End-to-end encrypted sync:** no need to trust a community relay
-- **Linux (Flatpak), Android and web** support
+- **Linux (Flatpak), Android, and web** support
 - **A lightweight, multi-purpose server:** a Nostr relay can do quite a bit
   more than just sync feeds
 - **OPML** import and export
