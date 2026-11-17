@@ -1,0 +1,4 @@
+# Relative paths, so the built page works from any folder (a GitHub Pages
+# project site is served from /<repo>/, not the domain root).
+[build]
+public_url = "./"

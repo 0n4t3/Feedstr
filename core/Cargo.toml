@@ -27,8 +27,18 @@ sha2 = "0.11.1"
 tokio = { version = "1.54.1", features = ["macros", "sync"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Feeds fetched through Tor (SOCKS5) or I2P (an HTTP proxy, which reqwest
+# supports without this); the browser can't use proxies.
+reqwest = { version = "0.13.5", default-features = false, features = ["socks"] }
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "time"] }
+# Gemini feeds through Tor.
+tokio-socks = "0.5.2"
+tokio = { version = "1.54.1", features = ["io-util", "net", "rt-multi-thread", "time"] }
+# Gemini feeds: TLS over a plain connection, and the certificate authorities
+# a capsule's certificate may (but needn't) be signed by. On Android, HTTPS
+# feeds are checked against the same list (see below).
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1.0.11"
 
 # The QR code for signing in with a remote signer, on screens big enough to show one.
 [target.'cfg(not(target_os = "android"))'.dependencies]
@@ -38,10 +48,10 @@ qrcodegen = "1.8.0"
 eframe = "0.37.0"
 
 # reqwest's usual certificate check needs extra Java setup on Android, so
-# there feeds are checked against Mozilla's root certificates instead.
+# there feeds are checked against Mozilla's root certificates (webpki-roots,
+# above) instead.
 [target.'cfg(target_os = "android")'.dependencies]
 eframe = { version = "0.37.0", default-features = false, features = ["system_fonts"] }
-webpki-roots = "1.0.11"
 
 # In the browser: its clock and timers, and its source of randomness.
 [target.'cfg(target_arch = "wasm32")'.dependencies]

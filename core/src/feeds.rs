@@ -6,6 +6,7 @@ use reqwest::{StatusCode, Url};
 
 use crate::db::{FetchInfo, now_ms};
 use crate::docs::Item;
+use crate::proxy::Route;
 
 /// Longer item content is cut off, so a single item can't crowd out a feed's sync cache.
 pub const MAX_CONTENT_BYTES: usize = 40_000;
@@ -37,14 +38,23 @@ pub enum Fetched {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn http_client() -> reqwest::Client {
+    http_client_builder(Route::Direct).build().expect("valid HTTP client configuration")
+}
+
+/// The settings every native HTTP client shares (proxied ones too, see
+/// [`crate::proxy::Clients`]), for one that goes `route`'s way.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn http_client_builder(route: Route) -> reqwest::ClientBuilder {
     // HTTPS here and Nostr relays (nostr-sdk) share rustls with its ring
     // backend, which has to be chosen before the first connection.
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let redirects = reqwest::redirect::Policy::custom(|attempt| {
+    let redirects = reqwest::redirect::Policy::custom(move |attempt| {
         if attempt.previous().len() >= 10 {
             attempt.error("too many redirects")
         } else if attempt.previous().last().is_some_and(|from| !may_lead_to(from, attempt.url())) {
             attempt.error("redirected to an address on this device or its network")
+        } else if !reachable(route, attempt.url()) {
+            attempt.error("redirected to a .onion or .i2p site, which this feed isn't fetched through")
         } else {
             attempt.follow()
         }
@@ -55,7 +65,7 @@ pub fn http_client() -> reqwest::Client {
         .timeout(std::time::Duration::from_secs(30));
     #[cfg(target_os = "android")]
     let builder = builder.tls_backend_preconfigured(android_tls());
-    builder.build().expect("valid HTTP client configuration")
+    builder
 }
 
 /// In the browser, requests go through its fetch(), which handles TLS and timeouts.
@@ -71,10 +81,30 @@ fn android_tls() -> rustls::ClientConfig {
     rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth()
 }
 
+/// Whether a client going `route`'s way may ask for `url`: a `.onion` or
+/// `.i2p` site only through its own network. Asking for one any other way
+/// would only fail, after giving its name away to the DNS server.
+pub fn reachable(route: Route, url: &Url) -> bool {
+    Route::required_by(url.as_str()).is_none_or(|needed| needed == route)
+}
+
 /// Whether a web or relay address is on this device or its local network
 /// (`localhost`, `192.168.…`, `10.…`, a name without a dot, and the like),
 /// going by the address as written: names aren't looked up.
 pub fn is_local_address(url: &Url) -> bool {
+    let Some(host) = url.host_str() else { return false };
+    match host.trim_start_matches('[').trim_end_matches(']').parse() {
+        Ok(ip) => is_local_ip(ip),
+        Err(_) => {
+            let name = host.trim_end_matches('.').to_ascii_lowercase();
+            let local_names = [".localhost", ".local", ".lan", ".internal", ".home.arpa"];
+            name == "localhost" || !name.contains('.') || local_names.iter().any(|end| name.ends_with(end))
+        }
+    }
+}
+
+/// Whether an IP address is this device or on its local network.
+pub fn is_local_ip(ip: std::net::IpAddr) -> bool {
     use std::net::{IpAddr, Ipv4Addr};
     let local_v4 = |ip: Ipv4Addr| {
         let carrier_nat = ip.octets()[0] == 100 && ip.octets()[1] & 0xc0 == 64;
@@ -85,10 +115,9 @@ pub fn is_local_address(url: &Url) -> bool {
             || ip.is_broadcast()
             || carrier_nat
     };
-    let Some(host) = url.host_str() else { return false };
-    match host.trim_start_matches('[').trim_end_matches(']').parse() {
-        Ok(IpAddr::V4(ip)) => local_v4(ip),
-        Ok(IpAddr::V6(ip)) => match ip.to_ipv4_mapped() {
+    match ip {
+        IpAddr::V4(ip) => local_v4(ip),
+        IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
             Some(ip) => local_v4(ip),
             // Loopback, unspecified, unique local (fc00::/7) and link-local (fe80::/10).
             None => {
@@ -96,11 +125,6 @@ pub fn is_local_address(url: &Url) -> bool {
                 ip.is_loopback() || ip.is_unspecified() || first & 0xfe00 == 0xfc00 || first & 0xffc0 == 0xfe80
             }
         },
-        Err(_) => {
-            let name = host.trim_end_matches('.').to_ascii_lowercase();
-            let local_names = [".localhost", ".local", ".lan", ".internal", ".home.arpa"];
-            name == "localhost" || !name.contains('.') || local_names.iter().any(|end| name.ends_with(end))
-        }
     }
 }
 
@@ -134,24 +158,37 @@ pub async fn fetch(http: &reqwest::Client, url: &str, cache: &FetchInfo) -> Resu
     Ok(Fetched::Feed(parse(&body, &base)?, info))
 }
 
-/// A response's body, unless it is larger than `max` bytes.
+/// A download refused for being larger than allowed (the limit, in bytes):
+/// the server is fine, the file is just too big.
+#[derive(Debug)]
+pub struct TooLarge(pub usize);
+
+impl std::fmt::Display for TooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "the download is too large (over {} KB)", self.0 / 1024)
+    }
+}
+
+impl std::error::Error for TooLarge {}
+
+/// A response's body, unless it is larger than `max` bytes ([`TooLarge`]).
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn read_limited(mut response: reqwest::Response, max: usize) -> Result<Vec<u8>> {
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await? {
         if body.len() + chunk.len() > max {
-            bail!("the download is too large (over {} KB)", max / 1024);
+            return Err(TooLarge(max).into());
         }
         body.extend_from_slice(&chunk);
     }
     Ok(body)
 }
 
-/// A response's body, unless it is larger than `max` bytes. The browser
-/// hands it over whole, so a size it announces is checked first.
+/// A response's body, unless it is larger than `max` bytes ([`TooLarge`]).
+/// The browser hands it over whole, so a size it announces is checked first.
 #[cfg(target_arch = "wasm32")]
 pub async fn read_limited(response: reqwest::Response, max: usize) -> Result<Vec<u8>> {
-    let too_large = || anyhow::anyhow!("the download is too large (over {} KB)", max / 1024);
+    let too_large = || anyhow::Error::from(TooLarge(max));
     if response.content_length().is_some_and(|length| length > max as u64) {
         return Err(too_large());
     }
@@ -162,10 +199,18 @@ pub async fn read_limited(response: reqwest::Response, max: usize) -> Result<Vec
     Ok(body.to_vec())
 }
 
-/// A web address as typed ("example.com/feed" counts too).
+/// A web address as typed ("example.com/feed" counts too). Without a
+/// scheme, HTTPS is assumed, except for `.onion` and `.i2p` sites, which
+/// mostly only offer HTTP (their networks encrypt the connection already).
 pub fn typed_url(input: &str) -> Result<Url> {
     let input = input.trim();
-    let url = if input.contains("://") { input.to_string() } else { format!("https://{input}") };
+    let url = if input.contains("://") {
+        input.to_string()
+    } else if crate::proxy::Route::required_by(&format!("http://{input}")).is_some() {
+        format!("http://{input}")
+    } else {
+        format!("https://{input}")
+    };
     let url = Url::parse(&url).context("not a valid address")?;
     anyhow::ensure!(matches!(url.scheme(), "http" | "https"), "not a web address");
     Ok(url)
@@ -191,7 +236,7 @@ pub async fn discover(http: &reqwest::Client, input: &str) -> Result<String> {
 }
 
 /// Finds `<link rel="alternate" type="application/rss+xml" href="...">` and friends.
-fn find_feed_link(html: &str) -> Option<String> {
+pub(crate) fn find_feed_link(html: &str) -> Option<String> {
     let lower = html.to_ascii_lowercase();
     let mut rest = lower.as_str();
     while let Some(start) = rest.find("<link") {

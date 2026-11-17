@@ -13,6 +13,46 @@ use crate::worker::SignerApp;
 /// A relay slower than this is skipped for the round (it catches up next time).
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+/// The same through Tor, where circuits take a while to build.
+const TOR_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+const TOR_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Where connections to relays go: directly (`None`), or through the SOCKS
+/// proxy at this address (Tor's, see `proxy::relay_proxy`), which also looks
+/// up the relays' names.
+pub type RelayProxy = Option<std::net::SocketAddr>;
+
+/// A relay client whose connections go `via` that proxy, if any.
+pub fn relay_client(via: RelayProxy) -> Client {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(address) = via {
+        return Client::builder().proxy(Proxy::all(address)).build();
+    }
+    let _ = via;
+    Client::default()
+}
+
+/// Whether a relay may be used with connections going `via` that proxy: not
+/// an unencrypted one (`ws://`) through Tor, where the exit relay could read
+/// who asks for what. (Its content is encrypted, but not that.)
+pub fn through_tor_ok(url: &str, via: RelayProxy) -> bool {
+    let unencrypted = url.trim().get(..5).is_some_and(|start| start.eq_ignore_ascii_case("ws://"));
+    let skip = via.is_some() && unencrypted;
+    if skip {
+        log::warn!("skipping {url}: unencrypted relays aren't used through Tor");
+    }
+    !skip
+}
+
+/// Options for relays of a remote signer, whose connections go `via` that proxy.
+fn signer_relays(via: RelayProxy) -> Option<RelayOptions> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(address) = via {
+        return Some(RelayOptions::new().proxy(Proxy::all(address)).connect_timeout(TOR_CONNECT_TIMEOUT));
+    }
+    let _ = via;
+    None
+}
 const BUNKER_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long a QR code sign-in waits for the signer app to connect.
 const QR_TIMEOUT: Duration = Duration::from_secs(180);
@@ -35,18 +75,27 @@ pub enum Signer {
 }
 
 impl Signer {
-    pub fn bunker(uri: &str, app_key: &Keys) -> Result<Self> {
+    pub fn bunker(uri: &str, app_key: &Keys, via: RelayProxy) -> Result<Self> {
         let uri = NostrConnectUri::parse(uri.trim()).context("not a valid bunker:// address")?;
-        Ok(Signer::Bunker(Box::new(NostrConnect::new(uri, app_key.clone(), BUNKER_TIMEOUT, None)?)))
+        // Its relays can't be left out (the signer only answers there).
+        anyhow::ensure!(
+            uri.relays().iter().all(|relay| through_tor_ok(relay.as_str(), via)),
+            "this remote signer uses an unencrypted relay (ws://), which isn't used while everything goes \
+             through Tor"
+        );
+        let opts = signer_relays(via);
+        Ok(Signer::Bunker(Box::new(NostrConnect::new(uri, app_key.clone(), BUNKER_TIMEOUT, opts)?)))
     }
 
     /// A remote signer that comes to us: its app scans the returned
     /// `nostrconnect://` link (NIP-46) as a QR code, and answers on `relays`.
-    pub fn nostr_connect(app_key: &Keys, relays: &[String]) -> Result<(String, Self)> {
-        let relays = relays.iter().filter_map(|relay| RelayUrl::parse(relay).ok());
+    pub fn nostr_connect(app_key: &Keys, relays: &[String], via: RelayProxy) -> Result<(String, Self)> {
+        let relays = relays.iter().filter(|relay| through_tor_ok(relay, via));
+        let relays = relays.filter_map(|relay| RelayUrl::parse(relay).ok());
         let uri = NostrConnectUri::client(app_key.public_key(), relays, "Feedstr");
         let link = uri.to_string();
-        Ok((link, Signer::Bunker(Box::new(NostrConnect::new(uri, app_key.clone(), QR_TIMEOUT, None)?))))
+        let opts = signer_relays(via);
+        Ok((link, Signer::Bunker(Box::new(NostrConnect::new(uri, app_key.clone(), QR_TIMEOUT, opts)?))))
     }
 
     /// For a remote signer: the `bunker://` link to connect to it again later.
@@ -135,26 +184,43 @@ pub struct NostrTransport {
     client: Client,
     signer: Signer,
     pubkey: PublicKey,
+    /// The relays in use: those asked for, less any left out.
     relays: Vec<String>,
+    /// The relays asked for, to tell when the list has changed.
+    asked: Vec<String>,
+    /// How long to wait for relays: longer through Tor.
+    connect_timeout: Duration,
+    fetch_timeout: Duration,
 }
 
 impl NostrTransport {
-    pub async fn new(signer: Signer, relays: Vec<String>) -> Result<Self> {
+    /// `via`: the proxy relay connections go through, if any.
+    pub async fn new(signer: Signer, relays: Vec<String>, via: RelayProxy) -> Result<Self> {
         let pubkey = signer.public_key().await?;
-        let client = Client::default();
+        let client = relay_client(via);
+        let (connect_timeout, fetch_timeout) =
+            if via.is_some() { (TOR_CONNECT_TIMEOUT, TOR_FETCH_TIMEOUT) } else { (CONNECT_TIMEOUT, FETCH_TIMEOUT) };
+        let asked = relays.clone();
         let mut added = Vec::new();
-        for url in relays {
+        for url in relays.into_iter().filter(|url| through_tor_ok(url, via)) {
             match client.add_relay(&url).await {
                 Ok(_) => added.push(url),
                 Err(e) => log::warn!("skipping relay {url}: {e}"),
             }
         }
         client.connect().await;
-        Ok(Self { client, signer, pubkey, relays: added })
+        Ok(Self { client, signer, pubkey, relays: added, asked, connect_timeout, fetch_timeout })
     }
 
     pub fn pubkey(&self) -> PublicKey {
         self.pubkey
+    }
+
+    /// The relays this was made for, including any left out (an unencrypted
+    /// one through Tor, or one that isn't a valid address): compare these,
+    /// not [`Transport::relays`], with the list to tell when it has changed.
+    pub fn relays_asked_for(&self) -> &[String] {
+        &self.asked
     }
 
     pub async fn shutdown(&self) {
@@ -175,11 +241,11 @@ impl NostrTransport {
             })
             .collect();
         let started = crate::clock::now_ms();
-        let events = relay.fetch_events(filters).timeout(FETCH_TIMEOUT).await?;
+        let events = relay.fetch_events(filters).timeout(self.fetch_timeout).await?;
         // The stream ends without an error on timeout or disconnect too, but
         // only an EOSE proves we have seen everything the relay holds.
         let elapsed = Duration::from_millis((crate::clock::now_ms() - started).max(0) as u64);
-        if elapsed >= FETCH_TIMEOUT || !relay.status().is_connected() {
+        if elapsed >= self.fetch_timeout || !relay.status().is_connected() {
             bail!("no complete answer");
         }
         Ok(events.into_iter().collect())
@@ -196,7 +262,7 @@ impl Transport for NostrTransport {
     async fn fetch(&self, url: &str, wanted: &[(String, Option<u64>)]) -> Result<Vec<RawEvent>> {
         let relay = self.client.relay(url).await?.ok_or_else(|| anyhow!("unknown relay"))?;
         if !relay.status().is_connected() {
-            relay.try_connect().timeout(CONNECT_TIMEOUT).await.context("offline")?;
+            relay.try_connect().timeout(self.connect_timeout).await.context("offline")?;
         }
         let mut raw = Vec::new();
         for event in self.request(&relay, wanted).await? {
@@ -253,6 +319,15 @@ impl Transport for NostrTransport {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unencrypted_relays_arent_used_through_tor() {
+        let tor = Some("127.0.0.1:9050".parse().unwrap());
+        assert!(super::through_tor_ok("wss://relay.example", tor));
+        assert!(!super::through_tor_ok("ws://relay.example", tor));
+        assert!(!super::through_tor_ok(" WS://relay.example", tor));
+        assert!(super::through_tor_ok("ws://localhost:7777", None));
+    }
+
     use nostr_sdk::local_relay::MockRelay;
 
     use super::*;
@@ -277,7 +352,7 @@ mod tests {
 
         let relay = MockRelay::run().await.unwrap();
         let (app_key, user) = (Keys::generate(), Keys::generate());
-        let (link, signer) = Signer::nostr_connect(&app_key, &[relay.url().await.to_string()]).unwrap();
+        let (link, signer) = Signer::nostr_connect(&app_key, &[relay.url().await.to_string()], None).unwrap();
         assert!(link.starts_with("nostrconnect://") && link.contains("secret="));
         // The signer app "scans" the link and answers.
         let uri = NostrConnectUri::parse(&link).unwrap();
@@ -330,14 +405,14 @@ mod tests {
         a.store_fetched(feed, "Example", "", &[("1".into(), item)]).unwrap();
         let key = crate::docs::item_key(feed, "1");
         a.set_fav(&key, true).unwrap();
-        let ta = NostrTransport::new(Signer::Keys(keys.clone()), relays.clone()).await.unwrap();
+        let ta = NostrTransport::new(Signer::Keys(keys.clone()), relays.clone(), None).await.unwrap();
         let report = sync(&a, &ta, PUSH).await.unwrap();
         assert_eq!((report.relays_ok, report.problems.len()), (2, 0), "{report:?}");
 
         // Another device with only one relay still reachable.
         r1.shutdown();
         let b = Db::open_memory().unwrap();
-        let tb = NostrTransport::new(Signer::Keys(keys), relays).await.unwrap();
+        let tb = NostrTransport::new(Signer::Keys(keys), relays, None).await.unwrap();
         let report = sync(&b, &tb, PUSH).await.unwrap();
         assert_eq!(report.relays_ok, 1, "{report:?}");
         let items = b.items(&View::All, false).unwrap();
@@ -372,15 +447,15 @@ mod tests {
 
         let db = Db::open_memory().unwrap();
         db.set_subscribed("https://example.com/feed", true).unwrap();
-        let signer = Signer::bunker(&uri, &Keys::generate()).unwrap();
-        let transport = NostrTransport::new(signer, vec![url.clone()]).await.unwrap();
+        let signer = Signer::bunker(&uri, &Keys::generate(), None).unwrap();
+        let transport = NostrTransport::new(signer, vec![url.clone()], None).await.unwrap();
         assert_eq!(transport.pubkey(), user.public_key());
         let report = sync(&db, &transport, PUSH).await.unwrap();
         assert!(report.problems.is_empty() && report.published > 0, "{report:?}");
 
         // The data is readable with the user's own key, so other devices can sign in either way.
         let other = Db::open_memory().unwrap();
-        let direct = NostrTransport::new(Signer::Keys(user), vec![url]).await.unwrap();
+        let direct = NostrTransport::new(Signer::Keys(user), vec![url], None).await.unwrap();
         sync(&other, &direct, PUSH).await.unwrap();
         assert_eq!(other.subscribed_feeds().unwrap(), ["https://example.com/feed"]);
     }

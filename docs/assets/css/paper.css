@@ -1,0 +1,172 @@
+/* Feedstr's site theme: a sheet of paper on a desk. */
+
+:root {
+  --desk: #e9e3d6;
+  --paper: #fbf8f1;
+  --ink: #2b2723;
+  --ink-soft: #6b6359;
+  --rule: #ddd4c3;
+  --accent: #8a3b2c;      /* a red-brown, like an old ink stamp */
+  --note: #f4ecd8;
+  --code: #f1ebdd;
+  --shadow: rgba(60, 45, 25, 0.12);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --desk: #1b1916;
+    --paper: #26231f;
+    --ink: #e8e1d4;
+    --ink-soft: #a89f91;
+    --rule: #3a352e;
+    --accent: #d9907c;
+    --note: #312c25;
+    --code: #2e2a24;
+    --shadow: rgba(0, 0, 0, 0.35);
+  }
+}
+
+* { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--desk);
+  color: var(--ink);
+  font-family: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+  font-size: 18px;
+  line-height: 1.65;
+}
+
+a { color: var(--accent); text-underline-offset: 0.15em; }
+a:hover { text-decoration-thickness: 2px; }
+
+/* Top bar */
+
+.masthead {
+  max-width: 46rem;
+  margin: 0 auto;
+  padding: 1.25rem 1.5rem 0.75rem;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem 1.5rem;
+}
+
+.masthead-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--ink);
+  font-size: 1.25rem;
+  font-weight: bold;
+  text-decoration: none;
+  letter-spacing: 0.02em;
+}
+
+.masthead-title img { border-radius: 6px; }
+
+.masthead-nav { display: flex; flex-wrap: wrap; gap: 0.25rem 1.25rem; }
+
+.masthead-nav a {
+  color: var(--ink-soft);
+  text-decoration: none;
+  font-variant: small-caps;
+  letter-spacing: 0.06em;
+  font-size: 1.05rem;
+}
+
+.masthead-nav a:hover { color: var(--accent); }
+
+/* The sheet of paper */
+
+.sheet {
+  max-width: 46rem;
+  margin: 0.5rem auto 2rem;
+  padding: 3rem 3.5rem;
+  background: var(--paper);
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  box-shadow: 0 1px 2px var(--shadow), 0 8px 24px var(--shadow);
+}
+
+@media (max-width: 640px) {
+  body { font-size: 17px; }
+  .masthead { padding: 1rem 1rem 0.5rem; }
+  .sheet { margin: 0.25rem 0 0; padding: 1.75rem 1.25rem; border-left: 0; border-right: 0; }
+}
+
+/* Text */
+
+h1, h2, h3, h4 { line-height: 1.25; font-weight: normal; margin: 2rem 0 0.75rem; }
+h1 { font-size: 2.3rem; margin-top: 0; }
+h2 { font-size: 1.6rem; padding-bottom: 0.3rem; border-bottom: 1px solid var(--rule); }
+h3 { font-size: 1.25rem; font-style: italic; }
+h4 { font-size: 1.05rem; font-weight: bold; }
+
+.page-title { margin-bottom: 1.5rem; }
+
+p, ul, ol, table, pre, blockquote { margin: 0 0 1.1rem; }
+ul, ol { padding-left: 1.4rem; }
+li { margin-bottom: 0.3rem; }
+li > ul, li > ol { margin: 0.3rem 0 0; }
+
+strong { font-weight: bold; }
+
+hr { border: 0; border-top: 1px solid var(--rule); margin: 2rem 0; }
+
+img { max-width: 100%; height: auto; }
+
+/* The home page's opening */
+
+.home > p:first-child img { display: block; margin-bottom: 0.5rem; }
+
+/* Notes and warnings */
+
+blockquote {
+  margin-left: 0;
+  margin-right: 0;
+  padding: 0.9rem 1.2rem;
+  background: var(--note);
+  border-left: 3px solid var(--accent);
+}
+
+blockquote p:last-child { margin-bottom: 0; }
+
+/* Code */
+
+code, pre {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.85em;
+}
+
+code { background: var(--code); padding: 0.1em 0.3em; border-radius: 3px; }
+
+pre {
+  background: var(--code);
+  padding: 0.9rem 1.1rem;
+  overflow-x: auto;
+  border-radius: 3px;
+  line-height: 1.45;
+}
+
+pre code { background: none; padding: 0; }
+
+/* Tables */
+
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: 0.45rem 0.75rem; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th { font-variant: small-caps; letter-spacing: 0.04em; color: var(--ink-soft); font-weight: normal; }
+
+/* Footer */
+
+.colophon {
+  max-width: 46rem;
+  margin: 0 auto;
+  padding: 0 1.5rem 2.5rem;
+  text-align: center;
+  color: var(--ink-soft);
+  font-size: 0.95rem;
+}

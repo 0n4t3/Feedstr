@@ -15,6 +15,7 @@ use crate::db::now_ms;
 use crate::docs::Item;
 use crate::feeds::{self, Feed};
 use crate::html;
+use crate::nostr::RelayProxy;
 
 pub const FOLLOWS_URL: &str = "nostr:follows";
 pub const FOLLOWS_TITLE: &str = "Nostr Follows";
@@ -24,6 +25,9 @@ pub(crate) const WEB_VIEWER: &str = "https://ditto.pub";
 const INDEX_RELAY: &str = "wss://purplepag.es";
 const TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+/// The same through Tor, where circuits take a while to build.
+const TOR_TIMEOUT: Duration = Duration::from_secs(30);
+const TOR_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// Write relays per author looked at for the follows feed.
 const RELAYS_PER_AUTHOR: usize = 3;
 /// Relays asked for posts at most, chosen to cover as many authors as possible.
@@ -92,27 +96,28 @@ pub async fn resolve_nip05(http: &reqwest::Client, address: &str) -> Result<Publ
 pub struct Reader {
     /// The user's relays and the index relay.
     index: Vec<String>,
+    /// The proxy relay connections go through, if any (see `proxy::relay_proxy`).
+    via: RelayProxy,
 }
 
 impl Reader {
-    pub fn new(relays: Vec<String>) -> Self {
-        let mut index = relays;
+    pub fn new(relays: Vec<String>, via: RelayProxy) -> Self {
+        let mut index: Vec<String> = relays.into_iter().filter(|url| crate::nostr::through_tor_ok(url, via)).collect();
         index.push(INDEX_RELAY.to_string());
-        Self { index: unique(index) }
+        Self { index: unique(index), via }
     }
 
     /// One person's long-form posts: all that can be found the first time
     /// (`newest` is None), then only those since about the newest one.
     pub async fn fetch_author(&self, author: PublicKey, newest: Option<i64>) -> Result<Feed> {
-        let session = Session::new(&self.index).await;
+        let session = Session::new(&self.index, self.via).await;
         let feed = session.author(author, newest).await;
-        session.client.shutdown().await;
-        feed
+        session.finish(feed, |feed| feed.items.is_empty()).await
     }
 
     /// Whether `user`'s Nostr follow list has anyone in it.
     pub async fn follows_anyone(&self, user: PublicKey) -> bool {
-        let session = Session::new(&self.index).await;
+        let session = Session::new(&self.index, self.via).await;
         let lists = session.query(&session.index, Filter::new().kind(Kind::ContactList).author(user)).await;
         session.client.shutdown().await;
         lists
@@ -121,13 +126,40 @@ impl Reader {
             .is_some_and(|list| list.tags.public_keys().next().is_some())
     }
 
+    /// `author`'s events matching each of `filters`, read from the relays
+    /// they publish to and the user's, with their name if they have one.
+    /// Used for nsites (see [`crate::nsite`]).
+    pub(crate) async fn events_by(
+        &self,
+        author: PublicKey,
+        filters: Vec<Filter>,
+    ) -> Result<(Vec<Event>, Option<String>)> {
+        let session = Session::new(&self.index, self.via).await;
+        let (relays, mut names) = session.authors(&[author]).await;
+        let sources = history_sources(relays.get(&author).map_or(&[][..], |r| r), &self.index);
+        let found = futures::future::join_all(filters.into_iter().map(|filter| session.query(&sources, filter))).await;
+        let found = Ok((found.into_iter().flatten().collect::<Vec<_>>(), names.remove(&author)));
+        session.finish(found, |(events, _)| events.is_empty()).await
+    }
+
+    /// Every event of `kind` by `author` that their relays and the user's
+    /// have, read page by page (relays cap how many they send at once). Used
+    /// for older nsites, which have an event per file (see [`crate::nsite`]).
+    pub(crate) async fn every_event_by(&self, author: PublicKey, kind: Kind) -> Result<Vec<Event>> {
+        let session = Session::new(&self.index, self.via).await;
+        let (relays, _) = session.authors(&[author]).await;
+        let sources = history_sources(relays.get(&author).map_or(&[][..], |r| r), &self.index);
+        let base = Filter::new().kind(kind).author(author);
+        let pages = futures::future::join_all(sources.iter().map(|relay| session.every(relay, base.clone()))).await;
+        session.finish(Ok(pages.into_iter().flatten().collect::<Vec<_>>()), Vec::is_empty).await
+    }
+
     /// Long-form posts by everyone `user` follows, newer than about the
     /// newest one stored (or from the last couple of months).
     pub async fn fetch_follows(&self, user: PublicKey, newest: Option<i64>) -> Result<Feed> {
-        let session = Session::new(&self.index).await;
+        let session = Session::new(&self.index, self.via).await;
         let feed = session.follows(user, newest).await;
-        session.client.shutdown().await;
-        feed
+        session.finish(feed, |feed| feed.items.is_empty()).await
     }
 }
 
@@ -135,15 +167,37 @@ impl Reader {
 struct Session {
     client: Client,
     index: Vec<String>,
+    /// How long to wait for relays: longer through Tor.
+    connect_timeout: Duration,
+    timeout: Duration,
+    via: RelayProxy,
 }
 
 impl Session {
-    async fn new(index: &[String]) -> Self {
-        let client = Client::default();
+    async fn new(index: &[String], via: RelayProxy) -> Self {
+        let client = crate::nostr::relay_client(via);
         for relay in index {
             let _ = client.add_relay(relay).await;
         }
-        Self { client, index: index.to_vec() }
+        let (connect_timeout, timeout) =
+            if via.is_some() { (TOR_CONNECT_TIMEOUT, TOR_TIMEOUT) } else { (CONNECT_TIMEOUT, TIMEOUT) };
+        Self { client, index: index.to_vec(), connect_timeout, timeout, via }
+    }
+
+    /// Closes the connections, and passes on what was found, unless it
+    /// came to nothing (`empty`, or an error) because no relay could be
+    /// reached: then that's the error, not "nothing found" (when Tor isn't
+    /// running, say).
+    async fn finish<T>(self, found: Result<T>, empty: impl FnOnce(&T) -> bool) -> Result<T> {
+        let reached = self.client.relays().await.values().any(|relay| relay.status().is_connected());
+        self.client.shutdown().await;
+        if reached || found.as_ref().is_ok_and(|found| !empty(found)) {
+            return found;
+        }
+        match self.via {
+            Some(proxy) => bail!("couldn't reach any relay through the Tor proxy at {proxy} (is it running?)"),
+            None => bail!("couldn't reach any relay"),
+        }
     }
 
     /// Events matching `filter` on these relays. Best effort: relays that
@@ -156,8 +210,8 @@ impl Session {
                 targets.push((relay.as_str(), vec![filter.clone()]));
             }
         }
-        self.client.try_connect().timeout(CONNECT_TIMEOUT).await;
-        match self.client.fetch_events(targets).timeout(TIMEOUT).await {
+        self.client.try_connect().timeout(self.connect_timeout).await;
+        match self.client.fetch_events(targets).timeout(self.timeout).await {
             Ok(events) => events.into_iter().filter(|event| asked_for(&filter, event)).collect(),
             Err(e) => {
                 log::warn!("reading long-form posts failed: {e}");
@@ -229,10 +283,16 @@ impl Session {
     /// has no older ones. Each relay is read on its own, since relays cap
     /// how many events they return differently.
     async fn history(&self, relay: &str, author: PublicKey) -> Vec<Event> {
+        self.every(relay, Filter::new().kind(Kind::LongFormTextNote).author(author)).await
+    }
+
+    /// Every event matching `base` on `relay`, read page by page until the
+    /// relay has no older ones.
+    async fn every(&self, relay: &str, base: Filter) -> Vec<Event> {
         let mut events: Vec<Event> = Vec::new();
         let mut until: Option<Timestamp> = None;
         for _ in 0..MAX_PAGES {
-            let mut filter = Filter::new().kind(Kind::LongFormTextNote).author(author).limit(PAGE);
+            let mut filter = base.clone().limit(PAGE);
             if let Some(until) = until {
                 filter = filter.until(until);
             }
@@ -295,7 +355,11 @@ fn asked_for(filter: &Filter, event: &Event) -> bool {
 /// encrypted connection to a relay out on the internet. Otherwise a writer's
 /// relay list could point Feedstr at this device or its local network.
 fn public_relay(url: &str) -> bool {
-    reqwest::Url::parse(url).is_ok_and(|url| url.scheme() == "wss" && !feeds::is_local_address(&url))
+    // Not a .onion or .i2p relay either: relays are reached directly, where
+    // those only fail after giving their name away to the DNS server.
+    reqwest::Url::parse(url).is_ok_and(|url| {
+        url.scheme() == "wss" && !feeds::is_local_address(&url) && feeds::reachable(crate::proxy::Route::Direct, &url)
+    })
 }
 
 /// The list without repeats, in its order.
@@ -332,7 +396,7 @@ fn newest_versions(events: Vec<Event>) -> Vec<Event> {
 }
 
 /// "npub1abcd…wxyz"
-fn short(npub: &str) -> String {
+pub(crate) fn short(npub: &str) -> String {
     format!("{}…{}", &npub[..10], &npub[npub.len() - 4..])
 }
 
@@ -401,7 +465,7 @@ mod tests {
         }
         publisher.shutdown().await;
         // Through a reader whose only relay is this one.
-        let reader = Reader { index: vec![url.clone()] };
+        let reader = Reader { index: vec![url.clone()], via: None };
         let feed = reader.fetch_author(keys.public_key(), None).await.unwrap();
         assert_eq!(feed.items.len(), total);
         // And it doesn't stay connected afterwards.
@@ -434,7 +498,7 @@ mod tests {
         publisher.send_event(&list(&follower, vec![nobody.public_key()])).await.unwrap();
         publisher.send_event(&list(&empty, Vec::new())).await.unwrap();
         publisher.shutdown().await;
-        let reader = Reader { index: vec![url] };
+        let reader = Reader { index: vec![url], via: None };
         assert!(reader.follows_anyone(follower.public_key()).await);
         assert!(!reader.follows_anyone(empty.public_key()).await);
         assert!(!reader.follows_anyone(nobody.public_key()).await);
@@ -473,13 +537,23 @@ mod tests {
         // Whatever it's asked, this relay answers with (properly signed) notes by a stranger.
         let opts = LocalRelayTestOptions { unresponsive_connection: None, send_random_events: true };
         let relay = MockRelay::run_with_opts(opts).await.unwrap();
-        let reader = Reader { index: vec![relay.url().await.to_string()] };
+        let reader = Reader { index: vec![relay.url().await.to_string()], via: None };
         let user = Keys::generate().public_key();
         // They don't become a writer's posts...
         assert!(reader.fetch_author(user, None).await.unwrap().items.is_empty());
         // ...or the user's follow list.
         assert!(!reader.follows_anyone(user).await);
         assert!(reader.fetch_follows(user, None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn no_relay_reached_is_an_error_not_nothing_found() {
+        // Nothing listens on port 9 (discard) here: the connection is refused.
+        let reader = Reader { index: vec!["ws://127.0.0.1:9".into()], via: None };
+        let user = Keys::generate().public_key();
+        let Err(error) = reader.fetch_author(user, None).await else { panic!("no relay was reached") };
+        assert!(format!("{error:#}").contains("couldn't reach any relay"), "{error:#}");
+        assert!(reader.events_by(user, vec![Filter::new().author(user)]).await.is_err());
     }
 
     /// Open TCP connections to or from a local port (Linux).

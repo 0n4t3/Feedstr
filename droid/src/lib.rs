@@ -150,8 +150,7 @@ impl Droid {
             // The keyboard only knows what it typed (see `Typing` in
             // MainActivity): start it afresh when the cursor goes elsewhere.
             // (It does by itself when it's hidden.)
-            let moved = self.editing.is_some()
-                && (focused != self.editing || ctx.input(|i| i.pointer.any_pressed()));
+            let moved = self.editing.is_some() && (focused != self.editing || ctx.input(|i| i.pointer.any_pressed()));
             let password = ctx.output(|o| o.ime.as_ref().is_some_and(|i| i.purpose == egui::IMEPurpose::Password));
             if moved || password != self.password {
                 self.password = password;
@@ -223,6 +222,15 @@ fn with_activity<T>(f: impl FnOnce(&mut jni::Env, &JObject) -> jni::errors::Resu
 }
 
 // ---- Files and links ----
+
+/// Opens a link in the app that takes its kind; false if there is none.
+fn open_uri(link: &str) -> Result<bool> {
+    with_activity(|env, activity| {
+        let link = env.new_string(link)?;
+        let sig = jni_sig!("(Ljava/lang/String;)Z");
+        env.call_method(activity, jni_str!("openUri"), sig, &[JValue::Object(&link)])?.z()
+    })
+}
 
 enum Reply {
     Opened(Option<Vec<u8>>),
@@ -298,12 +306,14 @@ impl Platform for Android {
     fn open_nostr_link(&self, link: &str) -> Result<()> {
         // Only ever Nostr links: anything else could start some other app.
         anyhow::ensure!(link.starts_with("nostr:"), "not a Nostr link");
-        let opened = with_activity(|env, activity| {
-            let link = env.new_string(link)?;
-            let sig = jni_sig!("(Ljava/lang/String;)Z");
-            env.call_method(activity, jni_str!("openUri"), sig, &[JValue::Object(&link)])?.z()
-        })?;
-        anyhow::ensure!(opened, "No app for Nostr links is installed");
+        anyhow::ensure!(open_uri(link)?, "No app for Nostr links is installed");
+        Ok(())
+    }
+
+    fn open_gemini_link(&self, link: &str) -> Result<()> {
+        // Only ever Gemini links, for the same reason.
+        anyhow::ensure!(link.starts_with("gemini://"), "not a Gemini link");
+        anyhow::ensure!(open_uri(link)?, "No Gemini browser is installed to open gemini:// links");
         Ok(())
     }
 
@@ -512,9 +522,13 @@ extern "system" fn Java_top_dns7_feedstr_MainActivity_nativeTyped<'caller>(
         }
     };
     let modifiers = egui::Modifiers::NONE;
-    TYPED.lock().unwrap().extend(
-        [true, false].map(|pressed| egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers }),
-    );
+    TYPED.lock().unwrap().extend([true, false].map(|pressed| egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed,
+        repeat: false,
+        modifiers,
+    }));
     repaint();
 }
 

@@ -7,31 +7,21 @@
     <!-- No scripts from other sites: the page may hold a Sync Key. (The inline
          script is trunk's loader; nothing a feed sends is ever put into the page.) -->
     <meta http-equiv="Content-Security-Policy"
-          content="default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; connect-src 'self' https: wss: ws://localhost:* ws://127.0.0.1:*; img-src 'self' data:; frame-src nostr:; style-src 'self' 'unsafe-inline'">
+          content="default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; connect-src 'self' https: wss: ws://localhost:* ws://127.0.0.1:*; img-src 'self' data:; frame-src nostr: gemini:; style-src 'self' 'unsafe-inline'">
     <title>Feedstr</title>
     <!-- The same icon as the apps (logo.svg in the repository root). -->
-    
+    <link data-trunk rel="copy-file" href="../logo.svg">
     <link rel="icon" type="image/svg+xml" href="logo.svg">
     <!-- wasm-opt shrinks the WebAssembly further; the features listed are the ones Rust's wasm target uses. -->
-    
-<script type="module">
-import init, * as bindings from './feedstr-web-d5f069e664d33f35.js';
-const wasm = await init({ module_or_path: './feedstr-web-51ac022438b839d9_bg.wasm' });
-
-
-window.wasmBindings = bindings;
-
-
-dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
-
-</script>
+    <link data-trunk rel="rust" data-cargo-profile="web" data-wasm-opt="z"
+          data-wasm-opt-params="--enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals --enable-multivalue --enable-reference-types">
     <style>
         html, body { margin: 0; height: 100%; overflow: hidden; background: #1b1b1f; }
         @media (prefers-color-scheme: light) { html, body { background: #fbfbfc; } }
         canvas { display: block; width: 100%; height: 100%; outline: none; }
         noscript { color: #888; font: 16px sans-serif; display: block; padding: 2em; }
     </style>
-<link rel="modulepreload" href="./feedstr-web-d5f069e664d33f35.js" crossorigin="anonymous" integrity="sha384-y0GmxIJDDPAkbgqa9y3SHctYJEbHl3WgIao7mt+e3DokJzX0231OAyplFIhKAmul"><link rel="preload" href="./feedstr-web-51ac022438b839d9_bg.wasm" crossorigin="anonymous" integrity="sha384-eSEJoUjIo2L4D065MfsGuTEd7UBf6SoRnMqrq6PxkxGkOpnbuEYwMm/y2W9CuFcP" as="fetch" type="application/wasm"></head>
+</head>
 <body>
     <canvas id="feedstr"></canvas>
     <noscript>Feedstr needs JavaScript and WebAssembly.</noscript>

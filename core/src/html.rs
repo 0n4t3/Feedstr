@@ -104,6 +104,9 @@ struct Reader {
     code: usize,
     strike: usize,
     links: Vec<Option<String>>,
+    /// What relative links are relative to: the first `<base href>` (Feedstr
+    /// puts one in front of pages it stores, like an nsite's).
+    base: Option<reqwest::Url>,
 }
 
 impl Reader {
@@ -165,14 +168,31 @@ impl Reader {
             "a" if closing => {
                 self.links.pop();
             }
-            "a" => self.links.push(attribute(tag, "href").and_then(|href| link_target(&href))),
+            "base" if self.base.is_none() => {
+                self.base = attribute(tag, "href").and_then(|href| reqwest::Url::parse(href.trim()).ok());
+            }
+            "a" => {
+                let link = attribute(tag, "href").and_then(|href| link_target(&self.resolve(&href)));
+                self.links.push(link);
+            }
             "img" => {
                 let label = img_alt(tag).map_or("[Image]".to_string(), |alt| format!("[Image: {alt}]"));
-                self.links.push(attribute(tag, "src").and_then(|src| link_target(&src)));
+                let link = attribute(tag, "src").and_then(|src| link_target(&self.resolve(&src)));
+                self.links.push(link);
                 self.push(&label);
                 self.links.pop();
             }
             _ => {}
+        }
+    }
+
+    /// A link made whole against the page's `<base>`, if it has one (and the
+    /// link isn't whole already).
+    fn resolve(&self, href: &str) -> String {
+        let href = href.trim();
+        match &self.base {
+            Some(base) if reqwest::Url::parse(href).is_err() => base.join(href).map_or(href.to_string(), String::from),
+            _ => href.to_string(),
         }
     }
 
@@ -251,12 +271,12 @@ pub fn markdown_to_html(markdown: &str) -> String {
     out
 }
 
-/// Where a link in an item may lead: web pages, and Nostr links
-/// (`nostr:npub1…`) to their page on the web viewer. Anything else (`file:`
-/// paths, other apps' links) is left as plain text.
+/// Where a link in an item may lead: web pages, Gemini pages, and Nostr
+/// links (`nostr:npub1…`) to their page on the web viewer. Anything else
+/// (`file:` paths, other apps' links) is left as plain text.
 pub fn link_target(href: &str) -> Option<String> {
     let href = href.trim();
-    if is_web_link(href) {
+    if opens(href) {
         return Some(href.to_string());
     }
     let id = href.strip_prefix("nostr:")?;
@@ -269,6 +289,12 @@ pub fn link_target(href: &str) -> Option<String> {
 /// files or start other programs.
 pub fn is_web_link(link: &str) -> bool {
     reqwest::Url::parse(link).is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.has_host())
+}
+
+/// Whether a link can be opened: a web page (in the browser), or a Gemini
+/// page (in a Gemini browser, if there is one).
+pub fn opens(link: &str) -> bool {
+    is_web_link(link) || crate::gemini::typed_url(link).is_ok()
 }
 
 /// All of an item's text, without markup.
@@ -318,6 +344,46 @@ pub fn attribute(tag: &str, name: &str) -> Option<String> {
         return Some(decode_entities(value));
     }
     None
+}
+
+/// A web page's main content, if it marks it with `<main>` (leaving out its
+/// navigation, sidebars and footer), else the whole page.
+pub fn main_part(html: &str) -> &str {
+    let lower = html.to_ascii_lowercase();
+    let start = lower
+        .match_indices("<main")
+        .map(|(i, _)| i)
+        .find(|&i| lower[i + 5..].starts_with(|c: char| c == '>' || c.is_ascii_whitespace()));
+    match (start, lower.rfind("</main>")) {
+        (Some(start), Some(end)) if start < end => &html[start..end + "</main>".len()],
+        _ => html,
+    }
+}
+
+/// The HTML without what [`to_blocks`] never shows (`<head>`, `<script>` and
+/// `<style>` elements), for a whole web page stored as an article: so a page
+/// with a large head isn't cut down to nothing by the size limit.
+pub fn without_hidden(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let mut kept = String::with_capacity(html.len());
+    let mut at = 0;
+    while let Some(lt) = lower[at..].find('<').map(|i| at + i) {
+        let name: String = lower[lt + 1..].chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+        if !matches!(name.as_str(), "head" | "script" | "style") {
+            kept.push_str(&html[at..=lt]);
+            at = lt + 1;
+            continue;
+        }
+        kept.push_str(&html[at..lt]);
+        // Up to the end of the closing tag (or of the page, if there's none).
+        let end = format!("</{name}");
+        at = match lower[lt..].find(&end).map(|i| lt + i) {
+            Some(close) => lower[close..].find('>').map_or(html.len(), |i| close + i + 1),
+            None => html.len(),
+        };
+    }
+    kept.push_str(&html[at..]);
+    kept
 }
 
 pub fn decode_entities(text: &str) -> String {
@@ -370,6 +436,27 @@ pub fn decode_entities(text: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn main_part_of_pages() {
+        let page = "<body><nav>Menu</nav><MAIN class=x><p>Text</p><main>inner</main></main><footer>F</footer>";
+        assert_eq!(main_part(page), "<MAIN class=x><p>Text</p><main>inner</main></main>");
+        assert_eq!(main_part("<body><mainly>x</mainly>"), "<body><mainly>x</mainly>");
+        assert_eq!(main_part("<p>no main</main>"), "<p>no main</main>");
+    }
+
+    #[test]
+    fn hidden_parts_of_pages_are_left_out() {
+        let page = "<base href=\"https://a.example/\"><HTML><Head><title>T</title><style>p{}</style></head>\
+                    <body><p>Hi</p><script src=x></SCRIPT><p>there</p><scriptless>ok</scriptless><style>";
+        let kept = without_hidden(page);
+        assert_eq!(
+            kept,
+            "<base href=\"https://a.example/\"><HTML><body><p>Hi</p><p>there</p><scriptless>ok</scriptless>"
+        );
+        assert_eq!(to_blocks(&kept), to_blocks(page));
+        assert_eq!(without_hidden("a < b <p>é</p>"), "a < b <p>é</p>");
+    }
+
     /// (style, depth, marker, text) of each block.
     fn outline(blocks: &[Block]) -> Vec<(Style, u8, Option<&str>, String)> {
         blocks.iter().map(|b| (b.style, b.depth, b.marker.as_deref(), b.text())).collect()
@@ -419,6 +506,22 @@ mod tests {
     }
 
     #[test]
+    fn relative_links_follow_the_first_base() {
+        let blocks = to_blocks(
+            "<base href=\"https://site.example/blog/post.html\"><base href=\"https://other.example/\">\
+             <p><a href=\"/about.html\">about</a> <a href=\"next.html\">next</a> \
+             <a href=\"https://elsewhere.example/\">away</a> <a href=\"file:///etc/passwd\">file</a></p>",
+        );
+        let link = |text: &str| blocks[0].spans.iter().find(|s| s.text.trim() == text).and_then(|s| s.link.clone());
+        assert_eq!(link("about").as_deref(), Some("https://site.example/about.html"));
+        assert_eq!(link("next").as_deref(), Some("https://site.example/blog/next.html"));
+        assert_eq!(link("away").as_deref(), Some("https://elsewhere.example/"));
+        assert_eq!(link("file"), None);
+        // Without a base, a relative link stays text.
+        assert_eq!(to_blocks("<p><a href=\"/about.html\">about</a></p>")[0].spans[0].link, None);
+    }
+
+    #[test]
     fn plain_text_paragraphs() {
         assert_eq!(texts("One\n\nTwo &#8217; &#x41;"), ["One", "Two ’ A"]);
     }
@@ -442,6 +545,11 @@ mod tests {
             assert_eq!(link_target(link), None, "{link}");
         }
         assert_eq!(link_target("nostr:npub1abc").as_deref(), Some("https://ditto.pub/npub1abc"));
+        // Gemini pages open too (in a Gemini browser).
+        assert_eq!(link_target(" gemini://capsule.example/a.gmi").as_deref(), Some("gemini://capsule.example/a.gmi"));
+        assert!(
+            opens("gemini://capsule.example/") && !opens("gemini:///etc/passwd") && !is_web_link("gemini://a.example/")
+        );
         assert_eq!(link_target("nostr:npub1abc?x=1"), None);
     }
 

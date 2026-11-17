@@ -23,10 +23,13 @@ use crate::clock::{self, now_ms};
 use crate::db::FetchInfo;
 use crate::db::{self, Conn, Db, Store};
 use crate::feeds::{self, Fetched};
+use crate::gemini;
 use crate::import_export;
 use crate::longform;
 pub use crate::nostr::DEFAULT_RELAYS;
 use crate::nostr::{NostrTransport, Signer};
+use crate::nsite;
+use crate::proxy::{self, Route};
 use crate::sync::{self, Options, Transport};
 use crate::youtube;
 
@@ -46,9 +49,25 @@ const SAVED_LOGIN_RETRIES: usize = 5;
 const NOSTR_FETCHED: &str = "fetched";
 
 /// Whether this platform can fetch the feed: browsers can't read most
-/// sites, so the web version only fetches Nostr feeds itself.
-fn fetchable(url: &str) -> bool {
-    !cfg!(target_arch = "wasm32") || longform::is_nostr(url)
+/// sites, so the web version only fetches Nostr feeds and nsites itself
+/// (relays, and Blossom servers, which let browser pages read them).
+pub(crate) fn fetchable(url: &str) -> bool {
+    !cfg!(target_arch = "wasm32") || longform::is_nostr(url) || nsite::is_nsite(url)
+}
+
+/// Says which proxy couldn't be reached, when that's why a fetch through one failed.
+fn proxy_hint(e: anyhow::Error, route: Route) -> anyhow::Error {
+    let refused = e.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == std::io::ErrorKind::ConnectionRefused)
+            // What reqwest's SOCKS connector says (and all it says) when it
+            // can't connect to the proxy itself.
+            || cause.to_string().ends_with("failed to create underlying connection")
+    });
+    match route {
+        Route::Direct => e,
+        _ if refused => e.context(format!("couldn't reach the {} proxy (is it running?)", route.badge())),
+        _ => e.context(format!("fetching through {} failed", route.badge())),
+    }
 }
 
 /// Fires every [`UPLOAD_DELAY`] in the browser, and never natively (where
@@ -127,6 +146,10 @@ pub trait Platform: Send + Sync {
     /// Saves `content` where the user picks, suggesting `name`. Returns a
     /// description of where it went, or `None` if they cancel.
     fn save_file(&self, kind: FileKind, name: String, content: Vec<u8>) -> PlatformFuture<Option<String>>;
+    /// Opens a `gemini://` link in the user's Gemini browser.
+    fn open_gemini_link(&self, _link: &str) -> Result<()> {
+        bail!("Gemini links can't be opened in other apps here: copy the address instead")
+    }
     /// Whether `nostr:` links can be opened in the user's Nostr app.
     fn opens_nostr_links(&self) -> bool {
         false
@@ -198,6 +221,9 @@ pub enum Cmd {
     AddFeed {
         input: String,
         category: String,
+        /// How to fetch it (web and Gemini feeds only; `.onion` and `.i2p`
+        /// sites go through their network whatever this says).
+        route: Route,
     },
     /// Finds the YouTube channel behind a channel's web address (see
     /// [`youtube::channel_url`]); answers with [`Msg::YoutubeChannel`].
@@ -213,6 +239,9 @@ pub enum Cmd {
     RelaysChanged,
     /// Fetches one feed now (say, one just switched on).
     FetchFeed(String),
+    /// Trusts the new certificate of the capsule that kept this Gemini feed
+    /// from being fetched (see [`gemini::changed_key`]), and fetches the feed.
+    TrustCapsule(String),
     ScheduleChanged,
     /// Asks for a file and imports it.
     Import(FileKind),
@@ -223,10 +252,14 @@ pub enum Cmd {
     /// The app went to the background, where phones may close it without
     /// notice: saves changes to relays. `kept_running`: the platform was asked
     /// to keep the app running meanwhile (see [`Remote::paused`]).
-    Paused { kept_running: bool },
+    Paused {
+        kept_running: bool,
+    },
     /// The app is back from the background, after `away_ms` (0 if it wasn't
     /// known to be away): syncs if that was a while.
-    Resumed { away_ms: i64 },
+    Resumed {
+        away_ms: i64,
+    },
     /// Publishes remaining changes, answers with [`Msg::ExitReady`] and stops.
     Exit,
 }
@@ -342,6 +375,11 @@ struct Lifecycle {
     hidden_at: AtomicI64,
     /// Whether the worker asked to keep the app running (see [`Platform::keep_running`]).
     busy: AtomicBool,
+    /// Counts changes to how this device connects (everything through Tor
+    /// turned on or off, Tor's address changed), and wakes a sync under way
+    /// (see [`Remote::network_changed`]).
+    network: std::sync::atomic::AtomicU64,
+    network_changed: tokio::sync::Notify,
 }
 
 impl Remote {
@@ -352,9 +390,8 @@ impl Remote {
         self.life.hidden_at.store(now_ms(), Ordering::Relaxed);
         self.life.hidden.store(true, Ordering::Relaxed);
         let work = self.life.busy.load(Ordering::Relaxed)
-            || db::connect(&self.store).is_ok_and(|db| {
-                db.meta("login").ok().flatten().is_some() && !manual_sync(&db) && has_changes(&db)
-            });
+            || db::connect(&self.store)
+                .is_ok_and(|db| db.meta("login").ok().flatten().is_some() && !manual_sync(&db) && has_changes(&db));
         self.tx.send(Cmd::Paused { kept_running: work }).is_ok() && work
     }
 
@@ -367,6 +404,16 @@ impl Remote {
     /// Uploads what's left and stops syncing (say, when another browser tab takes over).
     pub fn exit(&self) {
         let _ = self.tx.send(Cmd::Exit);
+    }
+
+    /// How this device connects changed (see [`Lifecycle::network`]): a sync
+    /// under way stops at once, rather than finish over its old connections
+    /// (directly, when everything was just sent through Tor), and relays and
+    /// remote signers connect again the new way.
+    pub fn network_changed(&self) {
+        self.life.network.fetch_add(1, Ordering::Relaxed);
+        self.life.network_changed.notify_waiters();
+        let _ = self.tx.send(Cmd::RelaysChanged);
     }
 }
 
@@ -392,9 +439,14 @@ pub fn spawn(store: &Store, ctx: eframe::egui::Context, platform: Arc<dyn Platfo
 struct Worker {
     db: Conn,
     http: reqwest::Client,
+    /// HTTP clients for feeds fetched through Tor or I2P.
+    #[cfg(not(target_arch = "wasm32"))]
+    proxied: proxy::Clients,
     nostr: Option<NostrTransport>,
     /// Reads long-form posts; made when first needed.
-    reader: tokio::sync::Mutex<Option<Arc<longform::Reader>>>,
+    /// With the proxy it connects through, so a change to that (turning on
+    /// "everything through Tor" during a fetch) makes a new one at once.
+    reader: tokio::sync::Mutex<Option<(Arc<longform::Reader>, crate::nostr::RelayProxy)>>,
     msg_tx: mpsc::Sender<Msg>,
     ctx: eframe::egui::Context,
     /// Becomes true when the app is closing.
@@ -405,6 +457,8 @@ struct Worker {
     life: Arc<Lifecycle>,
     /// Whether the platform was asked to keep the app running (see [`Platform::keep_running`]).
     kept_running: std::cell::Cell<bool>,
+    /// The [`Lifecycle::network`] count the relay connections were made with.
+    network_seen: std::cell::Cell<u64>,
 }
 
 impl Worker {
@@ -420,6 +474,8 @@ impl Worker {
         Worker {
             db,
             http: feeds::http_client(),
+            #[cfg(not(target_arch = "wasm32"))]
+            proxied: proxy::Clients::default(),
             nostr: None,
             reader,
             msg_tx,
@@ -429,6 +485,7 @@ impl Worker {
             cancel_connect,
             life: Arc::default(),
             kept_running: std::cell::Cell::new(false),
+            network_seen: std::cell::Cell::new(0),
         }
     }
 
@@ -456,7 +513,7 @@ impl Worker {
                 self.set_kept_running(false);
             }
             // A sync can bring a relay list changed on another device.
-            if self.nostr.as_ref().is_some_and(|nostr| nostr.relays() != relays(&self.db)) {
+            if self.nostr.as_ref().is_some_and(|nostr| nostr.relays_asked_for() != relays(&self.db)) {
                 self.reconnect().await;
             }
             tokio::select! {
@@ -489,9 +546,9 @@ impl Worker {
                             next_cycle = self.next_cycle();
                         }
                         // Adding and fetching feeds go on if the app is left meanwhile.
-                        Cmd::AddFeed { input, category } => {
+                        Cmd::AddFeed { input, category, route } => {
                             self.keep_running();
-                            let result = self.add_feed(&input, &category).await.map_err(|e| format!("{e:#}"));
+                            let result = self.add_feed(&input, &category, route).await.map_err(|e| format!("{e:#}"));
                             self.send(Msg::FeedAdded(result));
                             self.send(Msg::Changed);
                         }
@@ -499,7 +556,7 @@ impl Worker {
                             self.keep_running();
                             self.status("Looking up the channel…");
                             let result = match youtube::channel_url(&input) {
-                                Some(url) => youtube::look_up(&self.http, &url).await.map_err(|e| format!("{e:#}")),
+                                Some(url) => self.look_up_youtube(&url).await.map_err(|e| format!("{e:#}")),
                                 None => Err("that is not a YouTube channel's address".to_string()),
                             };
                             self.status(if result.is_ok() { "" } else { "Looking up the channel failed" });
@@ -508,21 +565,16 @@ impl Worker {
                         Cmd::AddYoutube { channel, videos_only, category } => {
                             self.keep_running();
                             let url = channel.feed_url(videos_only);
-                            let result = self.subscribe(&url, &category, channel.name.as_deref()).await;
+                            let result = self.subscribe(&url, &category, channel.name.as_deref(), None).await;
                             self.send(Msg::FeedAdded(result.map(|()| url).map_err(|e| format!("{e:#}"))));
                             self.send(Msg::Changed);
                         }
                         Cmd::RelaysChanged => self.reconnect().await,
-                        Cmd::FetchFeed(url) => {
-                            self.keep_running();
-                            self.status("Fetching…");
-                            let status = match self.fetch_feed(&url).await {
-                                Ok(()) => "Fetched".to_string(),
-                                Err(e) => format!("Fetching failed: {e:#}"),
-                            };
-                            self.status(status);
-                            self.send(Msg::Changed);
+                        Cmd::TrustCapsule(url) => {
+                            self.trust_capsule(&url);
+                            self.fetch_now(&url).await;
                         }
+                        Cmd::FetchFeed(url) => self.fetch_now(&url).await,
                         Cmd::ScheduleChanged => next_cycle = self.next_cycle(),
                         Cmd::Paused { kept_running } => {
                             // The platform may have started keeping the app running when it
@@ -690,14 +742,15 @@ impl Worker {
             }
             Login::Bunker(uri) => {
                 self.status("Waiting for the remote signer to approve…");
-                let signer = Signer::bunker(&uri, &self.bunker_app_key()?)?;
+                let signer = Signer::bunker(&uri, &self.bunker_app_key()?, proxy::relay_proxy(&self.db)?)?;
                 signer.public_key().await.context("the remote signer did not respond")?;
                 self.db.set_meta("login", "bunker")?;
                 self.db.set_meta("bunker_uri", uri.trim())?;
                 signer
             }
             Login::QrCode => {
-                let (link, signer) = Signer::nostr_connect(&self.bunker_app_key()?, &relays(&self.db))?;
+                let via = proxy::relay_proxy(&self.db)?;
+                let (link, signer) = Signer::nostr_connect(&self.bunker_app_key()?, &relays(&self.db), via)?;
                 self.send(Msg::ConnectLink(link));
                 self.status("Waiting for your signer app…");
                 tokio::select! {
@@ -734,7 +787,8 @@ impl Worker {
                 Some("extension") => Signer::extension()?,
                 Some("bunker") => {
                     self.status("Connecting to the remote signer…");
-                    Signer::bunker(&self.db.meta("bunker_uri")?.unwrap_or_default(), &self.bunker_app_key()?)?
+                    let uri = self.db.meta("bunker_uri")?.unwrap_or_default();
+                    Signer::bunker(&uri, &self.bunker_app_key()?, proxy::relay_proxy(&self.db)?)?
                 }
                 _ => bail!("not signed in"),
             },
@@ -743,7 +797,8 @@ impl Worker {
             old.shutdown().await;
         }
         self.status("Connecting to relays…");
-        let nostr = NostrTransport::new(signer, relays(&self.db)).await?;
+        self.network_seen.set(self.life.network.load(Ordering::Relaxed));
+        let nostr = NostrTransport::new(signer, relays(&self.db), proxy::relay_proxy(&self.db)?).await?;
         let pubkey = nostr.pubkey().to_hex();
         // Never mix two accounts' data in one database.
         if self.db.meta("pubkey")?.is_some_and(|old| old != pubkey) {
@@ -806,30 +861,170 @@ impl Worker {
         Ok(done)
     }
 
-    async fn add_feed(&self, input: &str, category: &str) -> Result<String> {
-        let url = if let Some(author) = longform::parse_author(input) {
+    /// Fetches one feed, saying how it went.
+    async fn fetch_now(&self, url: &str) {
+        // In the browser, the other devices fetch most feeds.
+        if !fetchable(url) {
+            return;
+        }
+        self.keep_running();
+        self.status("Fetching…");
+        let status = match self.fetch_feed(url).await {
+            Ok(()) => "Fetched".to_string(),
+            Err(e) => format!("Fetching failed: {e:#}"),
+        };
+        self.status(status);
+        self.send(Msg::Changed);
+    }
+
+    /// Forgets the certificate remembered for the capsule that kept this
+    /// Gemini feed from being fetched, so its new one is trusted from the
+    /// next fetch on.
+    fn trust_capsule(&self, feed_url: &str) {
+        let changed = gemini::changed_key(feed_url);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Ok(Some(capsule)) = self.db.meta(&changed) {
+            let _ = self.db.delete_meta(&gemini::pin_key(&capsule));
+        }
+        let _ = self.db.delete_meta(&changed);
+    }
+
+    async fn add_feed(&self, input: &str, category: &str, route: Route) -> Result<String> {
+        let mut route = Some(route);
+        // An address on an npub subdomain may be an nsite on a gateway, or a
+        // site of another kind (some hosts give Nostr users subdomains): only
+        // taken for an nsite if one was published.
+        let mut site = nsite::Site::parse_input(input);
+        if let Some(found) = &site
+            && !nsite::is_nsite(input.trim())
+            && !nsite::exists(&*self.reader().await?, found).await?
+        {
+            site = None;
+        }
+        // Through Tor for everything, if so set (`chosen`, below, is what the
+        // feed itself is set to, kept for when that's turned off).
+        let tor_everything = proxy::tor_everything(&self.db);
+        let url = if let Some(site) = site {
+            route = None;
+            site.feed_url()
+        } else if let Some(author) = longform::parse_author(input) {
+            route = None;
             longform::author_url(&author)
+        } else if gemini::is_gemini(input) {
+            let url = gemini::typed_url(input)?.to_string();
+            let chosen = proxy::route_for(&url, route.unwrap_or(Route::Direct).key())?;
+            let reached = proxy::effective_route(&url, chosen.key(), tor_everything)?;
+            anyhow::ensure!(reached != Route::I2p, "Gemini feeds can't be fetched through I2P");
+            // Read first, so a page that isn't a feed isn't subscribed to. (The
+            // browser can't: there the other devices fetch it, and report it.)
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Err(e) = self.gemini_client(reached).feed(&url).await {
+                let Some(gemini::CertChanged(capsule)) = e.chain().find_map(|cause| cause.downcast_ref()) else {
+                    return Err(e);
+                };
+                // A capsule followed before (maybe in another feed) that has a new
+                // certificate: added anyway. Fetching it notes why it failed, and
+                // the feed report offers to trust the new certificate.
+                let capsule = capsule.clone();
+                let _ = self.subscribe(&url, category, None, Some(chosen)).await;
+                anyhow::bail!(
+                    "{capsule} isn't using the certificate Feedstr saw there before. The feed was added, but \
+                     isn't fetched until you trust the new certificate: see Settings → Feed report"
+                );
+            }
+            route = Some(chosen);
+            url
         } else if longform::is_nip05(input) {
-            longform::author_url(&longform::resolve_nip05(&self.http, input).await?)
+            route = None;
+            // Asked the way the address's own site would be (its domain may be a .onion).
+            let (_, domain) = input.trim().split_once('@').context("not a NIP-05 address")?;
+            let site = format!("https://{domain}/");
+            let reached = proxy::effective_route(&site, "", tor_everything)?;
+            longform::author_url(&longform::resolve_nip05(&self.http_for(reached, &site)?, input).await?)
         } else {
-            match feeds::discover(&self.http, input).await {
-                Ok(url) => url,
-                // Most sites don't let browser pages read them; the other
-                // devices fetch the feed (and report it if it isn't one).
-                Err(_) if !fetchable(input) => feeds::typed_url(input)?.to_string(),
-                Err(e) => return Err(e),
+            let typed = feeds::typed_url(input)?.to_string();
+            let chosen = proxy::route_for(&typed, route.unwrap_or(Route::Direct).key())?;
+            let reached = proxy::effective_route(&typed, chosen.key(), tor_everything)?;
+            // The feed found keeps the way it was found: a .onion page may
+            // link to a feed elsewhere, which mustn't then be fetched directly.
+            route = Some(chosen);
+            if reached != Route::Direct && !fetchable(&typed) {
+                // The browser can't use the proxy, and asking the site
+                // directly is just what going through it should avoid.
+                typed
+            } else {
+                match feeds::discover(&self.http_for(reached, &typed)?, input).await {
+                    Ok(url) => url,
+                    // Most sites don't let browser pages read them; the other
+                    // devices fetch the feed (and report it if it isn't one).
+                    Err(_) if !fetchable(input) => typed,
+                    // Maybe an nsite on a gateway after all, whose relays didn't answer.
+                    Err(e) if nsite::Site::parse_input(input).is_some() => {
+                        return Err(e.context(
+                            "if this is an nsite, it couldn't be found on its owner's relays: try again, or add \
+                             it as nsite:npub1…",
+                        ));
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         };
-        self.subscribe(&url, category, None).await?;
+        self.subscribe(&url, category, None, route).await?;
         Ok(url)
+    }
+
+    /// Looks up a YouTube channel's page, through Tor if everything goes through Tor.
+    async fn look_up_youtube(&self, url: &youtube::ChannelUrl) -> Result<youtube::Channel> {
+        const YOUTUBE: &str = "https://www.youtube.com/";
+        let route = proxy::effective_route(YOUTUBE, "", proxy::tor_everything(&self.db))?;
+        youtube::look_up(&self.http_for(route, YOUTUBE)?, url).await
+    }
+
+    /// The HTTP client for the feed at `url`, fetched through `route`.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn http_for(&self, route: Route, url: &str) -> Result<reqwest::Client> {
+        let parsed = reqwest::Url::parse(url).ok();
+        let site = parsed.as_ref().and_then(|u| u.host_str()).unwrap_or(url);
+        self.proxied.get(&self.http, route, &proxy::proxy_address(&self.db, route), site)
+    }
+
+    /// The browser can't use proxies: such feeds are fetched by the other devices.
+    #[cfg(target_arch = "wasm32")]
+    fn http_for(&self, route: Route, _url: &str) -> Result<reqwest::Client> {
+        match route {
+            Route::Direct => Ok(self.http.clone()),
+            _ => bail!("the browser can't fetch feeds through Tor or I2P"),
+        }
+    }
+
+    /// A client for Gemini feeds fetched through `route` (directly or through Tor).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn gemini_client(&self, route: Route) -> gemini::Client<'_> {
+        let client = gemini::Client::new(&self.db);
+        match route {
+            Route::Tor => client.through_tor(proxy::proxy_address(&self.db, Route::Tor)),
+            _ => client,
+        }
     }
 
     /// Subscribes to a feed and fetches it. `title` names it until the first
     /// fetch does (which may only happen on another device).
-    async fn subscribe(&self, url: &str, category: &str, title: Option<&str>) -> Result<()> {
+    /// `route`: how it is to be fetched, if that was chosen (see [`Cmd::AddFeed`]).
+    async fn subscribe(&self, url: &str, category: &str, title: Option<&str>, route: Option<Route>) -> Result<()> {
         self.db.set_subscribed(url, true)?;
+        // The category first: if it is kept on this device only, so is the route.
         if !category.trim().is_empty() {
             self.db.set_category(url, category)?;
+        }
+        // Only what the address doesn't decide already is stored, and adding
+        // a feed again never takes it off Tor or I2P (the choice starts at
+        // "directly"): that's done from the feed's menu.
+        let current = self.db.route(url)?;
+        if let Some(route) = route.filter(|_| Route::required_by(url).is_none())
+            && current != route.key()
+            && !(route == Route::Direct && !current.is_empty())
+        {
+            self.db.set_route(url, route.key())?;
         }
         if let Some(title) = title {
             self.db.set_title_if_empty(url, title)?;
@@ -842,7 +1037,34 @@ impl Worker {
         Ok(())
     }
 
+    /// Fetches a feed. If how this device connects changes meanwhile
+    /// (everything was just sent through Tor, say), what's under way stops at
+    /// once, rather than go on over its old connections, and the feed is
+    /// fetched again the new way. (Nothing is stored until a fetch is done.)
     async fn fetch_feed(&self, url: &str) -> Result<()> {
+        loop {
+            let seen = self.life.network.load(Ordering::Relaxed);
+            tokio::select! {
+                result = self.fetch_feed_once(url) => return result,
+                () = self.network_change_since(seen) => {}
+            }
+        }
+    }
+
+    /// Returns once how this device connects has changed since `seen` (see
+    /// [`Remote::network_changed`]).
+    async fn network_change_since(&self, seen: u64) {
+        loop {
+            // Made before checking, so a change in between still wakes it.
+            let wake = self.life.network_changed.notified();
+            if self.life.network.load(Ordering::Relaxed) != seen {
+                return;
+            }
+            wake.await;
+        }
+    }
+
+    async fn fetch_feed_once(&self, url: &str) -> Result<()> {
         if longform::is_nostr(url) {
             // Articles from other devices' caches don't count: each device
             // reads the full history once, then only what's new.
@@ -862,8 +1084,72 @@ impl Worker {
                 }
             };
         }
+        let tor_everything = proxy::tor_everything(&self.db);
+        if nsite::is_nsite(url) {
+            let gateway = nsite::gateway(&self.db);
+            // The site's version last stored is kept in the feed's (otherwise unused) ETag.
+            let seen = self.db.fetch_info(url)?.etag;
+            // Its files directly, or through Tor if everything goes through Tor.
+            let route = if tor_everything { Route::Tor } else { Route::Direct };
+            let fetched = match (self.reader().await, self.http_for(route, url)) {
+                (Ok(reader), Ok(http)) => {
+                    nsite::fetch(&reader, &http, route, &self.db, url, &gateway, seen.as_deref()).await
+                }
+                (Err(e), _) | (_, Err(e)) => Err(e),
+            };
+            return match fetched.map_err(|e| proxy_hint(e, route)) {
+                Ok(fetched) => {
+                    // Nothing new if the site hasn't changed since last time.
+                    if let Some(feed) = fetched.feed {
+                        self.db.store_fetched(url, &feed.title, &feed.site, &feed.items)?;
+                    }
+                    self.db.set_fetch_result(url, &FetchInfo { etag: fetched.version, last_modified: None }, None)
+                }
+                Err(e) => {
+                    self.db.set_fetch_error(url, &format!("{e:#}"))?;
+                    Err(e)
+                }
+            };
+        }
+        // Through Tor or I2P, if the feed's address or its setting says so (or
+        // everything goes through Tor); never directly instead.
+        let route = match proxy::effective_route(url, &self.db.route(url)?, tor_everything) {
+            Ok(route) => route,
+            Err(e) => {
+                self.db.set_fetch_error(url, &format!("{e:#}"))?;
+                return Err(e);
+            }
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        if gemini::is_gemini(url) {
+            let changed = gemini::changed_key(url);
+            if route == Route::I2p {
+                let e = anyhow::anyhow!("Gemini feeds can't be fetched through I2P");
+                self.db.set_fetch_error(url, &format!("{e:#}"))?;
+                return Err(e);
+            }
+            return match self.gemini_client(route).fetch(url).await {
+                Ok(feed) => {
+                    self.db.store_fetched(url, &feed.title, &feed.site, &feed.items)?;
+                    self.db.delete_meta(&changed)?;
+                    self.db.set_fetch_result(url, &FetchInfo { etag: None, last_modified: None }, None)
+                }
+                Err(e) => {
+                    // Noted, so the feed report can offer to trust the capsule's new certificate.
+                    if let Some(gemini::CertChanged(capsule)) = e.chain().find_map(|cause| cause.downcast_ref()) {
+                        self.db.set_meta(&changed, capsule)?;
+                    }
+                    self.db.set_fetch_error(url, &format!("{e:#}"))?;
+                    Err(e)
+                }
+            };
+        }
         let cache = self.db.fetch_info(url)?;
-        match feeds::fetch(&self.http, url, &cache).await {
+        let fetched = match self.http_for(route, url) {
+            Ok(http) => feeds::fetch(&http, url, &cache).await,
+            Err(e) => Err(e),
+        };
+        match fetched.map_err(|e| proxy_hint(e, route)) {
             Ok(Fetched::NotModified) => self.db.set_fetch_result(url, &cache, None),
             Ok(Fetched::Feed(feed, info)) => {
                 self.db.store_fetched(url, &feed.title, &feed.site, &feed.items)?;
@@ -879,7 +1165,7 @@ impl Worker {
     /// A Nostr feed: one person's long-form posts, or everyone the user follows.
     /// `fetched_before`: this device read the feed in full already, so only newer posts are asked for.
     async fn fetch_longform(&self, url: &str, fetched_before: bool) -> Result<feeds::Feed> {
-        let reader = self.reader().await;
+        let reader = self.reader().await?;
         let newest = if fetched_before { self.db.newest_published(url)? } else { None };
         if url == longform::FOLLOWS_URL {
             let user =
@@ -892,9 +1178,18 @@ impl Worker {
     }
 
     /// The reader of public Nostr posts, made when first needed.
-    async fn reader(&self) -> Arc<longform::Reader> {
+    /// Fails if everything goes through Tor and Tor's proxy can't be found:
+    /// relays are then not asked at all, rather than directly.
+    async fn reader(&self) -> Result<Arc<longform::Reader>> {
         let mut reader = self.reader.lock().await;
-        reader.get_or_insert_with(|| Arc::new(longform::Reader::new(relays(&self.db)))).clone()
+        let via = proxy::relay_proxy(&self.db)?;
+        if let Some((reader, made_via)) = reader.as_ref()
+            && *made_via == via
+        {
+            return Ok(reader.clone());
+        }
+        let made = Arc::new(longform::Reader::new(relays(&self.db), via));
+        Ok(reader.insert((made, via)).0.clone())
     }
 
     /// At a fresh sign-in: turns on the follows feed if the account follows
@@ -905,7 +1200,8 @@ impl Worker {
         let downloaded = self.sync(Options { publish: false, throttle_feed_caches: false }).await.saved;
         let untouched = self.db.feed_known(longform::FOLLOWS_URL).is_ok_and(|known| !known);
         let Some(user) = self.nostr.as_ref().map(|n| n.pubkey()) else { return };
-        if !downloaded || !untouched || !self.reader().await.follows_anyone(user).await {
+        let Ok(reader) = self.reader().await else { return };
+        if !downloaded || !untouched || !reader.follows_anyone(user).await {
             return;
         }
         if self.db.set_subscribed(longform::FOLLOWS_URL, true).is_ok() {
@@ -1012,12 +1308,33 @@ impl Worker {
                 *shown.borrow_mut() = text;
             }
         };
-        let status = match sync::sync_reporting(&self.db, nostr, options, &progress).await {
+        // How this device connects changed since the relays were connected
+        // (the command to connect again waits behind this): not over these.
+        let seen = self.network_seen.get();
+        let changed = || self.life.network.load(Ordering::Relaxed) != seen;
+        if changed() {
+            self.status("Connecting to relays the new way…");
+            return outcome;
+        }
+        let synced = tokio::select! {
+            result = sync::sync_reporting(&self.db, nostr, options, &progress) => Some(result),
+            () = self.network_change_since(seen) => None,
+        };
+        let Some(synced) = synced else {
+            // Everything synced is merged field by field: what was cut short
+            // is done again by the next sync.
+            self.status("Sync stopped: connecting to relays the new way…");
+            return outcome;
+        };
+        let status = match synced {
             Ok(report) => {
                 outcome = SyncOutcome { saved: report.relays_ok > 0 && report.problems.is_empty() };
                 let time = chrono::Local::now().format("%H:%M");
                 let mut status = format!("Synced at {time} · {}/{} relays", report.relays_ok, report.relays_total);
-                if report.relays_ok == 0 {
+                if report.relays_total == 0 && proxy::relay_proxy(&self.db).is_ok_and(|via| via.is_some()) {
+                    status = "Sync failed: none of your relays can be used through Tor (unencrypted ws:// ones aren't)"
+                        .into();
+                } else if report.relays_ok == 0 {
                     status = "Sync failed: no relay reachable".into();
                 }
                 if !report.problems.is_empty() {
@@ -1202,7 +1519,7 @@ mod tests {
             let ctx = eframe::egui::Context::default();
             let mut worker = Worker::new(self.db(), msg_tx, ctx, closing, platform.clone());
             let signer = Signer::Keys(self.keys.clone());
-            worker.nostr = Some(NostrTransport::new(signer, relays(&worker.db)).await.unwrap());
+            worker.nostr = Some(NostrTransport::new(signer, relays(&worker.db), None).await.unwrap());
             let (tx, rx) = unbounded_channel();
             let remote = Remote { tx, life: worker.life.clone(), store: self.path.clone() };
             send(&remote);
@@ -1252,10 +1569,12 @@ mod tests {
         let app = TestApp::new().await;
         app.change();
         // The worker only gets to the command once the app is back (say, after a long sync).
-        let ran = app.run(|remote| {
-            remote.paused();
-            remote.resumed();
-        }).await;
+        let ran = app
+            .run(|remote| {
+                remote.paused();
+                remote.resumed();
+            })
+            .await;
         assert!(!ran.uploaded(), "{:?}", ran.statuses);
         assert_eq!(ran.kept_running, [false]);
     }
@@ -1330,6 +1649,25 @@ mod tests {
         let ran = app.run(start).await;
         assert!(!ran.synced());
         assert_eq!(ran.statuses.last().unwrap(), "Manual only: Sync to sync now");
+    }
+
+    #[tokio::test]
+    async fn a_relay_left_out_through_tor_doesnt_reconnect_forever() {
+        let app = TestApp::new().await;
+        // The test relay is ws://, which isn't used through Tor: none is left.
+        app.db().set_meta("tor_everything", "1").unwrap();
+        let ran = app
+            .run(|remote| {
+                remote.tx.send(Cmd::Login(Login::Saved)).unwrap();
+                remote.tx.send(Cmd::SyncNow).unwrap();
+            })
+            .await;
+        // Connected once, not again before every command.
+        assert_eq!(ran.statuses.iter().filter(|s| *s == "Connecting to relays…").count(), 1, "{:?}", ran.statuses);
+        assert_eq!(
+            ran.statuses.last().unwrap(),
+            "Sync failed: none of your relays can be used through Tor (unencrypted ws:// ones aren't)"
+        );
     }
 
     #[tokio::test]

@@ -117,8 +117,8 @@ pub fn export_opml(db: &Db) -> Result<String> {
     let mut feeds: Vec<OpmlFeed> = db
         .all_feeds()?
         .into_iter()
-        // Other feed readers can't follow Nostr feeds.
-        .filter(|feed| feed.subscribed && !crate::longform::is_nostr(&feed.url))
+        // Other feed readers can't follow Nostr feeds or nsites.
+        .filter(|feed| feed.subscribed && !crate::longform::is_nostr(&feed.url) && !crate::nsite::is_nsite(&feed.url))
         .map(|feed| OpmlFeed {
             title: if feed.title.is_empty() { feed.url.clone() } else { feed.title },
             url: feed.url,
@@ -179,6 +179,7 @@ impl Backup {
         let subscriptions = &mut self.subscriptions;
         subscriptions.feeds.values_mut().for_each(|v| cap(&mut v.1));
         subscriptions.categories.values_mut().for_each(|v| cap(&mut v.1));
+        subscriptions.routes.values_mut().for_each(|v| cap(&mut v.1));
         subscriptions.filters.values_mut().for_each(|v| cap(&mut v.1));
         subscriptions.cache.iter_mut().for_each(|v| cap(&mut v.1));
         for feed in self.feeds.values_mut() {
@@ -255,6 +256,9 @@ pub fn import_backup(db: &Db, json: &str) -> Result<BackupImport> {
     backup.subscriptions.salt = None;
     backup.subscriptions.erased_at = None;
     backup.subscriptions.relays = Default::default();
+    // A backup (maybe someone else's) can send feeds through Tor or I2P,
+    // never take them off: that's for the feed's menu.
+    backup.subscriptions.routes.retain(|_, route| !route.0.is_empty());
     db.merge_subscriptions(&backup.subscriptions)?;
     for (url, feed) in &backup.feeds {
         db.merge_feed_items(url, feed)?;
@@ -380,6 +384,21 @@ mod tests {
         json["subscriptions"]["relays"] = serde_json::to_value(db.subscriptions_doc().unwrap().relays).unwrap();
         import_backup(&other, &json.to_string()).unwrap();
         assert_eq!(crate::worker::relays(&other), ["wss://theirs.example"]);
+    }
+
+    #[test]
+    fn backups_can_send_feeds_through_tor_but_never_take_them_off() {
+        let feed = "https://a.example/feed";
+        let theirs = Db::open_memory().unwrap();
+        theirs.set_subscribed(feed, true).unwrap();
+        theirs.set_route(feed, "tor").unwrap();
+        let ours = Db::open_memory().unwrap();
+        import_backup(&ours, &export_backup(&theirs).unwrap()).unwrap();
+        assert_eq!(ours.route(feed).unwrap(), "tor");
+        // A newer backup saying "directly" changes nothing.
+        theirs.set_route(feed, "").unwrap();
+        import_backup(&ours, &export_backup(&theirs).unwrap()).unwrap();
+        assert_eq!(ours.route(feed).unwrap(), "tor");
     }
 
     #[test]

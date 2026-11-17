@@ -16,8 +16,11 @@ use nostr_sdk::prelude::{Keys, ToBech32};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::db::{self, Conn, FeedRow, ItemRow, ReportRow, Store, View, now_ms};
+use crate::gemini;
 use crate::html::{self, Block, Style};
 use crate::longform;
+use crate::nsite;
+use crate::proxy::{self, Route};
 use crate::worker::{self, Cmd, FileKind, Login, Msg};
 use crate::youtube;
 
@@ -121,6 +124,8 @@ enum Dialog {
     AddFeed {
         input: String,
         category: String,
+        /// How it is to be fetched (for web and Gemini feeds).
+        route: Route,
         busy: bool,
         error: Option<String>,
         focus: bool,
@@ -179,13 +184,22 @@ enum SettingsTab {
     Filters,
     Report,
     Socials,
+    Proxies,
     Data,
     Appearance,
 }
 
 impl SettingsTab {
-    const ALL: [SettingsTab; 7] =
-        [Self::Account, Self::Sync, Self::Filters, Self::Report, Self::Socials, Self::Data, Self::Appearance];
+    const ALL: [SettingsTab; 8] = [
+        Self::Account,
+        Self::Sync,
+        Self::Filters,
+        Self::Report,
+        Self::Socials,
+        Self::Proxies,
+        Self::Data,
+        Self::Appearance,
+    ];
 
     fn label(self) -> &'static str {
         match self {
@@ -194,6 +208,7 @@ impl SettingsTab {
             Self::Filters => "Filters",
             Self::Report => "Feed report",
             Self::Socials => "Socials",
+            Self::Proxies => "Tor & I2P",
             Self::Data => "Import & export",
             Self::Appearance => "Appearance",
         }
@@ -212,6 +227,13 @@ struct SettingsPage {
     report: Option<(u32, Vec<ReportRow>)>,
     /// On a phone: the chosen section is shown, not the list of sections.
     showing: bool,
+    /// The Tor and I2P proxy addresses and nsite gateway being edited, and
+    /// whether what was typed isn't one.
+    tor_proxy: String,
+    i2p_proxy: String,
+    nsite_gateway: String,
+    address_error: Option<&'static str>,
+    gateway_error: Option<&'static str>,
 }
 
 /// Days without new posts after which the feed report lists a feed, unless changed.
@@ -277,6 +299,8 @@ pub struct App {
     categories: Vec<String>,
     /// Categories this device doesn't sync.
     local_categories: Vec<String>,
+    /// Everything goes through Tor on this device (shown in the sidebar).
+    tor_everything: bool,
     /// People in the follows feed, with unread counts, when it's shown as a group.
     follows_people: Vec<(String, i64)>,
     items: Vec<ItemRow>,
@@ -373,6 +397,7 @@ impl App {
             follows_people: Vec::new(),
             categories: Vec::new(),
             local_categories: Vec::new(),
+            tor_everything: false,
             items: Vec::new(),
             limit: ITEMS_PAGE,
             selected: None,
@@ -411,6 +436,27 @@ impl App {
             || self.settings.as_ref().is_some_and(|page| page.show_key)
     }
 
+    /// Hands the Gemini links that were clicked this frame to the platform's
+    /// Gemini browser, taking them from what eframe would open as web pages.
+    fn open_gemini_links(&mut self, ctx: &egui::Context) {
+        let mut links = Vec::new();
+        ctx.output_mut(|output| {
+            output.commands.retain(|command| match command {
+                egui::OutputCommand::OpenUrl(open) if gemini::is_gemini(&open.url) => {
+                    links.push(open.url.clone());
+                    false
+                }
+                _ => true,
+            })
+        });
+        for link in links {
+            let opened = gemini::typed_url(&link).and_then(|url| self.platform.open_gemini_link(url.as_str()));
+            if let Err(e) = opened {
+                self.status = format!("{e:#}");
+            }
+        }
+    }
+
     /// Shown when signing in again failed: nothing syncs until it works.
     fn sign_in_problem_bar(&mut self, ui: &mut Ui) {
         let problem = self.sign_in_problem.clone().unwrap_or_default();
@@ -435,11 +481,13 @@ impl App {
         if self.dialog.take().is_some() {
             return true;
         }
-        if let Some(page) = &mut self.settings {
+        if let Some(mut page) = self.settings.take() {
             if self.narrow && page.showing {
                 page.showing = false;
+                self.settings = Some(page);
             } else {
-                self.settings = None;
+                // Leaving with an address still being typed: it's saved first.
+                self.save_addresses(&mut page);
             }
             return true;
         }
@@ -466,6 +514,7 @@ impl App {
             self.follows_people = self.db.follows_people()?;
             self.categories = self.db.categories()?;
             self.local_categories = self.db.local_categories()?;
+            self.tor_everything = proxy::tor_everything(&self.db);
             self.items = self.db.items_matching(&self.view, self.unread_only, &self.search, self.limit)?;
             // Only what can still be seen stays picked (after a search, say), so
             // the bulk buttons never act on articles out of sight.
@@ -818,8 +867,14 @@ impl App {
                     View::Category(name) => name.clone(),
                     _ => String::new(),
                 };
-                self.dialog =
-                    Some(Dialog::AddFeed { input: String::new(), category, busy: false, error: None, focus: true });
+                self.dialog = Some(Dialog::AddFeed {
+                    input: String::new(),
+                    category,
+                    route: Route::Direct,
+                    busy: false,
+                    error: None,
+                    focus: true,
+                });
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.button("⚙").on_hover_text("Settings").clicked() {
@@ -831,6 +886,11 @@ impl App {
                         filter_scope: String::new(),
                         report: None,
                         showing: false,
+                        tor_proxy: proxy::proxy_address(&self.db, Route::Tor),
+                        i2p_proxy: proxy::proxy_address(&self.db, Route::I2p),
+                        nsite_gateway: nsite::gateway(&self.db),
+                        address_error: None,
+                        gateway_error: None,
                     });
                 }
                 // Cut short when it doesn't fit (on a phone, say); tapping it shows all of it.
@@ -860,6 +920,12 @@ impl App {
             }
             ui.add_space(14.0);
             ui.label(RichText::new("FEEDS").small().weak());
+            // Feeds' own "· Tor" marks say how each is set; this applies over them.
+            if self.tor_everything {
+                let note = "Everything goes through Tor (.i2p sites through I2P)";
+                ui.label(RichText::new(note).small().weak())
+                    .on_hover_text("Settings › Tor & I2P › Send everything through Tor");
+            }
             ui.add_space(2.0);
             if self.feeds.is_empty() {
                 ui.label(RichText::new("No feeds yet. Add one with “✚ Add feed”.").weak());
@@ -953,6 +1019,11 @@ impl App {
             Some(FeedAction::SetSynced(name, synced)) if self.db.set_category_synced(&name, synced).is_ok() => {
                 self.reload();
             }
+            Some(FeedAction::SetRoute(url, route)) if self.db.set_route(&url, route.key()).is_ok() => {
+                self.reload();
+                // Fetched again the new way (on the web, by the other devices).
+                self.send(Cmd::FetchFeed(url));
+            }
             Some(FeedAction::Unsubscribe(url)) if self.db.set_subscribed(&url, false).is_ok() => {
                 if self.view == View::Feed(url) {
                     self.view = View::All;
@@ -999,7 +1070,7 @@ impl App {
             ui.add_space(24.0);
             // The web version shows other feeds only as your other devices cached them.
             let waiting = cfg!(target_arch = "wasm32")
-                && matches!(&self.view, View::Feed(url) if !longform::is_nostr(url))
+                && matches!(&self.view, View::Feed(url) if !worker::fetchable(url))
                 && !self.unread_only
                 && self.search.is_empty();
             let empty = if waiting {
@@ -1338,8 +1409,14 @@ impl App {
                         }
                         // A Nostr post's web link shows it on Ditto; it can also go to a Nostr app.
                         let nostr = longform::nostr_link(&item.link);
-                        let web = if nostr.is_some() { "Open in Ditto  ↗" } else { "Open in browser  ↗" };
-                        if html::is_web_link(&item.link) && ui.button(web).on_hover_text("O").clicked() {
+                        let open = if nostr.is_some() {
+                            "Open in Ditto  ↗"
+                        } else if gemini::is_gemini(&item.link) {
+                            "Open in Gemini browser  ↗"
+                        } else {
+                            "Open in browser  ↗"
+                        };
+                        if html::opens(&item.link) && ui.button(open).on_hover_text("O").clicked() {
                             ui.ctx().open_url(OpenUrl::new_tab(&item.link));
                         }
                         if let Some(link) = nostr.filter(|_| self.platform.opens_nostr_links())
@@ -1348,7 +1425,7 @@ impl App {
                         {
                             self.status = format!("{e:#}");
                         }
-                        if html::is_web_link(&item.link) {
+                        if html::opens(&item.link) {
                             if self.platform.shares_links() {
                                 if ui.button("Share…").clicked()
                                     && let Err(e) = self.platform.share_link(&item_title(&item.title), &item.link)
@@ -1399,7 +1476,7 @@ impl App {
             if pressed(Key::M) {
                 self.set_read(&item.key, item.unread);
             }
-            if pressed(Key::O) && html::is_web_link(&item.link) {
+            if pressed(Key::O) && html::opens(&item.link) {
                 ctx.open_url(OpenUrl::new_tab(&item.link));
             }
         }
@@ -1426,13 +1503,20 @@ impl App {
             // Scrolls when the dialog is taller than the space left, such as above
             // the on-screen keyboard, so the field being typed into can be shown.
             let max_height = ctx.content_rect().height() - 72.0;
+            // A modal only offers the space it took last frame (at first egui's
+            // default of 400 points, and the same for every dialog), and a scroll
+            // area takes no more than what's offered: without this, a dialog
+            // taller than that (most of them on a phone, where text wraps more),
+            // or than the dialog before it, scrolled however much room there was.
+            ui.set_max_height(max_height);
             ScrollArea::vertical().max_height(max_height).show(ui, |ui| {
                 match &mut dialog {
-                    Dialog::AddFeed { input, category, busy, error, focus } => {
+                    Dialog::AddFeed { input, category, route, busy, error, focus } => {
                         ui.label(RichText::new("Add a feed").size(18.0).strong());
-                        let hint = "Paste a feed address or a website that has one, like a YouTube channel. For a \
-                                    Nostr writer's long-form posts, paste their npub or NIP-05 address (like \
-                                    name@example.com).";
+                        let hint = "Paste a feed address or a website that has one, like a YouTube channel. \
+                                    Gemini feeds (gemini://…) work too. For a Nostr writer's long-form posts, \
+                                    paste their npub or NIP-05 address (like name@example.com); for their \
+                                    website on Nostr (an nsite), nsite:npub1… or its address on a gateway.";
                         ui.add(Label::new(RichText::new(hint).weak()).wrap());
                         ui.add_space(8.0);
                         let edit =
@@ -1442,6 +1526,7 @@ impl App {
                         let enter = response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
                         ui.add_space(4.0);
                         category_picker(ui, category, &self.categories, *busy);
+                        route_picker(ui, input, route, *busy);
                         if let Some(error) = error {
                             ui.colored_label(ui.visuals().error_fg_color, error.as_str());
                         }
@@ -1452,10 +1537,16 @@ impl App {
                                 *busy = true;
                                 *error = None;
                                 // A channel's page, not its feed: look it up and ask how to subscribe.
-                                if youtube::channel_url(input).is_some() {
+                                // (Not through a proxy: the lookup goes directly, the
+                                // channel page's own feed link is found through the proxy.)
+                                if youtube::channel_url(input).is_some() && *route == Route::Direct {
                                     self.send(Cmd::LookUpYoutube(input.clone()));
                                 } else {
-                                    self.send(Cmd::AddFeed { input: input.clone(), category: category.clone() });
+                                    self.send(Cmd::AddFeed {
+                                        input: input.clone(),
+                                        category: category.clone(),
+                                        route: *route,
+                                    });
                                 }
                             }
                             if ui.button("Cancel").clicked() {
@@ -1777,7 +1868,8 @@ impl App {
                                 SettingsTab::Sync => self.sync_settings(ui, &mut page.new_relay),
                                 SettingsTab::Filters => self.filter_settings(ui, &mut page),
                                 SettingsTab::Report => self.feed_report(ui, &mut page.report),
-                                SettingsTab::Socials => self.socials_settings(ui),
+                                SettingsTab::Socials => self.socials_settings(ui, &mut page),
+                                SettingsTab::Proxies => self.proxy_settings(ui, &mut page),
                                 SettingsTab::Data => self.data_settings(ui),
                                 SettingsTab::Appearance => self.appearance_settings(ui),
                             }
@@ -1792,9 +1884,64 @@ impl App {
         if escape && self.dialog.is_none() && !ui.ctx().text_edit_focused() {
             if narrow && page.showing { page.showing = false } else { open = false }
         }
+        // Addresses typed are saved once nothing is typed into a field any
+        // more, or the page closes (on a phone, Back can close it while a
+        // field still has the keyboard). Not after signing out or deleting
+        // everything, which leave the page too.
+        if self.screen == Screen::Main && (!ui.ctx().text_edit_focused() || !open) {
+            self.save_addresses(&mut page);
+        }
         // Signing out or deleting everything leaves the settings too.
         if open && self.screen == Screen::Main {
             self.settings = Some(page);
+        }
+    }
+
+    /// Saves the proxy addresses and the nsite gateway as typed, if they
+    /// changed: only when done typing, so a partly typed address is never
+    /// used, even for a moment. What isn't an address goes back to the one
+    /// used, and the page says so.
+    fn save_addresses(&mut self, page: &mut SettingsPage) {
+        let mut tor_changed = false;
+        for route in [Route::Tor, Route::I2p] {
+            let input = if route == Route::Tor { &mut page.tor_proxy } else { &mut page.i2p_proxy };
+            let used = proxy::proxy_address(&self.db, route);
+            let typed = input.trim();
+            let wanted = if typed.is_empty() {
+                Some(route.default_proxy().to_string())
+            } else {
+                proxy::parse_proxy_address(typed)
+            };
+            match wanted {
+                Some(address) if address == used => {}
+                Some(address) => {
+                    let custom = (address != route.default_proxy()).then_some(address.as_str());
+                    if proxy::set_proxy_address(&self.db, route, custom).is_ok() {
+                        tor_changed |= route == Route::Tor;
+                    }
+                }
+                None => {
+                    page.address_error = Some(
+                        "That wasn't a proxy address (a host and port, like 127.0.0.1:9050): the one before is used.",
+                    );
+                }
+            }
+            *input = proxy::proxy_address(&self.db, route);
+        }
+        match nsite::parse_gateway(&page.nsite_gateway) {
+            Some(gateway) if gateway != nsite::gateway(&self.db) => {
+                let _ = nsite::set_gateway(&self.db, &gateway);
+            }
+            Some(_) => {}
+            None => {
+                page.gateway_error =
+                    Some("That wasn't a gateway's address (like nsite.example): the one before is used.");
+            }
+        }
+        page.nsite_gateway = nsite::gateway(&self.db);
+        // Relays go through Tor's proxy too when everything does: connect again.
+        if tor_changed && proxy::tor_everything(&self.db) {
+            self.remote.network_changed();
         }
     }
 
@@ -1883,7 +2030,7 @@ impl App {
         }
     }
 
-    fn socials_settings(&mut self, ui: &mut Ui) {
+    fn socials_settings(&mut self, ui: &mut Ui, page: &mut SettingsPage) {
         let hint = "Feedstr can follow long-form posts (NIP-23) from Nostr. To follow one writer, use “Add feed” \
                     with their npub or NIP-05 address (like name@example.com); you don't need to follow them on \
                     Nostr.";
@@ -1928,6 +2075,87 @@ impl App {
                 }
             });
         }
+        ui.add_space(16.0);
+        ui.label(RichText::new("Websites on Nostr (nsites)").strong());
+        let hint = "Follow someone's nsite with “Add feed”: paste nsite:npub1… or the site's address on a \
+                    gateway. Feedstr reads the site from Nostr and its files from Blossom servers; if the site \
+                    has a feed of its own, that is used, otherwise new and changed pages show up as articles.";
+        ui.add(Label::new(RichText::new(hint).weak()).wrap());
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Open pages on");
+            // Saved once typing is done (see `save_addresses`).
+            let edit = TextEdit::singleline(&mut page.nsite_gateway).hint_text(nsite::DEFAULT_GATEWAY);
+            if ui.add(edit.desired_width(220.0)).changed() {
+                page.gateway_error = None;
+            }
+        });
+        if let Some(error) = page.gateway_error {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
+        let hint = "The gateway that shows nsites on the web, for the links of their pages (on this device, \
+                    from the next update of each site on).";
+        ui.add(Label::new(RichText::new(hint).small().weak()).wrap());
+    }
+
+    /// This device's Tor and I2P proxies, for feeds fetched through them.
+    fn proxy_settings(&mut self, ui: &mut Ui, page: &mut SettingsPage) {
+        let hint = |ui: &mut Ui, text: &str| ui.add(Label::new(RichText::new(text).small().weak()).wrap());
+        let intro = "A feed can be fetched through Tor or I2P instead of directly: choose it when adding the \
+                     feed, or from the feed's menu in the sidebar. Addresses ending in .onion always go through \
+                     Tor, and those ending in .i2p through I2P. Such a feed is never fetched directly: if the \
+                     proxy can't be reached, fetching it fails.";
+        ui.add(Label::new(RichText::new(intro).weak()).wrap());
+        ui.add_space(8.0);
+        if cfg!(target_arch = "wasm32") {
+            hint(
+                ui,
+                "The browser can't use these proxies: here, feeds fetched through Tor or I2P show what your \
+                 other devices fetched.",
+            );
+            return;
+        }
+        hint(ui, "These are this device's own proxies; each of your devices has its own.");
+        ui.add_space(12.0);
+        let mut everything = proxy::tor_everything(&self.db);
+        if ui.checkbox(&mut everything, "Send everything through Tor").changed()
+            && proxy::set_tor_everything(&self.db, everything).is_ok()
+        {
+            // A sync under way stops, and relays and remote signers connect
+            // again, the new way.
+            self.remote.network_changed();
+            self.reload();
+        }
+        hint(
+            ui,
+            "Every connection Feedstr makes on this device then goes through Tor: feeds (whatever each one is \
+             set to), nsites, looking up addresses, and Nostr relays, for syncing and for remote signers. Only \
+             .i2p sites go through I2P instead. If Tor isn't running, nothing is fetched or synced. Opening an \
+             article in your browser isn't covered: that's up to the browser.",
+        );
+        ui.add_space(12.0);
+        let fields = [
+            (
+                Route::Tor,
+                "Tor (SOCKS5 proxy)",
+                "The tor service and Orbot (Android) listen on 127.0.0.1:9050, Tor Browser on 127.0.0.1:9150.",
+            ),
+            (Route::I2p, "I2P (HTTP proxy)", "I2P and i2pd routers listen on 127.0.0.1:4444."),
+        ];
+        for (route, title, text) in fields {
+            ui.label(RichText::new(title).strong());
+            let input = if route == Route::Tor { &mut page.tor_proxy } else { &mut page.i2p_proxy };
+            let response = ui.add(TextEdit::singleline(input).hint_text(route.default_proxy()).desired_width(260.0));
+            // Saved once typing is done (see `save_addresses`).
+            if response.changed() {
+                page.address_error = None;
+            }
+            hint(ui, text);
+            ui.add_space(12.0);
+        }
+        if let Some(error) = page.address_error {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
     }
 
     fn feed_report(&mut self, ui: &mut Ui, report: &mut Option<(u32, Vec<ReportRow>)>) {
@@ -1956,7 +2184,7 @@ impl App {
         if rows.is_empty() {
             ui.label(RichText::new("All your feeds look fine.").weak());
         }
-        let mut unsubscribe = None;
+        let (mut unsubscribe, mut trust) = (None, None);
         for row in rows {
             Frame::new().fill(ui.visuals().faint_bg_color).corner_radius(8).inner_margin(12).show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -1974,12 +2202,28 @@ impl App {
                     if ui.button("Copy address").clicked() {
                         ui.ctx().copy_text(row.url.clone());
                     }
+                    // A Gemini capsule that changed its certificate: see `gemini::changed_key`.
+                    if let Some(capsule) = &row.cert_changed {
+                        let hint = format!(
+                            "{capsule} isn't using the certificate Feedstr first saw there. Capsules renew theirs \
+                             now and then, but it can also mean someone else is answering in its place."
+                        );
+                        if ui.button("Trust the new certificate").on_hover_text(hint).clicked() {
+                            trust = Some(row.url.clone());
+                        }
+                    }
                     if ui.button("Unsubscribe").clicked() {
                         unsubscribe = Some(row.url.clone());
                     }
                 });
             });
             ui.add_space(6.0);
+        }
+        if let Some(url) = trust {
+            // The report is made again once the feed has been fetched.
+            *report = None;
+            self.status = "Fetching…".into();
+            self.send(Cmd::TrustCapsule(url));
         }
         if let Some(url) = unsubscribe
             && self.db.set_subscribed(&url, false).is_ok()
@@ -2283,6 +2527,8 @@ enum FeedAction {
     RemoveCategory(String),
     /// Syncs a category, or keeps it on this device only.
     SetSynced(String, bool),
+    /// Sets how a feed is fetched (directly, through Tor or I2P).
+    SetRoute(String, Route),
     Unsubscribe(String),
 }
 
@@ -2343,6 +2589,11 @@ fn feed_row(
     action: &mut Option<FeedAction>,
 ) {
     let mut title = if feed.error.is_some() { format!("⚠ {}", feed.title) } else { feed.title.clone() };
+    // Fetched through Tor or I2P (by its setting or its address).
+    let route = proxy::route_for(&feed.url, &feed.route).ok();
+    if let Some(route) = route.filter(|r| *r != Route::Direct) {
+        title += &format!("  · {}", route.badge());
+    }
     if marked {
         title += "  · Local Only";
     }
@@ -2378,6 +2629,17 @@ fn feed_row(
                 *action = Some(FeedAction::NewCategory(feed.url.clone()));
             }
         });
+        // Web and Gemini feeds whose address doesn't decide it can go through a proxy.
+        let web = feed.url.starts_with("http://") || feed.url.starts_with("https://");
+        if (web || gemini::is_gemini(&feed.url)) && Route::required_by(&feed.url).is_none() {
+            ui.menu_button("Fetch it", |ui| {
+                for choice in Route::ALL.into_iter().filter(|r| web || *r != Route::I2p) {
+                    if ui.add(Button::selectable(route == Some(choice), choice.label())).clicked() {
+                        *action = Some(FeedAction::SetRoute(feed.url.clone(), choice));
+                    }
+                }
+            });
+        }
         if ui.button("Copy feed address").clicked() {
             ui.ctx().copy_text(feed.url.clone());
         }
@@ -2445,6 +2707,7 @@ impl eframe::App for App {
             }
         }
         self.dialogs(&ctx);
+        self.open_gemini_links(&ctx);
         self.handle_exit(&ctx);
         self.keep_keyboard(&ctx);
     }
@@ -2539,6 +2802,48 @@ fn category_picker(ui: &mut Ui, category: &mut String, categories: &[String], bu
                 }
             }
         });
+    }
+}
+
+/// How a web or Gemini feed being added is fetched: directly, or through Tor
+/// or I2P. Not offered for Nostr addresses (relays aren't reached through
+/// proxies), and only shown where the address decides it (`.onion`, `.i2p`).
+fn route_picker(ui: &mut Ui, input: &str, route: &mut Route, busy: bool) {
+    let input = input.trim();
+    // (A gateway's address may turn out not to be an nsite, so it gets the choice.)
+    let nostr = nsite::is_nsite(input) || longform::parse_author(input).is_some() || longform::is_nip05(input);
+    if input.is_empty() || nostr {
+        return;
+    }
+    let address = if input.contains("://") { input.to_string() } else { format!("http://{input}") };
+    if let Some(required) = Route::required_by(&address) {
+        let text = format!("Fetched through {}, as its address requires", required.badge());
+        ui.label(RichText::new(text).weak());
+        return;
+    }
+    let is_gemini = gemini::is_gemini(input);
+    if is_gemini && *route == Route::I2p {
+        *route = Route::Direct;
+    }
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Fetch it");
+        for choice in Route::ALL {
+            // Gemini only goes through Tor's SOCKS proxy, not I2P's HTTP proxy.
+            if is_gemini && choice == Route::I2p {
+                continue;
+            }
+            if ui.add_enabled(!busy, Button::selectable(*route == choice, choice.label()).small()).clicked() {
+                *route = choice;
+            }
+        }
+    });
+    if *route != Route::Direct {
+        let hint = if cfg!(target_arch = "wasm32") {
+            "The browser can't use a proxy: your other devices fetch this feed through theirs."
+        } else {
+            "Uses the proxy set in Settings › Tor & I2P, on each of your devices."
+        };
+        ui.add(Label::new(RichText::new(hint).small().weak()).wrap());
     }
 }
 
@@ -3048,7 +3353,7 @@ mod tests {
     #[test]
     fn keyboard_stays_open_while_the_field_being_edited_is_covered() {
         let ctx = egui::Context::default();
-        let id = Id::new("days");
+        let id = Id::unique("days");
         let mut text = String::from("30");
         let mut last = None;
         // A frame `height` points tall (smaller: the on-screen keyboard is open),

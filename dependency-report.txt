@@ -1,0 +1,458 @@
+Feedstr dependency report
+=========================
+
+Date: 2026-10-27
+Covers: the desktop app (feedstr), Android (feedstr-droid), web (feedstr-web)
+and the shared code they all use (feedstr-core), as locked in Cargo.lock.
+
+
+Update, 2026-11-14
+------------------
+
+cargo audit was run again during a security audit of the code. Advisories
+published after this report flagged two crates, and one version had been
+withdrawn (yanked) by its author. All three were updated; cargo audit now
+reports no vulnerabilities again. The rest of this report is as of
+2026-10-27 and still names the old versions.
+
+- rusqlite 0.40.2 -> 0.42.0 (libsqlite3-sys 0.38.2 -> 0.40.0), for
+  RUSTSEC-2026-0459: the bundled SQLite could return stale memory when
+  opening a crafted database with a mismatched -wal file. Feedstr only opens
+  its own database, so this wasn't reachable in practice. The new version
+  serializes a database only through a connection nothing else uses, so the
+  web version's snapshot now copies the database first (the `backup`
+  feature).
+- pulldown-cmark 0.13.5 -> 0.13.6, for RUSTSEC-2026-0433: slow parsing with
+  the wikilinks option, which Feedstr doesn't turn on (not affected).
+- nostr-sdk 0.45.4 -> 0.45.6: 0.45.4 was yanked from crates.io.
+
+Added as direct dependencies on 2026-11-16, for Gemini feeds (both were
+already in the tree, through reqwest and nostr-sdk, so nothing new is
+compiled): tokio-rustls 0.26.6 (TLS over a plain connection) and
+webpki-roots 1.0.11 (Mozilla's root certificates, until now only used
+directly on Android).
+
+Still reported, as warnings only: ttf-parser, zbus_names, zvariant and
+zvariant_derive are unmaintained, rustix 1.1.5 has an unsound xattr function
+(not used here), and async-executor 1.14.0 is yanked. All are deep inside
+eframe/winit and the desktop file dialogs.
+
+
+Summary
+-------
+
+- No known security vulnerabilities in any of the 598 crates in Cargo.lock
+  (cargo audit, 1,380 RustSec advisories). No yanked versions.
+- Every crate comes from crates.io; Cargo.lock pins each one by checksum.
+  There are no git or other sources.
+- Four crates deep inside eframe/winit are marked unmaintained (no
+  vulnerability). See "Transitive dependencies" below.
+- The main trust consideration: one person (yukibtc, the rust-nostr author)
+  is the only crates.io publisher of the 14 crates in the Nostr stack, which
+  handles keys and encryption. The project is established and active, but a
+  compromise of that one account would be the most damaging supply-chain
+  risk. Review the changes when updating these crates.
+- The Gradle wrapper matches Gradle's official checksum, and the Gradle
+  download it fetches is now pinned to its official checksum too.
+
+Crates compiled per platform (normal dependencies, not build tools):
+  Desktop (x86_64 Linux): 410    Android (arm64): 295    Web (wasm32): 208
+
+
+How this was checked
+--------------------
+
+- cargo audit 0.22.2 (RustSec's tool) against Cargo.lock.
+- crates.io API: publishers (owners) and download counts for every direct
+  dependency, and download counts for all 547 distinct crates in the tree.
+- GitHub and Codeberg APIs: stars, archived status, last activity.
+- Read by hand: universal-time (456 lines) and nostr-browser-signer
+  (363 lines), the two smallest and least-used direct dependencies.
+- Gradle wrapper jar compared with services.gradle.org's published checksum.
+
+All direct dependencies' repositories are active (commits within the last
+three months) and none are archived.
+
+
+Direct dependencies
+===================
+
+Stars are GitHub unless noted. Downloads are crates.io all-time downloads.
+"Publishers" are the crates.io accounts and teams that can publish new
+versions.
+
+Used on every platform (feedstr-core)
+-------------------------------------
+  anyhow 1.0.104
+    Purpose:    Error handling
+    Source:     https://github.com/dtolnay/anyhow
+    Stars:      6,685
+    Downloads:  1.1B (crates.io, all time)
+    Publishers: dtolnay
+
+  base64 0.23.1
+    Purpose:    Encoding sync documents
+    Source:     https://github.com/marshallpierce/rust-base64
+    Stars:      740
+    Downloads:  1.8B (crates.io, all time)
+    Publishers: alicemaz, marshallpierce
+
+  chrono 0.4.45
+    Purpose:    Dates in feeds and the interface
+    Source:     https://github.com/chronotope/chrono
+    Stars:      3,927
+    Downloads:  920M (crates.io, all time)
+    Publishers: lifthrasiir, github:chronotope:release-manager
+
+  eframe 0.37.0
+    Purpose:    App window and drawing
+    Source:     https://github.com/emilk/egui
+    Stars:      31,808
+    Downloads:  22.4M (crates.io, all time)
+    Publishers: emilk, rerunio
+
+  egui 0.37.0
+    Purpose:    User interface
+    Source:     https://github.com/emilk/egui
+    Stars:      31,808
+    Downloads:  28.6M (crates.io, all time)
+    Publishers: emilk, rerunio
+
+  feed-rs 3.0.0
+    Purpose:    Parsing RSS/Atom/JSON feeds (untrusted input)
+    Source:     https://github.com/feed-rs/feed-rs
+    Stars:      214
+    Downloads:  2.6M (crates.io, all time)
+    Publishers: markpritchard
+
+  flate2 1.1.10
+    Purpose:    Compressing sync documents and web snapshots
+    Source:     https://github.com/rust-lang/flate2-rs
+    Stars:      1,127
+    Downloads:  790.3M (crates.io, all time)
+    Publishers: Byron, joshtriplett, rust-lang-owner
+
+  futures 0.3.34
+    Purpose:    Async helpers
+    Source:     https://github.com/rust-lang/futures-rs
+    Stars:      5,936
+    Downloads:  888.8M (crates.io, all time)
+    Publishers: cramertj, taiki-e, rust-lang-owner
+
+  log 0.4.34
+    Purpose:    Logging
+    Source:     https://github.com/rust-lang/log
+    Stars:      2,558
+    Downloads:  1.4B (crates.io, all time)
+    Publishers: huonw, sfackler, KodrAus, rust-lang-owner, github:rust-lang-nursery:log-owners
+
+  nostr-sdk 0.45.4
+    Purpose:    Nostr relays, keys, signing, NIP-44 encryption
+    Source:     https://github.com/nostrdevkit/nostr
+    Stars:      677
+    Downloads:  1.8M (crates.io, all time)
+    Publishers: yukibtc
+
+  nostr-connect 0.45.2
+    Purpose:    Remote signers (NIP-46 bunker)
+    Source:     https://github.com/nostrdevkit/nostr
+    Stars:      677
+    Downloads:  49.7K (crates.io, all time)
+    Publishers: yukibtc
+
+  quick-xml 0.42
+    Purpose:    OPML import/export (untrusted input)
+    Source:     https://github.com/tafia/quick-xml
+    Stars:      1,577
+    Downloads:  501.1M (crates.io, all time)
+    Publishers: tafia, Mingun, dralley
+
+  reqwest 0.13.5
+    Purpose:    Fetching feeds over HTTPS
+    Source:     https://github.com/seanmonstar/reqwest
+    Stars:      11,891
+    Downloads:  844.4M (crates.io, all time)
+    Publishers: seanmonstar
+
+  pulldown-cmark 0.13.5
+    Purpose:    Markdown in Nostr long-form posts (untrusted input); added 2026-10-27
+    Source:     https://github.com/pulldown-cmark/pulldown-cmark
+    Stars:      2,751
+    Downloads:  187.9M (crates.io, all time)
+    Publishers: raphlinus, marcusklaas, Martin1887
+    Also brings in pulldown-cmark-escape 0.11.0 (same project) and
+    unicase 2.10.0 (seanmonstar, 455M downloads).
+
+  rusqlite 0.40.2
+    Purpose:    SQLite database (bundled SQLite)
+    Source:     https://github.com/rusqlite/rusqlite
+    Stars:      4,453
+    Downloads:  137M (crates.io, all time)
+    Publishers: thomcc, gwenn
+
+  serde 1.0.229
+    Purpose:    Serialization
+    Source:     https://github.com/serde-rs/serde
+    Stars:      10,918
+    Downloads:  1.6B (crates.io, all time)
+    Publishers: dtolnay, github:serde-rs:publish
+
+  serde_json 1.0.154
+    Purpose:    JSON (sync documents, backups)
+    Source:     https://github.com/serde-rs/json
+    Stars:      5,657
+    Downloads:  1.5B (crates.io, all time)
+    Publishers: dtolnay, github:serde-rs:publish
+
+  sha2 0.11.1
+    Purpose:    Hashing (document names)
+    Source:     https://github.com/RustCrypto/hashes
+    Stars:      2,281
+    Downloads:  1.1B (crates.io, all time)
+    Publishers: tarcieri, newpavlov, github:rustcrypto:hashes
+
+  tokio 1.54.1
+    Purpose:    Async runtime
+    Source:     https://github.com/tokio-rs/tokio
+    Stars:      33,531
+    Downloads:  1.1B (crates.io, all time)
+    Publishers: carllerche, Darksonn, github:tokio-rs:core
+
+Desktop and Android only (feedstr-core)
+---------------------------------------
+  rustls 0.23.46
+    Purpose:    TLS for HTTPS and relays (ring backend)
+    Source:     https://github.com/rustls/rustls
+    Stars:      7,717
+    Downloads:  1B (crates.io, all time)
+    Publishers: ctz, djc, github:rustls:publishers
+
+Desktop and web only (feedstr-core, not on Android)
+---------------------------------------------------
+  qrcodegen 1.8.0
+    Purpose:    The QR code for signing in with a remote signer; added 2026-10-28
+    Source:     https://github.com/nayuki/QR-Code-generator
+    Stars:      6,804
+    Downloads:  11M (crates.io, all time)
+    Publishers: nayuki
+    No dependencies of its own.
+
+Desktop only (feedstr)
+----------------------
+  dirs 7.0.0
+    Purpose:    Finding the data folder
+    Source:     https://codeberg.org/dirs/dirs-rs
+    Stars:      49 (Codeberg)
+    Downloads:  381.8M (crates.io, all time)
+    Publishers: soc
+
+  rfd 0.17.2
+    Purpose:    File dialogs (through the desktop portal)
+    Source:     https://github.com/PolyMeilex/rfd
+    Stars:      845
+    Downloads:  39.4M (crates.io, all time)
+    Publishers: PolyMeilex
+
+Android only (feedstr-droid, plus feedstr-core on Android)
+----------------------------------------------------------
+  webpki-roots 1.0.11
+    Purpose:    Mozilla's root certificates
+    Source:     https://github.com/rustls/webpki-roots
+    Stars:      158
+    Downloads:  863.4M (crates.io, all time)
+    Publishers: ctz, djc, github:rustls:publishers
+
+  jni 0.22.4
+    Purpose:    Calling the Java side of the app
+    Source:     https://github.com/jni-rs/jni-rs
+    Stars:      1,610
+    Downloads:  224.7M (crates.io, all time)
+    Publishers: jrobsonchase, stanislav-tkach, dmitry-timofeev, rib
+
+  android_logger 0.15.1
+    Purpose:    Logging to logcat
+    Source:     https://github.com/rust-mobile/android_logger-rs
+    Stars:      144
+    Downloads:  28.2M (crates.io, all time)
+    Publishers: Nercury, paulrouget, Dushistov, tyranron, MarijnS95
+
+  winit 0.30.13
+    Purpose:    Android activity and window
+    Source:     https://github.com/rust-windowing/winit
+    Stars:      6,233
+    Downloads:  61.6M (crates.io, all time)
+    Publishers: tomaka, daxpedda, madsmtm, kchibisov, github:rust-windowing:winit-publishers
+
+Web only (feedstr-web, plus feedstr-core in the browser)
+--------------------------------------------------------
+  nostr-browser-signer 0.45.1
+    Purpose:    Browser extension signers (NIP-07)
+    Source:     https://github.com/nostrdevkit/nostr
+    Stars:      677
+    Downloads:  1.9K (crates.io, all time)
+    Publishers: yukibtc
+
+  getrandom 0.4.3 and 0.2.17
+    Purpose:    Not called directly; switches on browser randomness for dependencies
+    Source:     https://github.com/rust-random/getrandom
+    Stars:      591
+    Downloads:  2.4B (crates.io, all time)
+    Publishers: dhardy, github:rust-random:maintainers
+
+  uuid 1.29.0
+    Purpose:    Not called directly; switches on browser support for a dependency's IDs
+    Source:     https://github.com/uuid-rs/uuid
+    Stars:      1,249
+    Downloads:  924.2M (crates.io, all time)
+    Publishers: KodrAus, rust-lang-owner
+
+  wasm-bindgen 0.2.129
+    Purpose:    Talking to the browser
+    Source:     https://github.com/wasm-bindgen/wasm-bindgen
+    Stars:      9,208
+    Downloads:  613.6M (crates.io, all time)
+    Publishers: RReverser, daxpedda, guybedford, github:wasm-bindgen:wasm-bindgen-publish
+
+  wasm-bindgen-futures 0.4.79
+    Purpose:    Browser promises as Rust futures
+    Source:     https://github.com/wasm-bindgen/wasm-bindgen
+    Stars:      9,208
+    Downloads:  380M (crates.io, all time)
+    Publishers: daxpedda, guybedford, github:wasm-bindgen:wasm-bindgen-publish
+
+  js-sys 0.3.106
+    Purpose:    JavaScript built-ins (clock, arrays)
+    Source:     https://github.com/wasm-bindgen/wasm-bindgen
+    Stars:      9,208
+    Downloads:  571M (crates.io, all time)
+    Publishers: RReverser, daxpedda, guybedford, github:wasm-bindgen:wasm-bindgen-publish
+
+  web-sys 0.3.106
+    Purpose:    Browser APIs (IndexedDB, tabs, files)
+    Source:     https://github.com/wasm-bindgen/wasm-bindgen
+    Stars:      9,208
+    Downloads:  440.2M (crates.io, all time)
+    Publishers: RReverser, daxpedda, guybedford, github:wasm-bindgen:wasm-bindgen-publish
+
+  universal-time 0.3.1
+    Purpose:    Supplying the clock to nostr in the browser
+    Source:     https://github.com/yukibtc/universal-time
+    Stars:      1
+    Downloads:  421.2K (crates.io, all time)
+    Publishers: yukibtc
+
+Notes on direct dependencies
+----------------------------
+
+- universal-time has 1 star, but it comes from the same author as nostr-sdk,
+  which already depends on it. Its source is 456 lines and does only what
+  its name says; its one `unsafe` block is the standard pattern for a global
+  hook that the app supplies.
+- nostr-browser-signer has under 2,000 downloads. It lives in the same
+  repository as nostr-sdk, is 363 lines, and only talks to the browser's
+  Nostr extension (window.nostr).
+- feed-rs (feeds) and quick-xml (OPML files) parse untrusted input.
+  feed-rs has a single publisher and a smaller following than most of the
+  list; neither has any advisories.
+- The nostr crates' repository moved from github.com/rust-nostr/nostr to
+  github.com/nostrdevkit/nostr (the old address redirects). Same project,
+  same publisher.
+- egui (shared) and eframe are listed separately but are one project.
+  eframe's platform features differ: wgpu drawing on desktop, OpenGL ES
+  (glow) on Android and WebGL (glow) in the browser.
+
+
+Transitive dependencies
+=======================
+
+Unmaintained (RustSec "informational" notices, not vulnerabilities)
+--------------------------------------------------------------------
+
+All four reach Feedstr only through eframe/winit, and only on Linux.
+Nothing to do on Feedstr's side; they go away when egui/winit update.
+
+  ttf-parser 0.25.1        RUSTSEC-2026-0192
+    Via winit -> sctk-adwaita -> ab_glyph (window title bar drawing). It
+    only parses the app's own and the system's fonts; nothing a feed sends
+    reaches it. Suggested replacement upstream: skrifa.
+  zvariant 5.15.1          RUSTSEC-2026-0370
+  zvariant_derive 5.15.1   RUSTSEC-2026-0372
+  zbus_names 4.3.5         RUSTSEC-2026-0371
+    Via eframe -> accesskit (screen reader bridge). Merged into zbus 6.
+
+Little-used crates (under 2 million downloads)
+----------------------------------------------
+
+Of 547 distinct crates, 15 have under 2 million downloads. All come from
+the Nostr stack or from well-known projects:
+
+  Crate                       Downloads  Publisher   Repository
+  nostr-browser-signer        1.9K       yukibtc     github.com/nostrdevkit/nostr
+  nostr-connect               49.7K      yukibtc     github.com/nostrdevkit/nostr
+  nostr-memory                55.1K      yukibtc     github.com/nostrdevkit/nostr
+  egui_system_font_provider   65.4K      rerunio     github.com/emilk/egui
+  btreecap                    82.6K      yukibtc     github.com/shadowylab/btreecap
+  tokio-happy-eyeballs        387K       yukibtc     github.com/shadowylab/tokio-happy-eyeballs
+  opaquerr                    414K       yukibtc     github.com/shadowylab/opaquerr
+  universal-time              421K       yukibtc     github.com/yukibtc/universal-time
+  accesskit_ios               596K       DataTriny   github.com/AccessKit/accesskit
+  nostr-gossip                1.26M      yukibtc     github.com/nostrdevkit/nostr
+  async-utility               1.71M      yukibtc     github.com/yukibtc/async-utility
+  nostr-database              1.74M      yukibtc     github.com/nostrdevkit/nostr
+  nostr-sdk                   1.80M      yukibtc     github.com/nostrdevkit/nostr
+  async-wsocket               1.85M      yukibtc     github.com/yukibtc/async-wsocket
+  negentropy                  1.99M      yukibtc     github.com/yukibtc/rust-negentropy
+
+accesskit_ios is only in Cargo.lock for iOS and is not compiled for any
+Feedstr platform. egui_system_font_provider loads Android's system fonts.
+
+Nostr stack publisher concentration
+-----------------------------------
+
+yukibtc is the sole crates.io publisher of: nostr, nostr-sdk, nostr-connect,
+nostr-database, nostr-gossip, nostr-memory, nostr-browser-signer, negentropy,
+async-wsocket, async-utility, btreecap, opaquerr, tokio-happy-eyeballs and
+universal-time. These handle the Sync Key, signing and encryption.
+Cargo.lock prevents surprise updates; when updating them, skim the changes.
+
+
+Build tools and non-Rust parts
+==============================
+
+None of these end up inside the apps except where noted.
+
+Android
+  Android Gradle Plugin 9.4.1   Google's Maven repository (google())
+  Gradle 9.8.2                  https://services.gradle.org (wrapper jar and
+                                download both verified against official
+                                SHA-256 checksums; the download is pinned in
+                                droid/gradle/wrapper/gradle-wrapper.properties)
+  cargo-ndk 4.1.2               crates.io, https://github.com/bbqsrc/cargo-ndk
+  Android SDK/NDK               Google (sdkmanager), NDK r28c
+  Java libraries in the APK     none (AndroidX is off; nothing from Maven
+                                is packaged into the app)
+
+Web
+  trunk 0.22.0                  crates.io, https://github.com/trunk-rs/trunk
+  wasm-bindgen CLI 0.2.129      downloaded by trunk from wasm-bindgen's
+                                official GitHub releases
+  wasm-opt (binaryen) 120       Debian package
+  clang, llvm                   Debian packages (compile SQLite and ring's
+                                C code for WebAssembly)
+
+Desktop (Flatpak)
+  org.freedesktop.Platform/Sdk 26.08 and the rust-stable SDK extension, from
+  Flathub (https://flathub.org). The Platform runtime ships with the app.
+  flatpak-builder 1.4.4 and flatpak 1.16.6 are Debian packages.
+
+Only used for development in the VM, not part of any build
+  cargo-audit 0.22.2   https://github.com/rustsec/rustsec
+  vtracer 0.6.5        https://github.com/visioncortex/vtracer (tracing the logo)
+
+
+Re-running the checks
+=====================
+
+  cargo install cargo-audit --locked
+  cargo audit                        # vulnerabilities, unmaintained, yanked
+  cargo tree -i <crate> --target all # what pulls a crate in

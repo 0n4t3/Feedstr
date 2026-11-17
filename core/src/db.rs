@@ -121,7 +121,16 @@ const MIGRATIONS: &[&str] = &[
     "INSERT OR IGNORE INTO state_shadow (key, read, read_t, fav, fav_t)
      SELECT s.key, s.read, s.read_t, s.fav, s.fav_t FROM state s JOIN items i ON i.key = s.key
      WHERE i.feed_url IN (SELECT url FROM sync_shadow);",
+    // How each feed is fetched: directly (''), or through Tor or I2P (see
+    // `proxy::Route`), synced like categories.
+    "ALTER TABLE feeds ADD COLUMN route TEXT NOT NULL DEFAULT '';
+     ALTER TABLE feeds ADD COLUMN route_t INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE sync_shadow ADD COLUMN route TEXT NOT NULL DEFAULT '';
+     ALTER TABLE sync_shadow ADD COLUMN route_t INTEGER NOT NULL DEFAULT 0;",
 ];
+
+/// Longer route values from other devices are ignored (they're short names).
+const MAX_ROUTE_BYTES: usize = 32;
 
 /// SQL: keys of the items of feeds kept on this device (Local Only).
 const LOCAL_KEYS: &str = "(SELECT key FROM items WHERE feed_url IN (SELECT url FROM sync_shadow))";
@@ -229,6 +238,8 @@ pub struct FeedRow {
     pub error: Option<String>,
     /// Kept on this device only (in a Local Only group).
     pub local: bool,
+    /// How it is fetched, as stored ("" directly; see `proxy::Route`).
+    pub route: String,
 }
 
 /// A word filter, as shown in settings.
@@ -245,6 +256,9 @@ pub struct ReportRow {
     pub error: Option<String>,
     /// When its newest item was published (seconds), if it has any.
     pub latest: Option<i64>,
+    /// For a Gemini feed, the capsule whose certificate changed (see
+    /// [`crate::gemini::changed_key`]).
+    pub cert_changed: Option<String>,
 }
 
 /// A feed as stored, for exports.
@@ -466,6 +480,27 @@ impl Db {
         self.refresh_hidden(Some(url))
     }
 
+    /// Sets how a feed is fetched ("" directly, "tor" or "i2p"; see
+    /// `proxy::Route`). Synced, unless the feed is kept on this device only.
+    pub fn set_route(&self, url: &str, route: &str) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE feeds SET route = ?2, route_t = max(?3, route_t + 1) WHERE url = ?1",
+            params![url, route, self.clock()?],
+        )?;
+        bump(&tx, SUBSCRIPTIONS_REV)?;
+        Ok(tx.commit()?)
+    }
+
+    /// How a feed is fetched, as stored ("" directly; see `proxy::Route`).
+    pub fn route(&self, url: &str) -> Result<String> {
+        Ok(self
+            .conn
+            .query_row("SELECT route FROM feeds WHERE url = ?1", [url], |r| r.get(0))
+            .optional()?
+            .unwrap_or_default())
+    }
+
     // ---- Categories kept on this device ----
 
     pub fn local_categories(&self) -> Result<Vec<String>> {
@@ -508,8 +543,9 @@ impl Db {
     /// on (so other devices drop it), while this device keeps its own view.
     fn keep_local(&self, url: &str) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO sync_shadow (url, subscribed, sub_t, category, category_t)
-             SELECT url, 0, max(?2, sub_t + 1), '', max(?2, category_t + 1) FROM feeds WHERE url = ?1
+            // The route already shared (if any) is passed on as it is.
+            "INSERT INTO sync_shadow (url, subscribed, sub_t, category, category_t, route, route_t)
+             SELECT url, 0, max(?2, sub_t + 1), '', max(?2, category_t + 1), route, route_t FROM feeds WHERE url = ?1
              ON CONFLICT (url) DO NOTHING",
             params![url, self.clock()?],
         )?;
@@ -530,7 +566,10 @@ impl Db {
         self.conn.execute(
             "UPDATE feeds SET
                 sub_t = max(?2, sub_t + 1, coalesce((SELECT sub_t FROM sync_shadow WHERE url = ?1), 0) + 1),
-                category_t = max(?2, category_t + 1, coalesce((SELECT category_t FROM sync_shadow WHERE url = ?1), 0) + 1)
+                category_t = max(?2, category_t + 1, coalesce((SELECT category_t FROM sync_shadow WHERE url = ?1), 0) + 1),
+                route_t = CASE WHEN route = '' AND route_t = 0
+                    AND coalesce((SELECT route_t FROM sync_shadow WHERE url = ?1), 0) = 0 THEN 0
+                    ELSE max(?2, route_t + 1, coalesce((SELECT route_t FROM sync_shadow WHERE url = ?1), 0) + 1) END
              WHERE url = ?1",
             params![url, self.clock()?],
         )?;
@@ -711,13 +750,13 @@ impl Db {
     pub fn feed_report(&self, days: u32) -> Result<Vec<ReportRow>> {
         let cutoff = now_ms() / 1000 - days as i64 * DAY_SECS;
         let mut stmt = self.conn.prepare(
-            "SELECT url, title, error, latest FROM (
+            "SELECT url, title, error, latest, (SELECT value FROM meta WHERE key = ?2 || url) FROM (
                 SELECT f.url, f.title, f.error, (SELECT max(published) FROM items WHERE feed_url = f.url) AS latest
                 FROM feeds f WHERE f.subscribed = 1)
              WHERE error IS NOT NULL OR latest IS NULL OR latest < ?1
              ORDER BY error IS NULL, coalesce(latest, 0), lower(title)",
         )?;
-        let rows = stmt.query_map([cutoff], |r| {
+        let rows = stmt.query_map(params![cutoff, crate::gemini::changed_key("")], |r| {
             let url: String = r.get(0)?;
             let title: String = r.get(1)?;
             Ok(ReportRow {
@@ -725,6 +764,7 @@ impl Db {
                 url,
                 error: r.get(2)?,
                 latest: r.get(3)?,
+                cert_changed: r.get(4)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -783,7 +823,7 @@ impl Db {
             "SELECT f.url, f.title, f.error,
                 (SELECT count(*) FROM items i LEFT JOIN state s ON s.key = i.key
                  WHERE i.feed_url = f.url AND {UNREAD} AND {VISIBLE}),
-                f.category, f.url IN (SELECT url FROM sync_shadow)
+                f.category, f.url IN (SELECT url FROM sync_shadow), f.route
              FROM feeds f WHERE f.subscribed = 1
              ORDER BY f.category = '', lower(f.category), lower(f.title), f.url"
         );
@@ -798,6 +838,7 @@ impl Db {
                 unread: r.get(3)?,
                 category: r.get(4)?,
                 local: r.get(5)?,
+                route: r.get(6)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -908,6 +949,17 @@ impl Db {
             None => stmt.query_map(params![unread_cutoff(), value, search], row)?,
         };
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Whether an item is stored already.
+    pub fn has_item(&self, key: &str) -> Result<bool> {
+        Ok(self.conn.query_row("SELECT count(*) FROM items WHERE key = ?1", [key], |r| r.get::<_, i64>(0))? > 0)
+    }
+
+    /// A stored item as it was fetched (without its version timestamp), if there is one.
+    pub fn stored_item(&self, key: &str) -> Result<Option<Item>> {
+        let sql = "SELECT title, link, author, published, content FROM items WHERE key = ?1";
+        Ok(self.conn.query_row(sql, [key], read_item).optional()?)
     }
 
     pub fn item_content(&self, key: &str) -> Result<String> {
@@ -1198,7 +1250,12 @@ impl Db {
     /// The synced subscriptions document without its feeds, which are synced
     /// in [`Self::feeds_doc`] shards.
     pub fn subscriptions_doc_without_feeds(&self) -> Result<Subscriptions> {
-        Ok(Subscriptions { feeds: BTreeMap::new(), categories: BTreeMap::new(), ..self.subscriptions_doc()? })
+        Ok(Subscriptions {
+            feeds: BTreeMap::new(),
+            categories: BTreeMap::new(),
+            routes: BTreeMap::new(),
+            ..self.subscriptions_doc()?
+        })
     }
 
     /// The synced feeds (and their categories) in one shard of the feed list.
@@ -1206,7 +1263,8 @@ impl Db {
         let mut doc = self.subscriptions_doc()?;
         doc.feeds.retain(|url, _| docs::feed_shard_of(url) == shard);
         doc.categories.retain(|url, _| docs::feed_shard_of(url) == shard);
-        Ok(Subscriptions { feeds: doc.feeds, categories: doc.categories, ..Default::default() })
+        doc.routes.retain(|url, _| docs::feed_shard_of(url) == shard);
+        Ok(Subscriptions { feeds: doc.feeds, categories: doc.categories, routes: doc.routes, ..Default::default() })
     }
 
     /// This device's own view, including feeds it doesn't share (for backups).
@@ -1219,18 +1277,22 @@ impl Db {
         let (own, shadow) = if shared {
             (
                 "url NOT IN (SELECT url FROM sync_shadow)",
-                "UNION ALL SELECT url, subscribed, sub_t, category, category_t FROM sync_shadow",
+                "UNION ALL SELECT url, subscribed, sub_t, category, category_t, route, route_t FROM sync_shadow",
             )
         } else {
             ("1", "")
         };
-        let rows = format!("SELECT url, subscribed, sub_t, category, category_t FROM feeds WHERE {own} {shadow}");
+        let rows = format!(
+            "SELECT url, subscribed, sub_t, category, category_t, route, route_t FROM feeds WHERE {own} {shadow}"
+        );
         let mut stmt = self.conn.prepare(&format!("SELECT url, subscribed, sub_t FROM ({rows}) WHERE sub_t > 0"))?;
         let feeds = stmt.query_map([], |r| Ok((r.get(0)?, Lww(r.get(1)?, r.get(2)?))))?.collect::<Result<_, _>>()?;
         let mut stmt =
             self.conn.prepare(&format!("SELECT url, category, category_t FROM ({rows}) WHERE category_t > 0"))?;
         let categories =
             stmt.query_map([], |r| Ok((r.get(0)?, Lww(r.get(1)?, r.get(2)?))))?.collect::<Result<_, _>>()?;
+        let mut stmt = self.conn.prepare(&format!("SELECT url, route, route_t FROM ({rows}) WHERE route_t > 0"))?;
+        let routes = stmt.query_map([], |r| Ok((r.get(0)?, Lww(r.get(1)?, r.get(2)?))))?.collect::<Result<_, _>>()?;
         let mut stmt = self.conn.prepare("SELECT id, phrase, scope, deleted, t FROM filters")?;
         let filters = stmt
             .query_map([], |r| {
@@ -1243,6 +1305,7 @@ impl Db {
             salt: self.salt()?,
             feeds,
             categories,
+            routes,
             filters,
             cache: self.cache_limits()?,
             erased_at,
@@ -1433,6 +1496,18 @@ impl Db {
             )?;
             changed += moved;
             regroup |= moved > 0;
+        }
+        let routes = doc.routes.iter().filter(|(_, v)| v.1 > floor && v.0.len() <= MAX_ROUTE_BYTES);
+        for (url, Lww(route, t)) in routes {
+            changed += tx.execute(
+                &format!(
+                    "INSERT INTO {} (url, route, route_t) VALUES (?1, ?2, ?3)
+                     ON CONFLICT (url) DO UPDATE SET route = excluded.route, route_t = excluded.route_t
+                     WHERE (excluded.route_t, excluded.route) > (route_t, route)",
+                    table(url)?
+                ),
+                params![url, route, t],
+            )?;
         }
         if changed > 0 {
             bump(&tx, SUBSCRIPTIONS_REV)?;
@@ -1965,6 +2040,11 @@ mod tests {
         let urls = |days| db.feed_report(days).unwrap().into_iter().map(|r| r.url).collect::<Vec<_>>();
         assert_eq!(urls(365), ["https://broken.example/", "https://empty.example/", "https://quiet.example/"]);
         assert_eq!(urls(500), ["https://broken.example/", "https://empty.example/"]);
+        // A Gemini capsule whose certificate changed comes along, for the report to offer trusting it.
+        db.set_meta(&crate::gemini::changed_key("https://broken.example/"), "capsule.example:1965").unwrap();
+        let rows = db.feed_report(500).unwrap();
+        assert_eq!(rows[0].cert_changed.as_deref(), Some("capsule.example:1965"));
+        assert_eq!(rows[1].cert_changed, None);
     }
 
     #[test]

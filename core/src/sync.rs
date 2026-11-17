@@ -229,7 +229,7 @@ impl Doc {
 
     fn is_empty(&self) -> bool {
         match self {
-            Doc::Subscriptions(doc) => doc.feeds.is_empty() && doc.categories.is_empty(),
+            Doc::Subscriptions(doc) => doc.feeds.is_empty() && doc.categories.is_empty() && doc.routes.is_empty(),
             Doc::State(doc) => doc.items.is_empty(),
             Doc::Items(doc) => doc.items.is_empty() && doc.meta_t == 0,
         }
@@ -333,6 +333,7 @@ async fn fetch_chunked<T: Transport>(
     Ok(results.into_iter().collect::<Result<Vec<_>>>()?.into_iter().flatten().collect())
 }
 
+#[cfg(test)]
 pub async fn sync<T: Transport>(db: &Db, t: &T, options: Options) -> Result<Report> {
     sync_reporting(db, t, options, &|_| {}).await
 }
@@ -458,6 +459,7 @@ pub async fn erase<T: Transport>(db: &Db, t: &T) -> Result<usize> {
     let local = db.subscriptions_doc()?;
     let stamps = (local.feeds.values().map(|v| v.1))
         .chain(local.categories.values().map(|v| v.1))
+        .chain(local.routes.values().map(|v| v.1))
         .chain(local.salt.map(|s| s.1))
         .chain(local.cache.map(|c| c.1));
     let erased_at = (stamps.max().unwrap_or(0) + 1).max(now_ms());
@@ -894,7 +896,7 @@ mod tests {
     const DELETE: &str = "\u{0}delete";
 
     fn fake_id(d: &str, created_at: u64, content: &str) -> String {
-        docs::sha256_hex(&format!("{d}{created_at}{content}"))
+        docs::sha256_hex(format!("{d}{created_at}{content}"))
     }
 
     impl Transport for FakeNet {
@@ -1526,6 +1528,37 @@ mod tests {
         sync_ok(&a, &net).await;
         sync_ok(&b, &net).await;
         assert!(read(&b, 0));
+    }
+
+    #[tokio::test]
+    async fn routes_sync_between_devices_but_not_for_local_feeds() {
+        let net = FakeNet::new(1);
+        let a = client_with_items();
+        a.set_route(FEED, "tor").unwrap();
+        sync_ok(&a, &net).await;
+        let b = Db::open_memory().unwrap();
+        sync_ok(&b, &net).await;
+        assert_eq!(b.route(FEED).unwrap(), "tor");
+        assert_eq!(b.feeds().unwrap()[0].route, "tor");
+        // Back to direct on B: A follows.
+        b.set_route(FEED, "").unwrap();
+        sync_ok(&b, &net).await;
+        sync_ok(&a, &net).await;
+        assert_eq!(a.route(FEED).unwrap(), "");
+        for db in [&a, &b] {
+            assert_eq!(sync_ok(db, &net).await.published, 0);
+        }
+        // A feed kept on A only: its new route isn't shared.
+        a.set_category(FEED, "Mine").unwrap();
+        a.set_category_synced("Mine", false).unwrap();
+        a.set_route(FEED, "i2p").unwrap();
+        sync_ok(&a, &net).await;
+        sync_ok(&b, &net).await;
+        assert_eq!(a.route(FEED).unwrap(), "i2p");
+        assert_eq!(b.route(FEED).unwrap(), "");
+        for db in [&a, &b, &a, &b] {
+            assert_eq!(sync_ok(db, &net).await.published, 0);
+        }
     }
 
     #[tokio::test]

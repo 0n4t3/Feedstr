@@ -132,15 +132,14 @@ fn channel_id(html: &str) -> Option<String> {
         ("link", "type", "application/rss+xml", "href"),
         ("meta", "property", "og:url", "content"),
     ];
-    tagged
-        .iter()
-        .find_map(|&(tag, key, value, attr)| find_tag(html, tag, key, value, attr).and_then(&from_url))
-        .or_else(|| {
-            // In the page's data, as a last resort.
-            let start = html.find("\"externalId\":\"")? + "\"externalId\":\"".len();
-            let id = html[start..].split('"').next()?;
-            is_channel_id(id).then(|| id.to_string())
-        })
+    let found =
+        tagged.iter().find_map(|&(tag, key, value, attr)| find_tag(html, tag, key, value, attr).and_then(from_url));
+    found.or_else(|| {
+        // In the page's data, as a last resort.
+        let start = html.find("\"externalId\":\"")? + "\"externalId\":\"".len();
+        let id = html[start..].split('"').next()?;
+        is_channel_id(id).then(|| id.to_string())
+    })
 }
 
 /// The channel's name, from a channel page.

@@ -6,7 +6,7 @@
 //! | d-tag                               | document         |
 //! |-------------------------------------|------------------|
 //! | `feedstr:subscriptions`             | [`Subscriptions`] without feeds |
-//! | `feedstr:<h("feeds:<0..16>")>`      | [`Subscriptions`] with only the feeds (and their categories) in that shard |
+//! | `feedstr:<h("feeds:<0..16>")>`      | [`Subscriptions`] with only the feeds (and their categories and routes) in that shard |
 //! | `feedstr:<h("state:<0..32>")>`      | [`StateShard`]    |
 //! | `feedstr:<h("items:<feed url>")>`   | [`FeedItems`]     |
 //!
@@ -57,6 +57,11 @@ pub struct Subscriptions {
     /// Feed URL -> category name ("" for none).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub categories: BTreeMap<String, Lww<String>>,
+    /// Feed URL -> how it is fetched: "" directly, "tor" or "i2p" through
+    /// that network's proxy on each device (see `proxy::Route`). Synced with
+    /// the feed list, in the same shards.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub routes: BTreeMap<String, Lww<String>>,
     /// How much of each feed is cached on relays; `None` means the defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<Lww<CacheLimits>>,
@@ -289,13 +294,13 @@ pub fn decode<T: DeserializeOwned>(text: &str) -> Result<T> {
     Ok(envelope.data)
 }
 
-pub fn sha256_hex(text: &str) -> String {
-    Sha256::digest(text.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+pub fn sha256_hex(data: impl AsRef<[u8]>) -> String {
+    Sha256::digest(data.as_ref()).iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Stable key of an item, the same on every device.
 pub fn item_key(feed_url: &str, guid: &str) -> String {
-    sha256_hex(&format!("{feed_url}\n{guid}"))[..16].to_string()
+    sha256_hex(format!("{feed_url}\n{guid}"))[..16].to_string()
 }
 
 pub fn shard_of(item_key: &str) -> u8 {
@@ -308,15 +313,15 @@ pub fn feed_shard_of(feed_url: &str) -> u8 {
 }
 
 pub fn feeds_d(salt: &str, shard: u8) -> String {
-    format!("feedstr:{}", &sha256_hex(&format!("{salt}:feeds:{shard}"))[..32])
+    format!("feedstr:{}", &sha256_hex(format!("{salt}:feeds:{shard}"))[..32])
 }
 
 pub fn state_d(salt: &str, shard: u8) -> String {
-    format!("feedstr:{}", &sha256_hex(&format!("{salt}:state:{shard}"))[..32])
+    format!("feedstr:{}", &sha256_hex(format!("{salt}:state:{shard}"))[..32])
 }
 
 pub fn items_d(salt: &str, feed_url: &str) -> String {
-    format!("feedstr:{}", &sha256_hex(&format!("{salt}:items:{feed_url}"))[..32])
+    format!("feedstr:{}", &sha256_hex(format!("{salt}:items:{feed_url}"))[..32])
 }
 
 #[cfg(test)]

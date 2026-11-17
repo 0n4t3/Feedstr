@@ -83,17 +83,38 @@ impl Platform for Dialogs {
 
     fn opens_nostr_links(&self) -> bool {
         static INSTALLED: OnceLock<bool> = OnceLock::new();
-        *INSTALLED.get_or_init(|| {
-            let handler = Command::new("xdg-mime").args(["query", "default", "x-scheme-handler/nostr"]).output();
-            handler.is_ok_and(|out| out.status.success() && !out.stdout.trim_ascii().is_empty())
-        })
+        *INSTALLED.get_or_init(|| has_handler("nostr"))
     }
 
     fn open_nostr_link(&self, link: &str) -> anyhow::Result<()> {
         // No shell, and core only makes links of "nostr:" and bech32 characters.
         anyhow::ensure!(link.starts_with("nostr:"), "not a Nostr link");
-        let mut opener = Command::new("xdg-open").arg(link).spawn()?;
-        std::thread::spawn(move || opener.wait());
-        Ok(())
+        xdg_open(link)
     }
+
+    fn open_gemini_link(&self, link: &str) -> anyhow::Result<()> {
+        // No shell, and core only hands over addresses it read as gemini:// ones.
+        anyhow::ensure!(link.starts_with("gemini://"), "not a Gemini link");
+        // In a Flatpak the desktop is asked to open it: it knows the apps, this sandbox doesn't.
+        let sandboxed = std::path::Path::new("/.flatpak-info").exists();
+        anyhow::ensure!(
+            sandboxed || has_handler("gemini"),
+            "No Gemini browser is set up to open gemini:// links (Lagrange is one): copy the address instead"
+        );
+        xdg_open(link)
+    }
+}
+
+/// Whether the desktop has an app for links of this kind (`nostr:`, `gemini:`).
+fn has_handler(scheme: &str) -> bool {
+    let kind = format!("x-scheme-handler/{scheme}");
+    let handler = Command::new("xdg-mime").args(["query", "default", &kind]).output();
+    handler.is_ok_and(|out| out.status.success() && !out.stdout.trim_ascii().is_empty())
+}
+
+/// Has the desktop open a link with the app for it.
+fn xdg_open(link: &str) -> anyhow::Result<()> {
+    let mut opener = Command::new("xdg-open").arg(link).spawn()?;
+    std::thread::spawn(move || opener.wait());
+    Ok(())
 }
