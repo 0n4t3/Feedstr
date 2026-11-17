@@ -4,27 +4,36 @@
 # Feedstr
 Feedstr was born out of the highly personalized annoyance of wanting private RSS feed sync, but not wanting to host my own FreshRSS instance (the only publicly accessible service on my home server right now). Feedstr attempts to solve that, syncing feeds, read/unread status, and favorites using the decentralized Nostr protocol - relying on either community relays (default), or a multi purpose self hosted relay.
 
-#### Features
-* Zero tracking, no outgoing connections ever aside from fetching feeds and sync
-* E2E Encrypted sync, no need to trust a community relay
-* Linux (flatpak), Android, and Web support
-* Lightweight multi purpose server - a Nostr relay can do quite a bit more than just sync feeds
-* Nostr NIP 23 longform blogging support
-* OPML import/export
-* Sandboxing: Bare bones permissions for the Flatpak and Andriod versions, with total sandboxing in the web version
-* Ability to enable/disable sync on a per-feed basis
+## RSS++
+In addition to standard RSS/ATOM feeds, Feedstr supports following additional content:
+- **Nostr NIP-23 Blog Posts**, of all users you follow
+- **YouTube channels**, which can be added by pasting a YouTube channel link, which can serve either all content or only standard videos (filtering out shorts & livestreams)
+- Blogs on **Tor & I2P**, using your local Tor/I2P router as a proxy
+- **Gemini Capsules**, which can be followed like standard HTTP websites
 
-#### Potential Future Features
-* Windows Support
-* PWA Support
-* Social Bookmarking & Quotes (optional)
-* Ability to fetch links & bookmarks from Activity Pub, AT, and Nostr users
-* Conversion tool to import/export full feed data (read status, favorites, ect) from FreshRSS and other readers
-* Page archive tool
-* Tor & I2P feed support (likely desktop only)
-* Feed subgroups
-* Automatic YouTube RSS feed extraction from channel links
-* TTS Narration Support
+## Features
+- **Zero tracking:** no outgoing connections ever, aside from fetching feeds
+  and syncing
+- **End-to-end encrypted sync:** no need to trust a community relay
+- **Linux (Flatpak), Android and web** support
+- **A lightweight, multi-purpose server:** a Nostr relay can do quite a bit
+  more than just sync feeds
+- **OPML** import and export
+- **Sandboxing:** bare-bones permissions for the Flatpak and Android
+  versions, and total sandboxing in the web version
+- **Local Only categories:** Fine tune what's actually synced
+
+## Potential Future Features
+- Windows builds
+- PWA support
+- Social bookmarking and quotes (optional)
+- Fetching links and bookmarks from ActivityPub, AT Protocol and Nostr users
+- A tool to import and export full feed data (read status, favorites, etc.)
+  from FreshRSS and other readers
+- A page archive tool
+- Text To Speech reading
+- Feed subgroups
+- Text-to-speech narration
 
 ## Installation
 coming soon
