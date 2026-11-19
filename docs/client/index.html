@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">
+    <meta name="color-scheme" content="light dark">
+    <!-- No scripts from other sites: the page may hold a Sync Key. (The inline
+         script is trunk's loader; nothing a feed sends is ever put into the page.) -->
+    <meta http-equiv="Content-Security-Policy"
+          content="default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; connect-src 'self' https: wss: ws://localhost:* ws://127.0.0.1:*; img-src 'self' data:; frame-src nostr: gemini:; style-src 'self' 'unsafe-inline'">
+    <title>Feedstr</title>
+    <!-- The same icon as the apps (logo.svg in the repository root). -->
+    
+    <link rel="icon" type="image/svg+xml" href="logo.svg">
+    <!-- wasm-opt shrinks the WebAssembly further; the features listed are the ones Rust's wasm target uses. -->
+    
+<script type="module">
+import init, * as bindings from './feedstr-web-a9e8f65f77887461.js';
+const wasm = await init({ module_or_path: './feedstr-web-2d89f89e23392c11_bg.wasm' });
+
+
+window.wasmBindings = bindings;
+
+
+dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
+
+</script>
+    <style>
+        html, body { margin: 0; height: 100%; overflow: hidden; background: #1b1b1f; }
+        @media (prefers-color-scheme: light) { html, body { background: #fbfbfc; } }
+        canvas { display: block; width: 100%; height: 100%; outline: none; }
+        noscript { color: #888; font: 16px sans-serif; display: block; padding: 2em; }
+    </style>
+<link rel="modulepreload" href="./feedstr-web-a9e8f65f77887461.js" crossorigin="anonymous" integrity="sha384-UBHPB8cmYVNRPIBEjqLRM0RkS6ja4ZwgaNJdFLuYt9GzVQEO9u95zcTlASLZMpYN"><link rel="preload" href="./feedstr-web-2d89f89e23392c11_bg.wasm" crossorigin="anonymous" integrity="sha384-G+yA5RU4stAg3q21wHCkeFHeUM3KEW/rljBG4mxBiiY6/3CCk8XchhOlebxqs4u8" as="fetch" type="application/wasm"></head>
+<body>
+    <canvas id="feedstr"></canvas>
+    <noscript>Feedstr needs JavaScript and WebAssembly.</noscript>
+</body>
+</html>
