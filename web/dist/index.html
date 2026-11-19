@@ -15,8 +15,8 @@
     <!-- wasm-opt shrinks the WebAssembly further; the features listed are the ones Rust's wasm target uses. -->
     
 <script type="module">
-import init, * as bindings from './feedstr-web-9f036184f7089f6b.js';
-const wasm = await init({ module_or_path: './feedstr-web-d307bb540602fde7_bg.wasm' });
+import init, * as bindings from './feedstr-web-a9e8f65f77887461.js';
+const wasm = await init({ module_or_path: './feedstr-web-2d89f89e23392c11_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -31,7 +31,7 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
         canvas { display: block; width: 100%; height: 100%; outline: none; }
         noscript { color: #888; font: 16px sans-serif; display: block; padding: 2em; }
     </style>
-<link rel="modulepreload" href="./feedstr-web-9f036184f7089f6b.js" crossorigin="anonymous" integrity="sha384-iOORUK09kmjoU1RWCPpCu45Mre1QfvUQMSudEka0V9HZKaFwOQTQEquohTmbhMnO"><link rel="preload" href="./feedstr-web-d307bb540602fde7_bg.wasm" crossorigin="anonymous" integrity="sha384-bWZE3nti4H2Fq7E5Y23HCp746zu+K9h6q5kRdAON+qmn6llSqlnnQxH5SW8PgCK+" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="./feedstr-web-a9e8f65f77887461.js" crossorigin="anonymous" integrity="sha384-UBHPB8cmYVNRPIBEjqLRM0RkS6ja4ZwgaNJdFLuYt9GzVQEO9u95zcTlASLZMpYN"><link rel="preload" href="./feedstr-web-2d89f89e23392c11_bg.wasm" crossorigin="anonymous" integrity="sha384-G+yA5RU4stAg3q21wHCkeFHeUM3KEW/rljBG4mxBiiY6/3CCk8XchhOlebxqs4u8" as="fetch" type="application/wasm"></head>
 <body>
     <canvas id="feedstr"></canvas>
     <noscript>Feedstr needs JavaScript and WebAssembly.</noscript>

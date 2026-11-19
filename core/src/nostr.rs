@@ -184,10 +184,7 @@ pub struct NostrTransport {
     client: Client,
     signer: Signer,
     pubkey: PublicKey,
-    /// The relays in use: those asked for, less any left out.
     relays: Vec<String>,
-    /// The relays asked for, to tell when the list has changed.
-    asked: Vec<String>,
     /// How long to wait for relays: longer through Tor.
     connect_timeout: Duration,
     fetch_timeout: Duration,
@@ -200,7 +197,6 @@ impl NostrTransport {
         let client = relay_client(via);
         let (connect_timeout, fetch_timeout) =
             if via.is_some() { (TOR_CONNECT_TIMEOUT, TOR_FETCH_TIMEOUT) } else { (CONNECT_TIMEOUT, FETCH_TIMEOUT) };
-        let asked = relays.clone();
         let mut added = Vec::new();
         for url in relays.into_iter().filter(|url| through_tor_ok(url, via)) {
             match client.add_relay(&url).await {
@@ -209,18 +205,11 @@ impl NostrTransport {
             }
         }
         client.connect().await;
-        Ok(Self { client, signer, pubkey, relays: added, asked, connect_timeout, fetch_timeout })
+        Ok(Self { client, signer, pubkey, relays: added, connect_timeout, fetch_timeout })
     }
 
     pub fn pubkey(&self) -> PublicKey {
         self.pubkey
-    }
-
-    /// The relays this was made for, including any left out (an unencrypted
-    /// one through Tor, or one that isn't a valid address): compare these,
-    /// not [`Transport::relays`], with the list to tell when it has changed.
-    pub fn relays_asked_for(&self) -> &[String] {
-        &self.asked
     }
 
     pub async fn shutdown(&self) {

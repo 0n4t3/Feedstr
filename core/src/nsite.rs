@@ -267,8 +267,8 @@ fn filters(site: &Site, servers: bool) -> Vec<Filter> {
 
 /// Whether the site has been published (as far as its owner's relays and the
 /// user's say): tells a gateway's address from another site on an npub subdomain.
-pub async fn exists(reader: &longform::Reader, site: &Site) -> Result<bool> {
-    Ok(!reader.events_by(site.author, filters(site, false)).await?.0.is_empty())
+pub async fn exists(reader: &longform::Reader, site: &Site) -> bool {
+    !reader.events_by(site.author, filters(site, false)).await.0.is_empty()
 }
 
 /// The site at the feed address `url`, unless it's still the version `seen`
@@ -310,7 +310,7 @@ async fn read(
     seen: Option<&str>,
 ) -> Result<Fetched> {
     let site = Site::parse_url(url).context("not an nsite address")?;
-    let (events, name) = reader.events_by(site.author, filters(&site, true)).await?;
+    let (events, name) = reader.events_by(site.author, filters(&site, true)).await;
     let newest = |kind: u16| events.iter().filter(|e| e.kind == Kind::from(kind)).max_by_key(|e| e.created_at);
 
     let manifest = newest(if site.name.is_some() { NAMED_SITE } else { ROOT_SITE });
@@ -323,7 +323,7 @@ async fn read(
         // An older site: an event per file, read page by page (there can be
         // more than relays send at once).
         None if site.name.is_none() => {
-            let events = reader.every_event_by(site.author, Kind::from(LEGACY_FILE)).await?;
+            let events = reader.every_event_by(site.author, Kind::from(LEGACY_FILE)).await;
             (legacy_files(events.iter()), Vec::new(), None)
         }
         None => (Files::new(), Vec::new(), None),
@@ -375,8 +375,7 @@ async fn read(
 
     // Otherwise its pages, newest first. Every page still on the site is
     // passed on (so it counts as still in the feed), those stored as they are.
-    let mut pages: Vec<(&String, &(String, i64))> =
-        files.iter().filter(|(path, _)| is_page(path) && !is_copy(path, &files)).collect();
+    let mut pages: Vec<(&String, &(String, i64))> = files.iter().filter(|(path, _)| is_page(path)).collect();
     pages.sort_by(|a, b| b.1.1.cmp(&a.1.1).then(a.0.cmp(b.0)));
     let mut items = Vec::new();
     let (mut read, started) = (0, clock::now_ms());
@@ -498,16 +497,7 @@ fn blossom_servers(listed: Vec<String>, route: Route) -> Vec<String> {
 
 fn is_page(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
-    !lower.ends_with("/404.html") && PAGE_ENDINGS.iter().any(|end| lower.ends_with(end))
-}
-
-/// Whether a page is the same page as a folder's `index.html` beside it
-/// (`/a.html` next to `/a/index.html`, as site builders like VitePress make
-/// them): only the folder's is shown, not each page twice.
-fn is_copy(path: &str, files: &Files) -> bool {
-    path.strip_suffix(".html")
-        .filter(|stem| !stem.ends_with("/index"))
-        .is_some_and(|stem| files.contains_key(&format!("{stem}/index.html")))
+    lower != "/404.html" && PAGE_ENDINGS.iter().any(|end| lower.ends_with(end))
 }
 
 /// Where a page is on the gateway: a folder's `index.html` is the folder.
@@ -532,7 +522,7 @@ fn page(path: &str, text: &str, link: &str) -> (Option<String>, String) {
         let title = text.lines().find_map(|l| l.strip_prefix("# ")).map(|t| t.trim().to_string());
         return (title.filter(|t| !t.is_empty()), base + &html::markdown_to_html(text));
     }
-    (html_title(text), base + &html::without_hidden(html::main_part(text)))
+    (html_title(text), base + text)
 }
 
 /// The text of an HTML page's `<title>`.
@@ -713,13 +703,6 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert_eq!(files["/Post.MD"], (hash.clone(), 5));
         assert!(is_page("/Post.MD") && is_page("/index.html") && !is_page("/404.html") && !is_page("/style.css"));
-        assert!(!is_page("/docs/404.html"));
-        let files: Files = ["/a.html", "/a/index.html", "/b.html", "/index.html"]
-            .into_iter()
-            .map(|path| (path.to_string(), (String::new(), 0)))
-            .collect();
-        assert!(is_copy("/a.html", &files));
-        assert!(!is_copy("/a/index.html", &files) && !is_copy("/b.html", &files) && !is_copy("/index.html", &files));
     }
 
     #[test]

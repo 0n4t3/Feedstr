@@ -32,7 +32,7 @@ Downloads are on the
   with `flatpak run top.dns7.feedstr.Feedstr`.
 - **Android:** download the APK and install it. Your phone may ask you to
   allow installing apps from your browser or file manager first.
-- **Web:** open the [web client](https://feedstr.dns7.top/client/) in your browser, or host it yourself (see
+- **Web:** open the [web client]({{ site.web_client_url | relative_url }}) in your browser, or host it yourself (see
   [Platform notes](#web)).
 
 ## Signing in
@@ -338,9 +338,6 @@ articles show up after they sync.
 at an address of their own (a separate domain or subdomain, not a folder next
 to other pages). With **Remember me**, your Sync Key is kept in the browser's
 storage for that address, where any page at the same address could read it.
-A folder is only safe next to pages you control that run no scripts: that's
-how this site serves the [web client](https://feedstr.dns7.top/client/),
-on a domain of its own whose other pages are plain text.
 If your host lets you set headers, also send
 `Content-Security-Policy: frame-ancestors 'none'` and
 `X-Content-Type-Options: nosniff`.

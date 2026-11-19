@@ -346,46 +346,6 @@ pub fn attribute(tag: &str, name: &str) -> Option<String> {
     None
 }
 
-/// A web page's main content, if it marks it with `<main>` (leaving out its
-/// navigation, sidebars and footer), else the whole page.
-pub fn main_part(html: &str) -> &str {
-    let lower = html.to_ascii_lowercase();
-    let start = lower
-        .match_indices("<main")
-        .map(|(i, _)| i)
-        .find(|&i| lower[i + 5..].starts_with(|c: char| c == '>' || c.is_ascii_whitespace()));
-    match (start, lower.rfind("</main>")) {
-        (Some(start), Some(end)) if start < end => &html[start..end + "</main>".len()],
-        _ => html,
-    }
-}
-
-/// The HTML without what [`to_blocks`] never shows (`<head>`, `<script>` and
-/// `<style>` elements), for a whole web page stored as an article: so a page
-/// with a large head isn't cut down to nothing by the size limit.
-pub fn without_hidden(html: &str) -> String {
-    let lower = html.to_ascii_lowercase();
-    let mut kept = String::with_capacity(html.len());
-    let mut at = 0;
-    while let Some(lt) = lower[at..].find('<').map(|i| at + i) {
-        let name: String = lower[lt + 1..].chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
-        if !matches!(name.as_str(), "head" | "script" | "style") {
-            kept.push_str(&html[at..=lt]);
-            at = lt + 1;
-            continue;
-        }
-        kept.push_str(&html[at..lt]);
-        // Up to the end of the closing tag (or of the page, if there's none).
-        let end = format!("</{name}");
-        at = match lower[lt..].find(&end).map(|i| lt + i) {
-            Some(close) => lower[close..].find('>').map_or(html.len(), |i| close + i + 1),
-            None => html.len(),
-        };
-    }
-    kept.push_str(&html[at..]);
-    kept
-}
-
 pub fn decode_entities(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -435,27 +395,6 @@ pub fn decode_entities(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn main_part_of_pages() {
-        let page = "<body><nav>Menu</nav><MAIN class=x><p>Text</p><main>inner</main></main><footer>F</footer>";
-        assert_eq!(main_part(page), "<MAIN class=x><p>Text</p><main>inner</main></main>");
-        assert_eq!(main_part("<body><mainly>x</mainly>"), "<body><mainly>x</mainly>");
-        assert_eq!(main_part("<p>no main</main>"), "<p>no main</main>");
-    }
-
-    #[test]
-    fn hidden_parts_of_pages_are_left_out() {
-        let page = "<base href=\"https://a.example/\"><HTML><Head><title>T</title><style>p{}</style></head>\
-                    <body><p>Hi</p><script src=x></SCRIPT><p>there</p><scriptless>ok</scriptless><style>";
-        let kept = without_hidden(page);
-        assert_eq!(
-            kept,
-            "<base href=\"https://a.example/\"><HTML><body><p>Hi</p><p>there</p><scriptless>ok</scriptless>"
-        );
-        assert_eq!(to_blocks(&kept), to_blocks(page));
-        assert_eq!(without_hidden("a < b <p>é</p>"), "a < b <p>é</p>");
-    }
 
     /// (style, depth, marker, text) of each block.
     fn outline(blocks: &[Block]) -> Vec<(Style, u8, Option<&str>, String)> {

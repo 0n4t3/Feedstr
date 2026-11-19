@@ -59,9 +59,6 @@ pub(crate) fn fetchable(url: &str) -> bool {
 fn proxy_hint(e: anyhow::Error, route: Route) -> anyhow::Error {
     let refused = e.chain().any(|cause| {
         cause.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == std::io::ErrorKind::ConnectionRefused)
-            // What reqwest's SOCKS connector says (and all it says) when it
-            // can't connect to the proxy itself.
-            || cause.to_string().ends_with("failed to create underlying connection")
     });
     match route {
         Route::Direct => e,
@@ -444,9 +441,7 @@ struct Worker {
     proxied: proxy::Clients,
     nostr: Option<NostrTransport>,
     /// Reads long-form posts; made when first needed.
-    /// With the proxy it connects through, so a change to that (turning on
-    /// "everything through Tor" during a fetch) makes a new one at once.
-    reader: tokio::sync::Mutex<Option<(Arc<longform::Reader>, crate::nostr::RelayProxy)>>,
+    reader: tokio::sync::Mutex<Option<Arc<longform::Reader>>>,
     msg_tx: mpsc::Sender<Msg>,
     ctx: eframe::egui::Context,
     /// Becomes true when the app is closing.
@@ -513,7 +508,7 @@ impl Worker {
                 self.set_kept_running(false);
             }
             // A sync can bring a relay list changed on another device.
-            if self.nostr.as_ref().is_some_and(|nostr| nostr.relays_asked_for() != relays(&self.db)) {
+            if self.nostr.as_ref().is_some_and(|nostr| nostr.relays() != relays(&self.db)) {
                 self.reconnect().await;
             }
             tokio::select! {
@@ -897,7 +892,7 @@ impl Worker {
         let mut site = nsite::Site::parse_input(input);
         if let Some(found) = &site
             && !nsite::is_nsite(input.trim())
-            && !nsite::exists(&*self.reader().await?, found).await?
+            && !nsite::exists(&*self.reader().await?, found).await
         {
             site = None;
         }
@@ -1037,34 +1032,7 @@ impl Worker {
         Ok(())
     }
 
-    /// Fetches a feed. If how this device connects changes meanwhile
-    /// (everything was just sent through Tor, say), what's under way stops at
-    /// once, rather than go on over its old connections, and the feed is
-    /// fetched again the new way. (Nothing is stored until a fetch is done.)
     async fn fetch_feed(&self, url: &str) -> Result<()> {
-        loop {
-            let seen = self.life.network.load(Ordering::Relaxed);
-            tokio::select! {
-                result = self.fetch_feed_once(url) => return result,
-                () = self.network_change_since(seen) => {}
-            }
-        }
-    }
-
-    /// Returns once how this device connects has changed since `seen` (see
-    /// [`Remote::network_changed`]).
-    async fn network_change_since(&self, seen: u64) {
-        loop {
-            // Made before checking, so a change in between still wakes it.
-            let wake = self.life.network_changed.notified();
-            if self.life.network.load(Ordering::Relaxed) != seen {
-                return;
-            }
-            wake.await;
-        }
-    }
-
-    async fn fetch_feed_once(&self, url: &str) -> Result<()> {
         if longform::is_nostr(url) {
             // Articles from other devices' caches don't count: each device
             // reads the full history once, then only what's new.
@@ -1097,7 +1065,7 @@ impl Worker {
                 }
                 (Err(e), _) | (_, Err(e)) => Err(e),
             };
-            return match fetched.map_err(|e| proxy_hint(e, route)) {
+            return match fetched {
                 Ok(fetched) => {
                     // Nothing new if the site hasn't changed since last time.
                     if let Some(feed) = fetched.feed {
@@ -1182,14 +1150,11 @@ impl Worker {
     /// relays are then not asked at all, rather than directly.
     async fn reader(&self) -> Result<Arc<longform::Reader>> {
         let mut reader = self.reader.lock().await;
-        let via = proxy::relay_proxy(&self.db)?;
-        if let Some((reader, made_via)) = reader.as_ref()
-            && *made_via == via
-        {
+        if let Some(reader) = reader.as_ref() {
             return Ok(reader.clone());
         }
-        let made = Arc::new(longform::Reader::new(relays(&self.db), via));
-        Ok(reader.insert((made, via)).0.clone())
+        let made = Arc::new(longform::Reader::new(relays(&self.db), proxy::relay_proxy(&self.db)?));
+        Ok(reader.insert(made).clone())
     }
 
     /// At a fresh sign-in: turns on the follows feed if the account follows
@@ -1316,9 +1281,18 @@ impl Worker {
             self.status("Connecting to relays the new way…");
             return outcome;
         }
+        let stop = async {
+            loop {
+                let wake = self.life.network_changed.notified();
+                if changed() {
+                    return;
+                }
+                wake.await;
+            }
+        };
         let synced = tokio::select! {
             result = sync::sync_reporting(&self.db, nostr, options, &progress) => Some(result),
-            () = self.network_change_since(seen) => None,
+            () = stop => None,
         };
         let Some(synced) = synced else {
             // Everything synced is merged field by field: what was cut short
@@ -1331,10 +1305,7 @@ impl Worker {
                 outcome = SyncOutcome { saved: report.relays_ok > 0 && report.problems.is_empty() };
                 let time = chrono::Local::now().format("%H:%M");
                 let mut status = format!("Synced at {time} · {}/{} relays", report.relays_ok, report.relays_total);
-                if report.relays_total == 0 && proxy::relay_proxy(&self.db).is_ok_and(|via| via.is_some()) {
-                    status = "Sync failed: none of your relays can be used through Tor (unencrypted ws:// ones aren't)"
-                        .into();
-                } else if report.relays_ok == 0 {
+                if report.relays_ok == 0 {
                     status = "Sync failed: no relay reachable".into();
                 }
                 if !report.problems.is_empty() {
@@ -1649,25 +1620,6 @@ mod tests {
         let ran = app.run(start).await;
         assert!(!ran.synced());
         assert_eq!(ran.statuses.last().unwrap(), "Manual only: Sync to sync now");
-    }
-
-    #[tokio::test]
-    async fn a_relay_left_out_through_tor_doesnt_reconnect_forever() {
-        let app = TestApp::new().await;
-        // The test relay is ws://, which isn't used through Tor: none is left.
-        app.db().set_meta("tor_everything", "1").unwrap();
-        let ran = app
-            .run(|remote| {
-                remote.tx.send(Cmd::Login(Login::Saved)).unwrap();
-                remote.tx.send(Cmd::SyncNow).unwrap();
-            })
-            .await;
-        // Connected once, not again before every command.
-        assert_eq!(ran.statuses.iter().filter(|s| *s == "Connecting to relays…").count(), 1, "{:?}", ran.statuses);
-        assert_eq!(
-            ran.statuses.last().unwrap(),
-            "Sync failed: none of your relays can be used through Tor (unencrypted ws:// ones aren't)"
-        );
     }
 
     #[tokio::test]

@@ -33,11 +33,10 @@ community relays (the default) or a multi-purpose self-hosted relay.
 
 ## RSS++
 In addition to standard RSS/ATOM feeds, Feedstr supports following additional content:
-- **Nostr NIP-23 Blog Posts** - both of all followed users (enabled/disabled), and individually added feeds
+- **Nostr NIP-23 Blog Posts**, of all users you follow
 - **YouTube channels**, which can be added by pasting a YouTube channel link, which can serve either all content or only standard videos (filtering out shorts & livestreams)
 - Blogs on **Tor & I2P**, using your local Tor/I2P router as a proxy
 - **Gemini Capsules**, which can be followed like standard HTTP websites
-- **Websites on Nostr (nsites)**, whose pages show up as articles, or that site's own feed if it has one
 
 ## Features
 - **Zero tracking:** no outgoing connections ever, aside from fetching feeds
@@ -61,3 +60,4 @@ In addition to standard RSS/ATOM feeds, Feedstr supports following additional co
 - A page archive tool
 - Text To Speech reading
 - Feed subgroups
+- Text-to-speech narration
