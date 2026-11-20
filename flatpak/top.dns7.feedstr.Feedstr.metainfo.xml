@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>top.dns7.feedstr.Feedstr</id>
+  <name>Feedstr</name>
+  <summary>Mildly improved reading for RSS and more</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-only</project_license>
+  <description>
+    <p>
+      A feed reader, written in Rust, that syncs feeds via the decentralized
+      protocol Nostr.
+    </p>
+    <p>
+      Follow RSS and Atom feeds, Gemini feeds, YouTube channels, Nostr
+      long-form posts (NIP-23) and websites on Nostr (nsites). Read and
+      favorite state, subscriptions and settings sync between your devices,
+      encrypted, through Nostr relays. Feeds can be fetched through Tor or
+      I2P.
+    </p>
+  </description>
+  <launchable type="desktop-id">top.dns7.feedstr.Feedstr.desktop</launchable>
+  <url type="homepage">https://feedstr.dns7.top/</url>
+  <url type="help">https://feedstr.dns7.top/usage/</url>
+  <url type="vcs-browser">https://github.com/0n4t3/feedstr</url>
+  <url type="bugtracker">https://github.com/0n4t3/feedstr/issues</url>
+  <content_rating type="oars-1.1"/>
+  <supports>
+    <control>keyboard</control>
+    <control>pointing</control>
+    <control>touch</control>
+  </supports>
+  <categories>
+    <category>Network</category>
+    <category>News</category>
+    <category>Feed</category>
+  </categories>
+  <releases>
+    <!-- The same version as versionName in droid/app/build.gradle.kts
+         and VERSION in core/src/ui.rs (there with a "v" in front). -->
+    <release version="0.1" date="2026-11-20">
+      <description>
+        <p>First release.</p>
+      </description>
+    </release>
+  </releases>
+</component>

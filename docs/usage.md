@@ -27,12 +27,14 @@ noted under [Platform notes](#platform-notes).
 Downloads are on the
 [latest release](https://github.com/0n4t3/feedstr/releases/latest).
 
-- **Linux:** download `feedstr.flatpak` and install it with
-  `flatpak install feedstr.flatpak`, then run it from your app launcher or
-  with `flatpak run top.dns7.feedstr.Feedstr`.
-- **Android:** download the APK and install it. Your phone may ask you to
-  allow installing apps from your browser or file manager first.
-- **Web:** open the [web client]({{ site.web_client_url | relative_url }}) in your browser, or host it yourself (see
+- **Linux:** download the Flatpak (`Feedstr-flatpak_v0.1.flatpak`) and
+  install it with `flatpak install Feedstr-flatpak_v0.1.flatpak`, then run it
+  from your app launcher or with `flatpak run top.dns7.feedstr.Feedstr`.
+- **Android:** download the APK and install it: `Feedstr-android-arm64_v0.1.apk`
+  for phones and tablets, `Feedstr-android-x86_64_v0.1.apk` for emulators and
+  x86 devices. Your phone may ask you to allow installing apps from your
+  browser or file manager first.
+- **Web:** open the [web client](https://feedstr.dns7.top/client/) in your browser, or host it yourself (see
   [Platform notes](#web)).
 
 ## Signing in
@@ -72,12 +74,13 @@ feed at the same time. Feedstr accepts:
   address (Feedstr looks for its feed).
 - **YouTube channels:** a channel's page (`youtube.com/@name`,
   `/channel/UC…`, `/c/…` or `/user/…`) or its feed address. Tick **Hide
-  livestreams and Shorts** to follow only regular videos.
+  livestreams and Shorts** to follow only regular videos. (A channel with
+  only Shorts or livestreams can't be added that way: untick it.)
 - **Nostr writers:** an npub, nprofile or NIP-05 address
   (`name@example.com`). Their long-form posts (NIP-23) become a feed. You
   don't need to follow them on Nostr.
 - **Websites on Nostr (nsites):** `nsite:npub1…`, `nsite:npub1…/name`, or the
-  site's address on a gateway (like `https://npub1….nsite.lol`). If the site
+  site's address on a gateway (like `https://npub1….nsite.run`). If the site
   has its own feed, you get that. Otherwise each new or changed page shows up
   as an article.
 - **Gemini feeds:** a `gemini://` address, either a gemlog's page of dated
@@ -149,6 +152,12 @@ to read all of it.
 
 Categories sync to your other devices and become folders in OPML exports.
 
+### Renaming a feed
+
+Right-click a feed and choose **Rename…** to give it a name of your own.
+Updates to the feed won't change it, and it syncs to your other devices. To go
+back to the feed's own name, rename it again and leave the name empty.
+
 ### Local Only categories
 
 To keep a category's feeds on one device, right-click it and choose **Make
@@ -180,7 +189,9 @@ Automatic syncs wait until 10 minutes after the last complete one, so
 reopening the app often doesn't sync every time. Pressing Sync always syncs.
 
 While syncing, the status at the top shows what Feedstr is doing, with a
-progress bar.
+progress bar, and the Sync button turns into **✖ Cancel**. Cancelling stops
+the sync where it is. What was already downloaded, fetched or uploaded is
+kept, and the next sync does the rest.
 
 **Manual only** (in **Settings → Sync**) turns off all automatic syncing.
 Nothing syncs until you press Sync, except when you sign in or out.
@@ -211,8 +222,9 @@ Read/unread state older than 60 days isn't synced. Favorites always are.
 Desktop and Android can fetch feeds through Tor or I2P, using proxies running
 on your device. The web version can't.
 
-1. Install and run Tor (the tor service on Linux, or Orbot on Android) and/or
-   an I2P router (I2P or i2pd).
+1. Install and run Tor and/or an I2P router: see
+   [Setting up Tor](#setting-up-tor) and [Setting up I2P](#setting-up-i2p)
+   below.
 2. Check the proxy addresses in **Settings → Tor & I2P**. The defaults are
    `127.0.0.1:9050` for Tor and `127.0.0.1:4444` for I2P. If you use Tor
    Browser's Tor, use `127.0.0.1:9150`.
@@ -230,9 +242,85 @@ Things to know:
 - Which feeds use Tor or I2P syncs to your other devices. The proxy addresses
   are set on each device.
 - Gemini feeds can use Tor but not I2P.
-- Fetching clearnet feeds through I2P needs your router's outproxy.
 - Only the feed goes through the proxy. Links you open from its articles open
   in your browser as usual.
+
+### Setting up Tor
+
+Feedstr talks to Tor through its SOCKS proxy. It doesn't include Tor itself.
+
+**Linux (the tor service):**
+
+1. Install it with your package manager:
+   - Debian, Ubuntu, Mint: `sudo apt install tor`
+   - Fedora: `sudo dnf install tor`
+   - Arch: `sudo pacman -S tor`
+2. Start it, and have it start with your computer:
+   `sudo systemctl enable --now tor`. (On Debian and Ubuntu it's already
+   running after installing.)
+3. Check that it works: `systemctl status tor` should say "active", and
+   `curl --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip`
+   should answer with `"IsTor":true`.
+4. Leave Feedstr's Tor address at `127.0.0.1:9050`.
+
+The tor service runs in the background, whether Feedstr is open or not. The
+Flatpak reaches it the same way, as it shares your computer's network.
+
+**Linux (Tor Browser instead):** if Tor Browser is installed and you'd
+rather not run a separate service, set Feedstr's Tor address to
+`127.0.0.1:9150`. Tor Browser has to be open while Feedstr fetches; when it's
+closed, Tor feeds fail to update.
+
+**Android (Orbot):**
+
+1. Install [Orbot](https://orbot.app/) from Google Play or F-Droid (from the
+   Guardian Project's repository).
+2. Open it and tap **Start** (or **Connect**). Wait until it says it's
+   connected.
+3. Orbot's SOCKS proxy is `127.0.0.1:9050` unless you changed it, which is
+   Feedstr's default. If you did, find the port in Orbot's settings and enter
+   it in Feedstr.
+4. Orbot's VPN mode isn't needed: Feedstr uses its proxy directly. You can
+   leave Feedstr out of the VPN's apps, or turn the VPN off.
+5. So Android doesn't stop Orbot in the background, turn off battery
+   optimization for Orbot in Android's settings (**Apps → Orbot → Battery →
+   Unrestricted**, worded differently on some phones).
+
+Tor Browser for Android can't be used: other apps can't reach its Tor.
+
+**Is it working?** Add a `.onion` feed, or set a feed to **Through Tor** and
+sync. If Tor isn't running or the address is wrong, the feed says it
+couldn't reach the Tor proxy.
+
+### Setting up I2P
+
+Feedstr reaches I2P sites through an I2P router's HTTP proxy, which is
+`127.0.0.1:4444` in both common routers.
+
+**Linux:**
+
+- **i2pd** (small, written in C++): `sudo apt install i2pd` on Debian and
+  Ubuntu, `sudo dnf install i2pd` on Fedora, `sudo pacman -S i2pd` on Arch.
+  Then `sudo systemctl enable --now i2pd`. Its web console, at
+  `http://127.0.0.1:7070`, shows whether it's connected.
+- **Java I2P:** install it from [geti2p.net](https://geti2p.net/) and start
+  it. Its console is at `http://127.0.0.1:7657`.
+
+**Android:** install **I2P** (from the I2P project) or **i2pd** (from
+PurpleI2P), from Google Play or F-Droid, and start it. Both use
+`127.0.0.1:4444`. As with Orbot, turn off battery optimization for it.
+
+Things to know about I2P:
+
+- A router that has just started needs a few minutes (sometimes 10 or more)
+  to join the network. Until then, I2P feeds fail to update; they work at the
+  next sync once it's ready.
+- If an `.i2p` name isn't found, the router's address book doesn't know it
+  yet. Add the site through the router's console (or a "jump" link from the
+  site), or use its `.b32.i2p` address, which always works.
+- Feeds on ordinary websites can also go through I2P, using your router's
+  outproxy. Most routers come with one set, but it's slow and sometimes down;
+  Tor is the better choice for these.
 
 ### Send everything through Tor
 
@@ -285,7 +373,7 @@ the next sync, or when you close the app.
 
 ## Deleting your data
 
-**Settings → Account → Delete all Feedstr data** removes your feeds, stored
+**Settings → Sync → Delete all Feedstr data** removes your feeds, stored
 articles, read/unread state, favorites and settings from your relays and
 from this device, then signs you out. Your other devices erase their copies
 when they next sync. Only Feedstr's data is deleted, not your Nostr profile
@@ -334,10 +422,13 @@ articles show up after they sync.
   address, not `@name`.
 - Feedstr needs WebGL.
 
-**Hosting it yourself:** serve the files from `feedstr-web.tar.gz` over HTTPS
+**Hosting it yourself:** serve the files from `Feedstr-web_v0.1.tar.gz` over HTTPS
 at an address of their own (a separate domain or subdomain, not a folder next
 to other pages). With **Remember me**, your Sync Key is kept in the browser's
 storage for that address, where any page at the same address could read it.
+A folder is only safe next to pages you control that run no scripts: that's
+how this site serves the [web client](https://feedstr.dns7.top/client/),
+on a domain of its own whose other pages are plain text.
 If your host lets you set headers, also send
 `Content-Security-Policy: frame-ancestors 'none'` and
 `X-Content-Type-Options: nosniff`.

@@ -12,18 +12,18 @@ In addition to standard RSS/ATOM feeds, Feedstr now support following content on
 - **NSites**, which can be followed via RSS links within them, or by listing page updates if no RSS link on said NSite is present 
 
 ## Installation
-* Linux: [Download the latest release](https://github.com/0n4t3/Feedstr/releases), and install flatpak if you don't already have it installed. Navigate to the folder you installed it with, and run `flatpak install --user ./[Feedstr Release]`
-* Android: [Download the latest release](https://github.com/0n4t3/Feedstr/releases), using your browser or Obtanium. *Note: [Keep Android Open](https://keepandroidopen.org/). I don't have a Google approved key, if you want to install it you'll need to enable doing so - or better yet - switch to a version of non-fisher-price Android like Graphene or Lineage. 
-* Web: [Open the web client](https://feedstr.dns7.top/client/) in any WebGL supported browser
+* Linux: [Download the latest release](https://github.com/0n4t3/Feedstr/releases), and install flatpak if you don't already have it installed. Navigate to the folder you saved it in, and run `flatpak install --user ./[Feedstr Release]`
+* Android: [Download the latest release](https://github.com/0n4t3/Feedstr/releases), using your browser or Obtanium. *Note: [Keep Android Open](https://keepandroidopen.org/). I don't have a Google approved key, if you want to install it you'll need to enable doing so - or better yet - switch to a version of non-fisher-price Android like Graphene or Lineage.*
+* Web: [Open the web client](https://feedstr.dns7.top/client/) in any WebGL supported browser. *NOTE: The web client is unable to fetch standard feeds (only Nostr NIP-23 feeds) due to browser sandboxing. It requires a Desktop/Mobile device to fetch feeds and sync them first.*
 
 #### Updates
-There's currently no means of automatically updating Feedstr, aside from Android via Obtanium. [Add the repo's RSS feed](https://github.com/0n4t3/Feedstr/releases.atom) to your Feedstr's installation to be notified of updates.
+There's currently no means of automatically updating Feedstr, aside from Android via Obtanium. [Add the repo's RSS feed](https://github.com/0n4t3/Feedstr/releases.atom) to your Feedstr's installation to track updates and manually install updates.
 
 ## Usage
 
 #### Setting Up:
-* If you don't know what the heck a Nostr is, choose "Create a sync key" and save it in your password manager. (you do use a password manager, right? because you should.) This is a private key, it keeps your data end to end encrypted. Don't lose it or give it to anyone else.
-* If you do know what a Nostr is, sign in with your nsec bunker, or if you're on the web client, your web extension. Configure your relays in the "Sync" settings (such as adding any paid or self hosted relays you use), and you'll likely want to enable displaying NIP-23 blog posts from users you already follow in the "Socials" section.
+* If you don't know what the heck a Nostr is, choose "Create a sync key" at the bottom and save it in your password manager. *(you do use a password manager, right? because you should.)* This is a private key, it keeps your data end to end encrypted. Don't lose it or give it to anyone else.
+* If you do know what a Nostr is, sign in with your nsec bunker - or if you're on the web client - your web extension. Configure your relays in the "Sync" settings (such as adding any paid/self-hosted relays you use), and you'll likely want to enable displaying NIP-23 blog posts from users you already follow in the "Socials" section.
 
 #### Adding Content
 In Settings/"Import & Export" you can import an OPML subscription list. You can also export both OPML or all data from Feedstr, which I'd recommend doing as a backup once you get things how you like them. You can also add feeds individually with the "+" button:

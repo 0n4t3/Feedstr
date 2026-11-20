@@ -13,8 +13,9 @@ android {
         applicationId = "top.dns7.feedstr"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        // versionName matches the Flatpak's release (flatpak/top.dns7.feedstr.Feedstr.metainfo.xml).
+        versionCode = 6
+        versionName = "v0.1"
     }
 
     sourceSets {

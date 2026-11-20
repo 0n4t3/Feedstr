@@ -50,7 +50,7 @@ const LEGACY_FILE: u16 = 34128;
 /// Someone's Blossom servers (BUD-03).
 const SERVER_LIST: u16 = 10063;
 
-pub const DEFAULT_GATEWAY: &str = "nsite.lol";
+pub const DEFAULT_GATEWAY: &str = "nsite.run";
 const GATEWAY_KEY: &str = "nsite_gateway";
 
 /// Pages read at most in one fetch (the newest ones), so a big site isn't
@@ -219,6 +219,36 @@ pub fn set_gateway(db: &Db, gateway: &str) -> Result<()> {
     if gateway == DEFAULT_GATEWAY { db.delete_meta(GATEWAY_KEY) } else { db.set_meta(GATEWAY_KEY, gateway) }
 }
 
+/// A stored nsite page's link (or its text) leading to `gateway`. Pages keep
+/// the links of the gateway they were read through, which may since have
+/// changed here, or been another one on the device that read them.
+pub fn on_gateway(feed_url: &str, link: &str, text: &str, gateway: &str) -> String {
+    match moved(feed_url, link, gateway) {
+        Some((old, new)) => {
+            text.replace(&format!("{old}/"), &format!("{new}/")).replace(&format!("{old}\""), &format!("{new}\""))
+        }
+        None => text.to_string(),
+    }
+}
+
+/// The site's address on the gateway `link` leads to, and on `gateway`, if
+/// they differ.
+fn moved(feed_url: &str, link: &str, gateway: &str) -> Option<(String, String)> {
+    let site = Site::parse_url(feed_url)?;
+    let rest = link.strip_prefix("https://")?;
+    let old = &link[..8 + rest.find('/').unwrap_or(rest.len())];
+    let new = site.web_url(gateway);
+    (old != new && old.starts_with(&site.web_url(""))).then(|| (old.to_string(), new))
+}
+
+/// A stored nsite page's link, leading to `gateway` (see [`on_gateway`]).
+pub fn link_on_gateway(feed_url: &str, link: &str, gateway: &str) -> String {
+    match moved(feed_url, link, gateway) {
+        Some((old, new)) => format!("{new}{}", &link[old.len()..]),
+        None => link.to_string(),
+    }
+}
+
 /// A gateway as typed (`nsite.example`, or an address on it), as a host
 /// name; empty means the default.
 pub fn parse_gateway(input: &str) -> Option<String> {
@@ -267,8 +297,8 @@ fn filters(site: &Site, servers: bool) -> Vec<Filter> {
 
 /// Whether the site has been published (as far as its owner's relays and the
 /// user's say): tells a gateway's address from another site on an npub subdomain.
-pub async fn exists(reader: &longform::Reader, site: &Site) -> bool {
-    !reader.events_by(site.author, filters(site, false)).await.0.is_empty()
+pub async fn exists(reader: &longform::Reader, site: &Site) -> Result<bool> {
+    Ok(!reader.events_by(site.author, filters(site, false)).await?.0.is_empty())
 }
 
 /// The site at the feed address `url`, unless it's still the version `seen`
@@ -310,7 +340,7 @@ async fn read(
     seen: Option<&str>,
 ) -> Result<Fetched> {
     let site = Site::parse_url(url).context("not an nsite address")?;
-    let (events, name) = reader.events_by(site.author, filters(&site, true)).await;
+    let (events, name) = reader.events_by(site.author, filters(&site, true)).await?;
     let newest = |kind: u16| events.iter().filter(|e| e.kind == Kind::from(kind)).max_by_key(|e| e.created_at);
 
     let manifest = newest(if site.name.is_some() { NAMED_SITE } else { ROOT_SITE });
@@ -323,7 +353,7 @@ async fn read(
         // An older site: an event per file, read page by page (there can be
         // more than relays send at once).
         None if site.name.is_none() => {
-            let events = reader.every_event_by(site.author, Kind::from(LEGACY_FILE)).await;
+            let events = reader.every_event_by(site.author, Kind::from(LEGACY_FILE)).await?;
             (legacy_files(events.iter()), Vec::new(), None)
         }
         None => (Files::new(), Vec::new(), None),
@@ -375,7 +405,8 @@ async fn read(
 
     // Otherwise its pages, newest first. Every page still on the site is
     // passed on (so it counts as still in the feed), those stored as they are.
-    let mut pages: Vec<(&String, &(String, i64))> = files.iter().filter(|(path, _)| is_page(path)).collect();
+    let mut pages: Vec<(&String, &(String, i64))> =
+        files.iter().filter(|(path, _)| is_page(path) && !is_copy(path, &files)).collect();
     pages.sort_by(|a, b| b.1.1.cmp(&a.1.1).then(a.0.cmp(b.0)));
     let mut items = Vec::new();
     let (mut read, started) = (0, clock::now_ms());
@@ -480,6 +511,11 @@ fn blossom_servers(listed: Vec<String>, route: Route) -> Vec<String> {
     let mut servers: Vec<String> = Vec::new();
     for server in listed {
         let Ok(url) = Url::parse(server.trim()) else { continue };
+        #[cfg(test)]
+        if tests::LOCAL_SERVERS.get() && feeds::is_local_address(&url) {
+            servers.push(server.trim().trim_end_matches('/').to_string());
+            continue;
+        }
         // Not servers only another network reaches (.onion, unless files go
         // through Tor; .i2p): they would only fail, after giving their name
         // to the DNS server.
@@ -497,7 +533,16 @@ fn blossom_servers(listed: Vec<String>, route: Route) -> Vec<String> {
 
 fn is_page(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
-    lower != "/404.html" && PAGE_ENDINGS.iter().any(|end| lower.ends_with(end))
+    !lower.ends_with("/404.html") && PAGE_ENDINGS.iter().any(|end| lower.ends_with(end))
+}
+
+/// Whether a page is the same page as a folder's `index.html` beside it
+/// (`/a.html` next to `/a/index.html`, as site builders like VitePress make
+/// them): only the folder's is shown, not each page twice.
+fn is_copy(path: &str, files: &Files) -> bool {
+    path.strip_suffix(".html")
+        .filter(|stem| !stem.ends_with("/index"))
+        .is_some_and(|stem| files.contains_key(&format!("{stem}/index.html")))
 }
 
 /// Where a page is on the gateway: a folder's `index.html` is the folder.
@@ -522,7 +567,7 @@ fn page(path: &str, text: &str, link: &str) -> (Option<String>, String) {
         let title = text.lines().find_map(|l| l.strip_prefix("# ")).map(|t| t.trim().to_string());
         return (title.filter(|t| !t.is_empty()), base + &html::markdown_to_html(text));
     }
-    (html_title(text), base + text)
+    (html_title(text), base + &html::without_hidden(html::main_part(text)))
 }
 
 /// The text of an HTML page's `<title>`.
@@ -569,6 +614,10 @@ async fn own_feed(blobs: &Blobs<'_>, files: &Files, base: &str) -> Result<Option
 /// can't be found are left out too.
 #[cfg(not(target_arch = "wasm32"))]
 async fn outside_local_network(servers: Vec<String>) -> Vec<String> {
+    #[cfg(test)]
+    if tests::LOCAL_SERVERS.get() {
+        return servers;
+    }
     let mut kept = Vec::new();
     for server in servers {
         let Ok(url) = Url::parse(&server) else { continue };
@@ -651,8 +700,121 @@ impl Blobs<'_> {
 mod tests {
     use super::*;
 
+    thread_local! {
+        /// Lets this thread's test read files from a Blossom server on this
+        /// device, which sites can't otherwise point Feedstr at.
+        pub(super) static LOCAL_SERVERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
     fn tag(values: &[&str]) -> Vec<String> {
         values.iter().map(|v| v.to_string()).collect()
+    }
+
+    /// A Blossom server on this device with `files`, by their SHA-256.
+    fn blossom_server(files: Vec<&'static str>) -> String {
+        use std::io::{Read, Write};
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", server.local_addr().unwrap());
+        let files: HashMap<String, &str> = files.into_iter().map(|f| (docs::sha256_hex(f), f)).collect();
+        std::thread::spawn(move || {
+            for mut stream in server.incoming().flatten() {
+                let mut request = [0; 4096];
+                let n = stream.read(&mut request).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..n]).to_string();
+                let path = request.split_whitespace().nth(1).unwrap_or("/").trim_start_matches('/').to_string();
+                let answer = match files.get(&path) {
+                    Some(body) => {
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+                    }
+                    None => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string(),
+                };
+                let _ = stream.write_all(answer.as_bytes());
+            }
+        });
+        url
+    }
+
+    /// Publishes `kind` events by `keys` to `relay`, each with its tags.
+    async fn publish(relay: &str, keys: &Keys, kind: u16, events: Vec<Vec<Vec<String>>>) {
+        let client = Client::default();
+        client.add_relay(relay).await.unwrap();
+        client.connect().await;
+        for tags in events {
+            let tags = tags.into_iter().map(|t| Tag::parse(t).unwrap());
+            let unsigned = EventBuilder::new(Kind::from(kind), "").tags(tags).finalize_unsigned(keys.public_key());
+            let event = keys.sign_event(unsigned).unwrap();
+            client.send_event(&event).await.unwrap();
+        }
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_site_is_read_and_its_changed_pages_show_up_as_new() {
+        LOCAL_SERVERS.set(true);
+        let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+        let relay_url = relay.url().await.to_string();
+        let index = "<html><head><title>Home</title></head><body><a href=\"about.html\">About</a></body></html>";
+        let about = "<html><head><title>About</title></head><body>First version</body></html>";
+        let about2 = "<html><head><title>About</title></head><body>Second version</body></html>";
+        let blossom = blossom_server(vec![index, about, about2]);
+        let keys = Keys::generate();
+        let path = |p: &str, file: &str| tag(&["path", p, &docs::sha256_hex(file)]);
+        publish(&relay_url, &keys, SERVER_LIST, vec![vec![tag(&["server", &blossom])]]).await;
+        publish(&relay_url, &keys, ROOT_SITE, vec![vec![path("/index.html", index), path("/about.html", about)]]).await;
+
+        let site = Site { author: keys.public_key(), name: None };
+        let url = site.feed_url();
+        let base = site.web_url("nsite.run");
+        let reader = longform::Reader::new(vec![relay_url.clone()], None);
+        let (http, db) = (feeds::http_client_builder(Route::Direct).build().unwrap(), Db::open_memory().unwrap());
+        let fetched = fetch(&reader, &http, Route::Direct, &db, &url, "nsite.run", None).await.unwrap();
+        let feed = fetched.feed.unwrap();
+        let version = fetched.version.expect("every page read");
+        assert_eq!(feed.items.len(), 2);
+        let home = feed.items.iter().find(|(guid, _)| guid.starts_with("/index.html ")).unwrap();
+        assert_eq!(home.1.link, format!("{base}/"));
+        // A relative link leads to the page on the gateway.
+        assert!(home.1.content.contains(&format!("{base}/")), "{}", home.1.content);
+        db.set_subscribed(&url, true).unwrap();
+        db.store_fetched(&url, &feed.title, &feed.site, &feed.items).unwrap();
+
+        // Unchanged: nothing to read.
+        let again = fetch(&reader, &http, Route::Direct, &db, &url, "nsite.run", Some(&version)).await.unwrap();
+        assert!(again.feed.is_none());
+
+        // A changed page is a new article; the unchanged one stays as it was.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        publish(&relay_url, &keys, ROOT_SITE, vec![vec![path("/index.html", index), path("/about.html", about2)]])
+            .await;
+        let changed = fetch(&reader, &http, Route::Direct, &db, &url, "nsite.run", Some(&version)).await.unwrap();
+        let guids: Vec<String> = changed.feed.unwrap().items.into_iter().map(|(guid, _)| guid).collect();
+        assert!(guids.contains(&format!("/about.html {}", docs::sha256_hex(about2))), "{guids:?}");
+        assert!(!guids.contains(&format!("/about.html {}", docs::sha256_hex(about))), "{guids:?}");
+        assert!(guids.contains(&format!("/index.html {}", docs::sha256_hex(index))), "{guids:?}");
+    }
+
+    #[tokio::test]
+    async fn an_older_site_has_an_event_per_file() {
+        LOCAL_SERVERS.set(true);
+        let relay = nostr_sdk::local_relay::MockRelay::run().await.unwrap();
+        let relay_url = relay.url().await.to_string();
+        let index = "<html><head><title>Old home</title></head><body>Hello</body></html>";
+        let blossom = blossom_server(vec![index]);
+        let keys = Keys::generate();
+        publish(&relay_url, &keys, SERVER_LIST, vec![vec![tag(&["server", &blossom])]]).await;
+        // Kind 34128: the path in `d`, the file's hash in `x`.
+        let hash = docs::sha256_hex(index);
+        publish(&relay_url, &keys, LEGACY_FILE, vec![vec![tag(&["d", "/index.html"]), tag(&["x", &hash])]]).await;
+
+        let site = Site { author: keys.public_key(), name: None };
+        let reader = longform::Reader::new(vec![relay_url], None);
+        assert!(exists(&reader, &site).await.unwrap());
+        let (http, db) = (feeds::http_client_builder(Route::Direct).build().unwrap(), Db::open_memory().unwrap());
+        let fetched = fetch(&reader, &http, Route::Direct, &db, &site.feed_url(), "nsite.run", None).await.unwrap();
+        let items = fetched.feed.unwrap().items;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].0, format!("/index.html {hash}"));
+        assert_eq!(items[0].1.title, "Old home");
     }
 
     #[test]
@@ -703,6 +865,13 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert_eq!(files["/Post.MD"], (hash.clone(), 5));
         assert!(is_page("/Post.MD") && is_page("/index.html") && !is_page("/404.html") && !is_page("/style.css"));
+        assert!(!is_page("/docs/404.html"));
+        let files: Files = ["/a.html", "/a/index.html", "/b.html", "/index.html"]
+            .into_iter()
+            .map(|path| (path.to_string(), (String::new(), 0)))
+            .collect();
+        assert!(is_copy("/a.html", &files));
+        assert!(!is_copy("/a/index.html", &files) && !is_copy("/b.html", &files) && !is_copy("/index.html", &files));
     }
 
     #[test]
@@ -743,6 +912,31 @@ mod tests {
         assert_eq!(page_link("https://x.gw", "/a b\"c.html"), "https://x.gw/a%20b%22c.html");
         assert_eq!(page_link("https://x.gw", "//evil.example/x.html"), "https://x.gw//evil.example/x.html");
         assert_eq!(page_link("https://x.gw", "/../../up.html"), "https://x.gw/up.html");
+    }
+
+    #[test]
+    fn stored_pages_lead_to_the_gateway_set() {
+        let site = Site { author: Keys::generate().public_key(), name: None };
+        let feed = site.feed_url();
+        let old = site.web_url("nsite.lol");
+        let new = site.web_url("nsite.run");
+        let link = format!("{old}/posts/");
+        assert_eq!(link_on_gateway(&feed, &link, "nsite.run"), format!("{new}/posts/"));
+        assert_eq!(link_on_gateway(&feed, &old, "nsite.run"), new);
+        let text =
+            format!(r#"<a href="{old}/a.html">A</a> <a href="{old}">home</a> <a href="https://x.example/">x</a>"#);
+        let moved =
+            format!(r#"<a href="{new}/a.html">A</a> <a href="{new}">home</a> <a href="https://x.example/">x</a>"#);
+        assert_eq!(on_gateway(&feed, &link, &text, "nsite.run"), moved);
+        // Already on it, another site's link, or not an nsite: left as it is.
+        assert_eq!(link_on_gateway(&feed, &format!("{new}/posts/"), "nsite.run"), format!("{new}/posts/"));
+        let other = Site { author: Keys::generate().public_key(), name: None }.web_url("nsite.lol");
+        assert_eq!(link_on_gateway(&feed, &other, "nsite.run"), other);
+        assert_eq!(link_on_gateway("https://example.com/feed.xml", &link, "nsite.run"), link);
+        // A named site's address too.
+        let named = Site { author: site.author, name: Some("blog".into()) };
+        let link = format!("{}/p", named.web_url("nsite.lol"));
+        assert_eq!(link_on_gateway(&named.feed_url(), &link, "nsite.run"), format!("{}/p", named.web_url("nsite.run")));
     }
 
     #[test]

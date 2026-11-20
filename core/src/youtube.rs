@@ -6,7 +6,7 @@
 //! kind of upload; the one starting `UULF` instead of `UC` holds only the
 //! regular videos, and has a feed of its own.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use reqwest::Url;
 
 use crate::feeds;
@@ -89,10 +89,12 @@ pub async fn look_up(http: &reqwest::Client, url: &ChannelUrl) -> Result<Channel
         }
         // The ID is enough to subscribe; the name comes with the first fetch.
         (ChannelUrl::Id(id), Err(_)) => Ok(Channel { id: id.clone(), name: None }),
-        (ChannelUrl::Page(_), Err(e)) if cfg!(target_arch = "wasm32") => Err(e).context(
+        // The browser's own error (it blocks the request) says nothing more,
+        // and comes with a JavaScript stack trace: left out.
+        (ChannelUrl::Page(_), Err(_)) if cfg!(target_arch = "wasm32") => Err(anyhow!(
             "browsers can't read YouTube's pages. Paste the channel's RSS feed or its youtube.com/channel/UC… \
-             address instead, or add it on another device",
-        ),
+             address instead, or add it on another device"
+        )),
         (ChannelUrl::Page(_), Err(e)) => Err(e),
     }
 }

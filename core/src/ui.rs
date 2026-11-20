@@ -129,6 +129,8 @@ enum Dialog {
         busy: bool,
         error: Option<String>,
         focus: bool,
+        /// The help (behind “?”) is shown.
+        help: bool,
     },
     /// Subscribing to a YouTube channel pasted into [`Dialog::AddFeed`].
     Youtube {
@@ -142,6 +144,15 @@ enum Dialog {
     RenameCategory {
         from: String,
         to: String,
+    },
+    RenameFeed {
+        url: String,
+        /// The name it's shown with now.
+        shown: String,
+        name: String,
+        /// Whether it has a name of the user's (which an empty one undoes).
+        named: bool,
+        focus: bool,
     },
     NewCategory {
         url: String,
@@ -179,31 +190,30 @@ enum Dialog {
 
 #[derive(Clone, Copy, PartialEq)]
 enum SettingsTab {
-    Account,
+    Appearance,
     Sync,
     Filters,
     Report,
     Socials,
     Proxies,
     Data,
-    Appearance,
+    About,
 }
 
 impl SettingsTab {
     const ALL: [SettingsTab; 8] = [
-        Self::Account,
+        Self::Appearance,
         Self::Sync,
         Self::Filters,
         Self::Report,
         Self::Socials,
         Self::Proxies,
         Self::Data,
-        Self::Appearance,
+        Self::About,
     ];
 
     fn label(self) -> &'static str {
         match self {
-            Self::Account => "Account",
             Self::Sync => "Sync",
             Self::Filters => "Filters",
             Self::Report => "Feed report",
@@ -211,6 +221,7 @@ impl SettingsTab {
             Self::Proxies => "Tor & I2P",
             Self::Data => "Import & export",
             Self::Appearance => "Appearance",
+            Self::About => "About",
         }
     }
 }
@@ -283,6 +294,8 @@ pub struct App {
     /// How far along what the status says is under way (a sync, say) is, from
     /// 0 to 1, with the status it goes with: a newer status hides it.
     progress: Option<(String, f32)>,
+    /// A sync is under way (the Sync button cancels it).
+    syncing: bool,
     /// Signing in again (at startup, or after changing relays) failed.
     sign_in_problem: Option<String>,
     npub: String,
@@ -386,6 +399,7 @@ impl App {
             settings: None,
             status: "Connecting…".into(),
             progress: None,
+            syncing: false,
             sign_in_problem: None,
             npub: String::new(),
             view: View::All,
@@ -561,6 +575,7 @@ impl App {
                     self.dialog = Some(Dialog::ConfirmSignOut);
                 }
                 Msg::Status(status) => self.status = status,
+                Msg::Syncing(syncing) => self.syncing = syncing,
                 Msg::Progress(status, done) => {
                     self.progress = Some((status.clone(), done));
                     self.status = status;
@@ -858,9 +873,16 @@ impl App {
                 ui.label(RichText::new("Feedstr").size(18.0).strong());
                 ui.add_space(12.0);
             }
-            let hint = "Download changes from relays, fetch all feeds, then upload changes (R)";
-            if ui.button(if self.narrow { "⟳" } else { "⟳  Sync" }).on_hover_text(hint).clicked() {
-                self.send(Cmd::SyncNow);
+            if self.syncing {
+                let hint = "Stop syncing: what was done so far is kept, the rest is done next time";
+                if ui.button(if self.narrow { "✖" } else { "✖  Cancel" }).on_hover_text(hint).clicked() {
+                    self.send(Cmd::CancelSync);
+                }
+            } else {
+                let hint = "Download changes from relays, fetch all feeds, then upload changes (R)";
+                if ui.button(if self.narrow { "⟳" } else { "⟳  Sync" }).on_hover_text(hint).clicked() {
+                    self.send(Cmd::SyncNow);
+                }
             }
             if ui.button(if self.narrow { "✚" } else { "✚  Add feed" }).clicked() {
                 let category = match &self.view {
@@ -874,12 +896,13 @@ impl App {
                     busy: false,
                     error: None,
                     focus: true,
+                    help: false,
                 });
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.button("⚙").on_hover_text("Settings").clicked() {
                     self.settings = Some(SettingsPage {
-                        tab: SettingsTab::Account,
+                        tab: SettingsTab::Appearance,
                         new_relay: String::new(),
                         show_key: false,
                         new_filter: String::new(),
@@ -1015,6 +1038,10 @@ impl App {
                 self.dialog = Some(Dialog::NewCategory { url, name: String::new(), focus: true })
             }
             Some(FeedAction::Rename(from)) => self.dialog = Some(Dialog::RenameCategory { to: from.clone(), from }),
+            Some(FeedAction::RenameFeed(url, shown)) => {
+                let named = self.db.name(&url).is_ok_and(|name| !name.is_empty());
+                self.dialog = Some(Dialog::RenameFeed { name: shown.clone(), url, shown, named, focus: true });
+            }
             Some(FeedAction::RemoveCategory(name)) => self.rename_category(&name, ""),
             Some(FeedAction::SetSynced(name, synced)) if self.db.set_category_synced(&name, synced).is_ok() => {
                 self.reload();
@@ -1107,8 +1134,8 @@ impl App {
     /// The view's title, with the buttons that act on the whole view.
     fn list_header(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
-            let title = self.view_title(&self.view);
-            ui.add(Label::new(RichText::new(title).size(16.0).strong()).truncate());
+            // The buttons first, from the right, so a long title only gets the
+            // space left of them (and is cut short there).
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 // Every unread article in the view (matching the search), not just those listed.
                 let (mut all, mut older) = (false, false);
@@ -1143,6 +1170,11 @@ impl App {
                 if let Some(layout) = chosen {
                     self.set_layout(layout);
                 }
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    // (Cut short, it shows in full on hover.)
+                    let title = self.view_title(&self.view);
+                    ui.add(Label::new(RichText::new(title).size(16.0).strong()).truncate());
+                });
             });
         });
     }
@@ -1511,13 +1543,18 @@ impl App {
             ui.set_max_height(max_height);
             ScrollArea::vertical().max_height(max_height).show(ui, |ui| {
                 match &mut dialog {
-                    Dialog::AddFeed { input, category, route, busy, error, focus } => {
-                        ui.label(RichText::new("Add a feed").size(18.0).strong());
-                        let hint = "Paste a feed address or a website that has one, like a YouTube channel. \
-                                    Gemini feeds (gemini://…) work too. For a Nostr writer's long-form posts, \
-                                    paste their npub or NIP-05 address (like name@example.com); for their \
-                                    website on Nostr (an nsite), nsite:npub1… or its address on a gateway.";
-                        ui.add(Label::new(RichText::new(hint).weak()).wrap());
+                    Dialog::AddFeed { input, category, route, busy, error, focus, help } => {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Add a feed").size(18.0).strong());
+                            ui.toggle_value(help, "?").on_hover_text("What can be added");
+                        });
+                        if *help {
+                            ui.add_space(4.0);
+                            for paragraph in ADD_FEED_HELP {
+                                ui.add(Label::new(RichText::new(*paragraph).weak()).wrap());
+                                ui.add_space(4.0);
+                            }
+                        }
                         ui.add_space(8.0);
                         let edit =
                             TextEdit::singleline(input).hint_text("https://example.com").desired_width(f32::INFINITY);
@@ -1614,6 +1651,36 @@ impl App {
                             {
                                 self.reload();
                                 open = false;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                open = false;
+                            }
+                        });
+                    }
+                    Dialog::RenameFeed { url, shown, name, named, focus } => {
+                        ui.add(Label::new(RichText::new(format!("Rename “{shown}”")).size(18.0).strong()).wrap());
+                        ui.add_space(8.0);
+                        let response = ui.add(
+                            TextEdit::singleline(name).char_limit(db::MAX_NAME_BYTES / 4).desired_width(f32::INFINITY),
+                        );
+                        focus_on_open(&response, focus);
+                        let enter = response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                        let hint = if *named {
+                            "Leave it empty to go back to the feed's own name. Synced to your other devices."
+                        } else {
+                            "Updates to the feed won't change it. Synced to your other devices."
+                        };
+                        ui.add(Label::new(RichText::new(hint).small().weak()).wrap());
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            // Emptied, it goes back to the feed's own name (if it had another).
+                            let valid = !name.trim().is_empty() || *named;
+                            if (ui.add_enabled(valid, primary_button("Rename")).clicked() || enter) && valid {
+                                let unchanged = name.trim() == shown.trim();
+                                if unchanged || self.db.set_name(url, name).is_ok() {
+                                    self.reload();
+                                    open = false;
+                                }
                             }
                             if ui.button("Cancel").clicked() {
                                 open = false;
@@ -1864,14 +1931,17 @@ impl App {
                             ui.label(RichText::new(page.tab.label()).size(22.0).strong());
                             ui.add_space(12.0);
                             match page.tab {
-                                SettingsTab::Account => self.account_settings(ui, &mut page.show_key),
-                                SettingsTab::Sync => self.sync_settings(ui, &mut page.new_relay),
+                                SettingsTab::Sync => {
+                                    self.account_settings(ui, &mut page.show_key);
+                                    self.sync_settings(ui, &mut page.new_relay);
+                                }
                                 SettingsTab::Filters => self.filter_settings(ui, &mut page),
                                 SettingsTab::Report => self.feed_report(ui, &mut page.report),
                                 SettingsTab::Socials => self.socials_settings(ui, &mut page),
                                 SettingsTab::Proxies => self.proxy_settings(ui, &mut page),
                                 SettingsTab::Data => self.data_settings(ui),
                                 SettingsTab::Appearance => self.appearance_settings(ui),
+                                SettingsTab::About => about(ui),
                             }
                             ui.add_space(32.0);
                         });
@@ -1930,7 +2000,10 @@ impl App {
         }
         match nsite::parse_gateway(&page.nsite_gateway) {
             Some(gateway) if gateway != nsite::gateway(&self.db) => {
-                let _ = nsite::set_gateway(&self.db, &gateway);
+                // The articles' links change with it.
+                if nsite::set_gateway(&self.db, &gateway).is_ok() {
+                    self.reload();
+                }
             }
             Some(_) => {}
             None => {
@@ -2031,9 +2104,9 @@ impl App {
     }
 
     fn socials_settings(&mut self, ui: &mut Ui, page: &mut SettingsPage) {
-        let hint = "Feedstr can follow long-form posts (NIP-23) from Nostr. To follow one writer, use “Add feed” \
-                    with their npub or NIP-05 address (like name@example.com); you don't need to follow them on \
-                    Nostr.";
+        let hint = "Separate from following an individual Nostr NIP-23 blog, if enabled, this displays all longform \
+                    blog posts from users you follow using standard Nostr. Adding a user as a feed does not update \
+                    your Nostr follow list, and is separate from standard follows.";
         ui.add(Label::new(RichText::new(hint).weak()).wrap());
         ui.add_space(16.0);
         ui.label(RichText::new("Everyone you follow").strong());
@@ -2049,8 +2122,6 @@ impl App {
             }
             self.reload();
         }
-        let hint = "Uses the follow list from your other Nostr apps.";
-        ui.add(Label::new(RichText::new(hint).small().weak()).wrap());
         if on {
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
@@ -2077,13 +2148,9 @@ impl App {
         }
         ui.add_space(16.0);
         ui.label(RichText::new("Websites on Nostr (nsites)").strong());
-        let hint = "Follow someone's nsite with “Add feed”: paste nsite:npub1… or the site's address on a \
-                    gateway. Feedstr reads the site from Nostr and its files from Blossom servers; if the site \
-                    has a feed of its own, that is used, otherwise new and changed pages show up as articles.";
-        ui.add(Label::new(RichText::new(hint).weak()).wrap());
-        ui.add_space(8.0);
+        ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
-            ui.label("Open pages on");
+            ui.label("Default nsite http gateway:");
             // Saved once typing is done (see `save_addresses`).
             let edit = TextEdit::singleline(&mut page.nsite_gateway).hint_text(nsite::DEFAULT_GATEWAY);
             if ui.add(edit.desired_width(220.0)).changed() {
@@ -2093,18 +2160,14 @@ impl App {
         if let Some(error) = page.gateway_error {
             ui.colored_label(ui.visuals().error_fg_color, error);
         }
-        let hint = "The gateway that shows nsites on the web, for the links of their pages (on this device, \
-                    from the next update of each site on).";
-        ui.add(Label::new(RichText::new(hint).small().weak()).wrap());
     }
 
     /// This device's Tor and I2P proxies, for feeds fetched through them.
     fn proxy_settings(&mut self, ui: &mut Ui, page: &mut SettingsPage) {
         let hint = |ui: &mut Ui, text: &str| ui.add(Label::new(RichText::new(text).small().weak()).wrap());
-        let intro = "A feed can be fetched through Tor or I2P instead of directly: choose it when adding the \
-                     feed, or from the feed's menu in the sidebar. Addresses ending in .onion always go through \
-                     Tor, and those ending in .i2p through I2P. Such a feed is never fetched directly: if the \
-                     proxy can't be reached, fetching it fails.";
+        let intro = ".Onion and .I2P domains are automatically fetched through Tor and I2P respectively, and feeds \
+                     can be manually set to run through Tor/I2P on a per feed basis. Requires a (separately \
+                     installed) Tor/I2P router, see Settings > About > Help for more info.";
         ui.add(Label::new(RichText::new(intro).weak()).wrap());
         ui.add_space(8.0);
         if cfg!(target_arch = "wasm32") {
@@ -2115,8 +2178,7 @@ impl App {
             );
             return;
         }
-        hint(ui, "These are this device's own proxies; each of your devices has its own.");
-        ui.add_space(12.0);
+        ui.add_space(4.0);
         let mut everything = proxy::tor_everything(&self.db);
         if ui.checkbox(&mut everything, "Send everything through Tor").changed()
             && proxy::set_tor_everything(&self.db, everything).is_ok()
@@ -2126,13 +2188,7 @@ impl App {
             self.remote.network_changed();
             self.reload();
         }
-        hint(
-            ui,
-            "Every connection Feedstr makes on this device then goes through Tor: feeds (whatever each one is \
-             set to), nsites, looking up addresses, and Nostr relays, for syncing and for remote signers. Only \
-             .i2p sites go through I2P instead. If Tor isn't running, nothing is fetched or synced. Opening an \
-             article in your browser isn't covered: that's up to the browser.",
-        );
+        hint(ui, "Forces all connections, aside from I2P connections, to go through Tor.");
         ui.add_space(12.0);
         let fields = [
             (
@@ -2260,7 +2316,9 @@ impl App {
         ui.add(Label::new(RichText::new("Ctrl + and Ctrl − change it too; Ctrl 0 resets.").small().weak()).wrap());
     }
 
+    /// The account synced with, at the top of the Sync settings.
     fn account_settings(&mut self, ui: &mut Ui, show_key: &mut bool) {
+        ui.label(RichText::new("Account").strong());
         ui.add(Label::new(RichText::new(&self.npub).monospace().small()).truncate());
         ui.horizontal_wrapped(|ui| {
             if ui.button("Copy public key").clicked() {
@@ -2296,6 +2354,9 @@ impl App {
         if ui.add(delete).on_hover_text(hint).clicked() {
             self.dialog = Some(Dialog::ConfirmErase { understood: false, busy: false, error: None });
         }
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(12.0);
     }
 
     fn data_settings(&mut self, ui: &mut Ui) {
@@ -2360,23 +2421,17 @@ impl App {
             if minutes != current {
                 let _ = self.db.set_meta("sync_minutes", &minutes.to_string());
                 self.send(Cmd::ScheduleChanged);
+                if self.status == worker::MANUAL_STATUS {
+                    self.status.clear();
+                }
             }
         });
-        hint(
-            ui,
-            if worker::manual_sync(&self.db) {
-                "Feedstr only syncs when you use the Sync button (or press R). Your changes stay on this device until then."
-            } else if cfg!(target_arch = "wasm32") {
-                "Feedstr syncs when the page opens (unless it synced less than 10 minutes ago), and saves your \
-                 changes to relays a few seconds after you make them."
-            } else if cfg!(target_os = "android") {
-                "Feedstr syncs when it starts (unless it synced less than 10 minutes ago), and saves your \
-                 changes to relays when you leave it."
-            } else {
-                "Feedstr syncs when it starts (unless it synced less than 10 minutes ago), and saves your \
-                 changes to relays when you close it."
-            },
-        );
+        if worker::manual_sync(&self.db) {
+            hint(
+                ui,
+                "Feedstr only syncs when you use the Sync button (or press R). Your changes stay on this device until then.",
+            );
+        }
 
         ui.add_space(12.0);
         ui.label(RichText::new("Relays").strong());
@@ -2414,7 +2469,6 @@ impl App {
             let _ = worker::set_relays(&self.db, &relays);
             self.send(Cmd::RelaysChanged);
         }
-        hint(ui, "Unless you change them, Feedstr uses its default relays, and updates to Feedstr can change those.");
 
         ui.add_space(12.0);
         let categories = self.categories.clone();
@@ -2524,6 +2578,8 @@ enum FeedAction {
     /// Asks for a new category name for a feed.
     NewCategory(String),
     Rename(String),
+    /// Asks for a new name for a feed.
+    RenameFeed(String, String),
     RemoveCategory(String),
     /// Syncs a category, or keeps it on this device only.
     SetSynced(String, bool),
@@ -2614,6 +2670,9 @@ fn feed_row(
         }
         if ui.button("Mark older as read…").clicked() {
             *action = Some(FeedAction::MarkOlderRead(view));
+        }
+        if ui.button("Rename…").clicked() {
+            *action = Some(FeedAction::RenameFeed(feed.url.clone(), feed.title.clone()));
         }
         ui.menu_button("Move to category", |ui| {
             for name in categories.iter().filter(|c| **c != feed.category) {
@@ -2817,7 +2876,10 @@ fn route_picker(ui: &mut Ui, input: &str, route: &mut Route, busy: bool) {
     }
     let address = if input.contains("://") { input.to_string() } else { format!("http://{input}") };
     if let Some(required) = Route::required_by(&address) {
-        let text = format!("Fetched through {}, as its address requires", required.badge());
+        let text = match required {
+            Route::I2p => "I2P URLs are always fetched through I2P, see settings for more info",
+            _ => "Onion URLs are always fetched through Tor, see settings for more info",
+        };
         ui.label(RichText::new(text).weak());
         return;
     }
@@ -2847,6 +2909,44 @@ fn route_picker(ui: &mut Ui, input: &str, route: &mut Route, busy: bool) {
     }
 }
 
+/// The version shown in About (the same as `versionName` in
+/// droid/app/build.gradle.kts, and the Flatpak's newest release in
+/// flatpak/top.dns7.feedstr.Feedstr.metainfo.xml).
+const VERSION: &str = "v0.1";
+
+/// What Feedstr is, and where to read more.
+fn about(ui: &mut Ui) {
+    ui.label(RichText::new(format!("Feedstr {VERSION}")).strong());
+    ui.add_space(8.0);
+    let text = "Feedstr: mildly improved reading for RSS & more. A feed reader, written in Rust, that syncs \
+                feeds via the decentralized protocol Nostr.";
+    ui.add(Label::new(text).wrap());
+    ui.add_space(12.0);
+    for (name, url) in [
+        ("Website", "https://feedstr.dns7.top/"),
+        ("Source Code", "https://github.com/0n4t3/feedstr/"),
+        ("Help", "https://feedstr.dns7.top/usage/"),
+    ] {
+        ui.hyperlink_to(name, url).on_hover_text(url);
+    }
+}
+
+/// What “Add feed” takes, shown behind its “?”.
+const ADD_FEED_HELP: &[&str] = &[
+    "Add a new feed. For RSS aim to add the feed URL directly, but if you add a root domain Feedstr will try to \
+     locate the feed on it. RSS is supported for standard HTTP sites, Gemini Pods, and NSites.",
+    "YouTube channels can be added with their URL (youtube.com/c/username or youtube.com/@username), and will \
+     prompt you to follow all content or just standard videos (filtering out livestreams/shorts) when being added.",
+    "Nostr NIP-23 blogs can be added with an NPUB or NIP-05 username. NSites can be added with nsite:NPUB or a \
+     gateway url. NSites will track RSS updates if an RSS feed is detected, or list all new or updated pages when \
+     changes are detected if there's no RSS.",
+    "Tor & I2P URLs will auto resolve using their respective routers, assuming you have them installed and \
+     running. See Settings > About > Help for more info.",
+    "Due to browser sandboxing limitations, feeds (outside of Nostr NIP 23) cannot be fetched from the web \
+     client. Though you can add a feed from the web client, you will be unable to fetch its contents until after \
+     it's been synced on a PC or Phone.",
+];
+
 fn primary_button(text: &str) -> Button<'_> {
     Button::new(RichText::new(text).color(Color32::WHITE)).fill(ACCENT)
 }
@@ -2869,12 +2969,16 @@ fn item_row(ui: &mut Ui, item: &ItemRow, selected: bool) -> egui::Response {
             if item.unread {
                 ui.label(RichText::new("●").small().color(ACCENT));
             }
-            ui.add(Label::new(RichText::new(&item.feed_title).small().weak()).truncate());
+            // The date first, from the right, so a long feed name only gets
+            // the space left of it (and is cut short there).
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.label(RichText::new(format_date(item.published, false)).small().weak());
                 if item.fav {
                     ui.label(RichText::new("★").small().color(ACCENT));
                 }
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    ui.add(Label::new(RichText::new(&item.feed_title).small().weak()).truncate());
+                });
             });
         });
         let title = RichText::new(item_title(&item.title));

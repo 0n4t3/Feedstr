@@ -629,8 +629,12 @@ mod client {
             let connect = tokio_socks::tcp::Socks5Stream::connect_with_password(proxy, target, &user, "x");
             match tokio::time::timeout(TOR_CONNECT_TIMEOUT, connect).await {
                 Ok(Ok(stream)) => Ok(stream.into_inner()),
+                // (Refused connections to the proxy come back as "unreachable".)
+                Ok(Err(tokio_socks::Error::ProxyServerUnreachable)) => {
+                    bail!("couldn't reach the Tor proxy at {proxy} (is it running?)")
+                }
                 Ok(Err(tokio_socks::Error::Io(e))) => {
-                    bail!("couldn't reach Tor at {proxy} (is it running?): {e}")
+                    bail!("couldn't reach the Tor proxy at {proxy} (is it running?): {e}")
                 }
                 Ok(Err(e)) => bail!("couldn't connect to {capsule} through Tor: {e}"),
                 Err(_) => bail!("couldn't connect to {capsule} through Tor: it took too long"),

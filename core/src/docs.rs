@@ -6,7 +6,7 @@
 //! | d-tag                               | document         |
 //! |-------------------------------------|------------------|
 //! | `feedstr:subscriptions`             | [`Subscriptions`] without feeds |
-//! | `feedstr:<h("feeds:<0..16>")>`      | [`Subscriptions`] with only the feeds (and their categories and routes) in that shard |
+//! | `feedstr:<h("feeds:<0..16>")>`      | [`Subscriptions`] with only the feeds (and their categories, routes and names) in that shard |
 //! | `feedstr:<h("state:<0..32>")>`      | [`StateShard`]    |
 //! | `feedstr:<h("items:<feed url>")>`   | [`FeedItems`]     |
 //!
@@ -62,6 +62,10 @@ pub struct Subscriptions {
     /// the feed list, in the same shards.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub routes: BTreeMap<String, Lww<String>>,
+    /// Feed URL -> the name the user gave it ("" for the feed's own title).
+    /// Synced with the feed list, in the same shards.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub names: BTreeMap<String, Lww<String>>,
     /// How much of each feed is cached on relays; `None` means the defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<Lww<CacheLimits>>,

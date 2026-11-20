@@ -6,7 +6,7 @@
 //! to Manual Only ([`MANUAL_SYNC`]), only [`Cmd::SyncNow`], signing in and
 //! signing out talk to relays.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc;
@@ -59,6 +59,9 @@ pub(crate) fn fetchable(url: &str) -> bool {
 fn proxy_hint(e: anyhow::Error, route: Route) -> anyhow::Error {
     let refused = e.chain().any(|cause| {
         cause.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == std::io::ErrorKind::ConnectionRefused)
+            // What reqwest's SOCKS connector says (and all it says) when it
+            // can't connect to the proxy itself.
+            || cause.to_string().ends_with("failed to create underlying connection")
     });
     match route {
         Route::Direct => e,
@@ -215,6 +218,8 @@ pub enum Cmd {
     },
     /// Runs a sync cycle now.
     SyncNow,
+    /// Stops the sync under way, if there is one (see [`Worker::adding_meanwhile`]).
+    CancelSync,
     AddFeed {
         input: String,
         category: String,
@@ -272,6 +277,8 @@ pub enum Msg {
     /// Signing out was refused because changes couldn't be saved to relays.
     LogoutBlocked,
     Status(String),
+    /// A sync started (`true`) or ended, so it can be cancelled meanwhile.
+    Syncing(bool),
     /// Like [`Msg::Status`], for something under way: how far along it is, from 0 to 1.
     Progress(String, f32),
     FeedAdded(Result<String, String>),
@@ -331,6 +338,9 @@ pub fn sync_minutes(db: &Db) -> u32 {
 
 /// Whether syncing is Manual Only: nothing is downloaded or uploaded unless
 /// the Sync button (or R) is used, not at start, in the background or on closing.
+/// Shown on starting with "Manual only" (and cleared on leaving it).
+pub const MANUAL_STATUS: &str = "Manual only: Sync to sync now";
+
 pub fn manual_sync(db: &Db) -> bool {
     sync_minutes(db) == MANUAL_SYNC
 }
@@ -340,6 +350,14 @@ pub fn manual_sync(db: &Db) -> bool {
 fn has_changes(db: &Db) -> bool {
     let uploaded = db.meta("uploaded_rev").ok().flatten().and_then(|r| r.parse::<i64>().ok());
     uploaded.is_none_or(|uploaded| db.revision().ok() != Some(uploaded))
+}
+
+/// The next command for the worker: those put off during a sync first.
+async fn next_command(later: &mut VecDeque<Cmd>, rx: &mut UnboundedReceiver<Cmd>) -> Option<Cmd> {
+    match later.pop_front() {
+        Some(cmd) => Some(cmd),
+        None => rx.recv().await,
+    }
 }
 
 /// The worker's side of the app: commands go in, messages come out. Sending
@@ -441,7 +459,9 @@ struct Worker {
     proxied: proxy::Clients,
     nostr: Option<NostrTransport>,
     /// Reads long-form posts; made when first needed.
-    reader: tokio::sync::Mutex<Option<Arc<longform::Reader>>>,
+    /// With the proxy it connects through, so a change to that (turning on
+    /// "everything through Tor" during a fetch) makes a new one at once.
+    reader: tokio::sync::Mutex<Option<(Arc<longform::Reader>, crate::nostr::RelayProxy)>>,
     msg_tx: mpsc::Sender<Msg>,
     ctx: eframe::egui::Context,
     /// Becomes true when the app is closing.
@@ -454,6 +474,10 @@ struct Worker {
     kept_running: std::cell::Cell<bool>,
     /// The [`Lifecycle::network`] count the relay connections were made with.
     network_seen: std::cell::Cell<u64>,
+    /// Feeds being added, and how many have been (see [`Worker::adding`]):
+    /// to tell when one was added while changes were being uploaded.
+    adds_running: std::cell::Cell<u32>,
+    adds_done: std::cell::Cell<u64>,
 }
 
 impl Worker {
@@ -481,6 +505,8 @@ impl Worker {
             life: Arc::default(),
             kept_running: std::cell::Cell::new(false),
             network_seen: std::cell::Cell::new(0),
+            adds_running: std::cell::Cell::new(0),
+            adds_done: std::cell::Cell::new(0),
         }
     }
 
@@ -501,18 +527,20 @@ impl Worker {
         let mut next_cycle = self.next_cycle();
         // When to try again after a failed upload in the browser.
         let mut retry_at = 0;
+        // Commands that came in during a sync and wait for it (see [`Worker::adding_meanwhile`]).
+        let mut later = VecDeque::new();
         loop {
             // Nothing left to do (for now): the app needn't be kept running.
-            if self.kept_running.get() && rx.is_empty() {
+            if self.kept_running.get() && rx.is_empty() && later.is_empty() {
                 self.platform.keep_running(false);
                 self.set_kept_running(false);
             }
             // A sync can bring a relay list changed on another device.
-            if self.nostr.as_ref().is_some_and(|nostr| nostr.relays() != relays(&self.db)) {
+            if self.nostr.as_ref().is_some_and(|nostr| nostr.relays_asked_for() != relays(&self.db)) {
                 self.reconnect().await;
             }
             tokio::select! {
-                cmd = rx.recv() => {
+                cmd = next_command(&mut later, &mut rx) => {
                     let Some(cmd) = cmd else { break };
                     match cmd {
                         Cmd::Login(login) => match (matches!(login, Login::Saved), self.login_with_retries(login).await) {
@@ -524,10 +552,10 @@ impl Worker {
                                 // Signing in on purpose always syncs; starting up only when it's
                                 // automatic, and not again right after the last time.
                                 if !saved || (!manual_sync(&self.db) && self.auto_sync_due()) {
-                                    self.cycle(false).await;
+                                    self.adding_meanwhile(&mut rx, &mut later, self.cycle(false)).await;
                                 } else if manual_sync(&self.db) {
                                     // Replaces "Connecting to relays…", which would stay up otherwise.
-                                    self.status("Manual only: Sync to sync now");
+                                    self.status(MANUAL_STATUS);
                                 } else {
                                     self.status("Synced less than 10 minutes ago: Sync to sync again now");
                                 }
@@ -536,33 +564,14 @@ impl Worker {
                             (_, Err(e)) => self.send(Msg::LoginFailed(format!("{e:#}"))),
                         },
                         Cmd::Logout { force } => self.logout(force).await,
+                        // Nothing is syncing (a sync takes it in `adding_meanwhile`).
+                        Cmd::CancelSync => {}
                         Cmd::SyncNow => {
-                            self.cycle(false).await;
+                            self.adding_meanwhile(&mut rx, &mut later, self.cycle(false)).await;
                             next_cycle = self.next_cycle();
                         }
-                        // Adding and fetching feeds go on if the app is left meanwhile.
-                        Cmd::AddFeed { input, category, route } => {
-                            self.keep_running();
-                            let result = self.add_feed(&input, &category, route).await.map_err(|e| format!("{e:#}"));
-                            self.send(Msg::FeedAdded(result));
-                            self.send(Msg::Changed);
-                        }
-                        Cmd::LookUpYoutube(input) => {
-                            self.keep_running();
-                            self.status("Looking up the channel…");
-                            let result = match youtube::channel_url(&input) {
-                                Some(url) => self.look_up_youtube(&url).await.map_err(|e| format!("{e:#}")),
-                                None => Err("that is not a YouTube channel's address".to_string()),
-                            };
-                            self.status(if result.is_ok() { "" } else { "Looking up the channel failed" });
-                            self.send(Msg::YoutubeChannel(result));
-                        }
-                        Cmd::AddYoutube { channel, videos_only, category } => {
-                            self.keep_running();
-                            let url = channel.feed_url(videos_only);
-                            let result = self.subscribe(&url, &category, channel.name.as_deref(), None).await;
-                            self.send(Msg::FeedAdded(result.map(|()| url).map_err(|e| format!("{e:#}"))));
-                            self.send(Msg::Changed);
+                        cmd @ (Cmd::AddFeed { .. } | Cmd::LookUpYoutube(_) | Cmd::AddYoutube { .. }) => {
+                            self.adding(cmd).await;
                         }
                         Cmd::RelaysChanged => self.reconnect().await,
                         Cmd::TrustCapsule(url) => {
@@ -587,7 +596,7 @@ impl Worker {
                         Cmd::Resumed { away_ms } => {
                             let long = away_ms > RESUME_SYNC_AFTER.as_millis() as i64;
                             if long && !manual_sync(&self.db) && self.auto_sync_due() {
-                                self.cycle(false).await;
+                                self.adding_meanwhile(&mut rx, &mut later, self.cycle(false)).await;
                                 next_cycle = self.next_cycle();
                             }
                         }
@@ -621,16 +630,109 @@ impl Worker {
                     }
                 }
                 _ = clock::sleep(Duration::from_millis((next_cycle - now_ms()).max(0) as u64)) => {
-                    self.cycle(true).await;
+                    self.adding_meanwhile(&mut rx, &mut later, self.cycle(true)).await;
                     next_cycle = self.next_cycle();
                 }
                 _ = upload_tick(), if self.nostr.is_some() && !manual_sync(&self.db) => {
-                    if self.has_changes() && now_ms() >= retry_at && !self.push(true).await {
+                    if self.has_changes() && now_ms() >= retry_at && !self.adding_meanwhile(&mut rx, &mut later, self.push(true)).await.unwrap_or(false) {
                         retry_at = now_ms() + UPLOAD_RETRY.as_millis() as i64;
                     }
                 }
             }
         }
+    }
+
+    /// Adding a feed ([`Cmd::AddFeed`], [`Cmd::LookUpYoutube`] and
+    /// [`Cmd::AddYoutube`]), which may run while a sync does.
+    async fn adding(&self, cmd: Cmd) {
+        // Adding and fetching feeds go on if the app is left meanwhile.
+        self.keep_running();
+        self.adds_running.set(self.adds_running.get() + 1);
+        match cmd {
+            Cmd::AddFeed { input, category, route } => {
+                let result = self.add_feed(&input, &category, route).await.map_err(|e| format!("{e:#}"));
+                self.send(Msg::FeedAdded(result));
+                self.send(Msg::Changed);
+            }
+            Cmd::LookUpYoutube(input) => {
+                self.status("Looking up the channel…");
+                let result = match youtube::channel_url(&input) {
+                    Some(url) => self.look_up_youtube(&url).await.map_err(|e| format!("{e:#}")),
+                    None => Err("that is not a YouTube channel's address".to_string()),
+                };
+                self.status(if result.is_ok() { "" } else { "Looking up the channel failed" });
+                self.send(Msg::YoutubeChannel(result));
+            }
+            Cmd::AddYoutube { channel, videos_only, category } => {
+                let url = channel.feed_url(videos_only);
+                let new = !self.db.subscribed_feeds().is_ok_and(|feeds| feeds.contains(&url));
+                let mut result = self.subscribe(&url, &category, channel.name.as_deref(), None).await;
+                if videos_only {
+                    result = result.context(
+                        "couldn't read the channel's regular videos (it may have none): try without \
+                         \"Hide livestreams and Shorts\"",
+                    );
+                }
+                // As with other feeds, one that can't be read isn't added (a channel
+                // with no regular videos has no `UULF` feed): the dialog says why,
+                // and stays open to try again without "Hide livestreams and Shorts".
+                if result.is_err() && new {
+                    let _ = self.db.set_subscribed(&url, false);
+                }
+                self.send(Msg::FeedAdded(result.map(|()| url).map_err(|e| format!("{e:#}"))));
+                self.send(Msg::Changed);
+            }
+            _ => {}
+        }
+        self.adds_running.set(self.adds_running.get() - 1);
+        self.adds_done.set(self.adds_done.get() + 1);
+    }
+
+    /// Runs `work` (a sync) while adding the feeds asked for meanwhile, so
+    /// the Add feed dialog doesn't wait for the sync to finish. Other
+    /// commands wait in `later`, in order, as they would have in `rx`.
+    ///
+    /// [`Cmd::CancelSync`] stops `work` where it is waiting (on a relay or a
+    /// feed), giving `None`. That leaves nothing half done: the database is
+    /// only written between those waits, and everything synced is merged
+    /// field by field, so what was cut short is done again by the next sync
+    /// (as when a sync stops because the network changed).
+    async fn adding_meanwhile<T>(
+        &self,
+        rx: &mut UnboundedReceiver<Cmd>,
+        later: &mut VecDeque<Cmd>,
+        work: impl Future<Output = T>,
+    ) -> Option<T> {
+        self.send(Msg::Syncing(true));
+        // Boxed, so it can be dropped here (a cancelled sync lets go of what it holds).
+        let mut work = Box::pin(work);
+        let mut adds = futures::stream::FuturesUnordered::new();
+        let mut open = true;
+        let done = loop {
+            tokio::select! {
+                done = &mut work => break Some(done),
+                Some(()) = adds.next(), if !adds.is_empty() => {}
+                cmd = rx.recv(), if open => match cmd {
+                    Some(cmd @ (Cmd::AddFeed { .. } | Cmd::LookUpYoutube(_) | Cmd::AddYoutube { .. })) => {
+                        adds.push(self.adding(cmd));
+                    }
+                    Some(Cmd::CancelSync) => break None,
+                    Some(cmd) => later.push_back(cmd),
+                    None => open = false,
+                },
+            }
+        };
+        // Dropped before the feeds being added finish, so a cancelled sync
+        // stops now.
+        drop(work);
+        if done.is_none() {
+            self.status("Sync cancelled: what was done so far is kept, the rest is done next time");
+            self.send(Msg::Changed);
+        }
+        self.send(Msg::Syncing(false));
+        // Feeds still being added finish here (they borrow the worker).
+        while adds.next().await.is_some() {}
+        done
     }
 
     /// Connects to the relays in the (changed) relay list.
@@ -693,10 +795,18 @@ impl Worker {
     /// Publishes everything waiting. Returns whether it was all saved.
     async fn push(&self, throttle_feed_caches: bool) -> bool {
         self.keep_running();
+        let no_adds = || self.adds_running.get() == 0;
+        let (adds, no_adds_before) = (self.adds_done.get(), no_adds());
         let saved = self.sync(Options { publish: true, throttle_feed_caches }).await.saved;
         // What the sync merged was published too, so this is the revision after it.
         // Kept in the database, so a restart doesn't upload again with nothing changed.
-        if saved && let Ok(revision) = self.db.revision() {
+        // Not if a feed was being added meanwhile, which may have missed the
+        // upload: the next one sends it.
+        let alone = no_adds_before && no_adds() && self.adds_done.get() == adds;
+        if saved
+            && alone
+            && let Ok(revision) = self.db.revision()
+        {
             let _ = self.db.set_meta("uploaded_rev", &revision.to_string());
         }
         saved
@@ -892,7 +1002,7 @@ impl Worker {
         let mut site = nsite::Site::parse_input(input);
         if let Some(found) = &site
             && !nsite::is_nsite(input.trim())
-            && !nsite::exists(&*self.reader().await?, found).await
+            && !nsite::exists(&*self.reader().await?, found).await?
         {
             site = None;
         }
@@ -1032,7 +1142,34 @@ impl Worker {
         Ok(())
     }
 
+    /// Fetches a feed. If how this device connects changes meanwhile
+    /// (everything was just sent through Tor, say), what's under way stops at
+    /// once, rather than go on over its old connections, and the feed is
+    /// fetched again the new way. (Nothing is stored until a fetch is done.)
     async fn fetch_feed(&self, url: &str) -> Result<()> {
+        loop {
+            let seen = self.life.network.load(Ordering::Relaxed);
+            tokio::select! {
+                result = self.fetch_feed_once(url) => return result,
+                () = self.network_change_since(seen) => {}
+            }
+        }
+    }
+
+    /// Returns once how this device connects has changed since `seen` (see
+    /// [`Remote::network_changed`]).
+    async fn network_change_since(&self, seen: u64) {
+        loop {
+            // Made before checking, so a change in between still wakes it.
+            let wake = self.life.network_changed.notified();
+            if self.life.network.load(Ordering::Relaxed) != seen {
+                return;
+            }
+            wake.await;
+        }
+    }
+
+    async fn fetch_feed_once(&self, url: &str) -> Result<()> {
         if longform::is_nostr(url) {
             // Articles from other devices' caches don't count: each device
             // reads the full history once, then only what's new.
@@ -1065,7 +1202,7 @@ impl Worker {
                 }
                 (Err(e), _) | (_, Err(e)) => Err(e),
             };
-            return match fetched {
+            return match fetched.map_err(|e| proxy_hint(e, route)) {
                 Ok(fetched) => {
                     // Nothing new if the site hasn't changed since last time.
                     if let Some(feed) = fetched.feed {
@@ -1150,11 +1287,14 @@ impl Worker {
     /// relays are then not asked at all, rather than directly.
     async fn reader(&self) -> Result<Arc<longform::Reader>> {
         let mut reader = self.reader.lock().await;
-        if let Some(reader) = reader.as_ref() {
+        let via = proxy::relay_proxy(&self.db)?;
+        if let Some((reader, made_via)) = reader.as_ref()
+            && *made_via == via
+        {
             return Ok(reader.clone());
         }
-        let made = Arc::new(longform::Reader::new(relays(&self.db), proxy::relay_proxy(&self.db)?));
-        Ok(reader.insert(made).clone())
+        let made = Arc::new(longform::Reader::new(relays(&self.db), via));
+        Ok(reader.insert((made, via)).0.clone())
     }
 
     /// At a fresh sign-in: turns on the follows feed if the account follows
@@ -1281,18 +1421,9 @@ impl Worker {
             self.status("Connecting to relays the new way…");
             return outcome;
         }
-        let stop = async {
-            loop {
-                let wake = self.life.network_changed.notified();
-                if changed() {
-                    return;
-                }
-                wake.await;
-            }
-        };
         let synced = tokio::select! {
             result = sync::sync_reporting(&self.db, nostr, options, &progress) => Some(result),
-            () = stop => None,
+            () = self.network_change_since(seen) => None,
         };
         let Some(synced) = synced else {
             // Everything synced is merged field by field: what was cut short
@@ -1305,7 +1436,10 @@ impl Worker {
                 outcome = SyncOutcome { saved: report.relays_ok > 0 && report.problems.is_empty() };
                 let time = chrono::Local::now().format("%H:%M");
                 let mut status = format!("Synced at {time} · {}/{} relays", report.relays_ok, report.relays_total);
-                if report.relays_ok == 0 {
+                if report.relays_total == 0 && proxy::relay_proxy(&self.db).is_ok_and(|via| via.is_some()) {
+                    status = "Sync failed: none of your relays can be used through Tor (unencrypted ws:// ones aren't)"
+                        .into();
+                } else if report.relays_ok == 0 {
                     status = "Sync failed: no relay reachable".into();
                 }
                 if !report.problems.is_empty() {
@@ -1454,6 +1588,10 @@ mod tests {
     struct Ran {
         statuses: Vec<String>,
         kept_running: Vec<bool>,
+        /// For each feed added: how many statuses had come before, and whether it worked.
+        added: Vec<(usize, bool)>,
+        /// Each sync starting (`true`) and ending.
+        syncing: Vec<bool>,
     }
 
     impl Ran {
@@ -1496,15 +1634,17 @@ mod tests {
             send(&remote);
             drop(remote);
             worker.run(rx).await;
-            let statuses = msgs
-                .try_iter()
-                .filter_map(|msg| match msg {
-                    Msg::Status(text) => Some(text),
-                    _ => None,
-                })
-                .collect();
+            let (mut statuses, mut added, mut syncing) = (Vec::new(), Vec::new(), Vec::new());
+            for msg in msgs.try_iter() {
+                match msg {
+                    Msg::Status(text) => statuses.push(text),
+                    Msg::FeedAdded(result) => added.push((statuses.len(), result.is_ok())),
+                    Msg::Syncing(on) => syncing.push(on),
+                    _ => {}
+                }
+            }
             let kept_running = platform.kept_running.lock().unwrap().clone();
-            Ran { statuses, kept_running }
+            Ran { statuses, kept_running, added, syncing }
         }
 
         fn synced_minutes_ago(&self, minutes: i64) {
@@ -1619,7 +1759,103 @@ mod tests {
         app.synced_minutes_ago(60);
         let ran = app.run(start).await;
         assert!(!ran.synced());
-        assert_eq!(ran.statuses.last().unwrap(), "Manual only: Sync to sync now");
+        assert_eq!(ran.statuses.last().unwrap(), MANUAL_STATUS);
+    }
+
+    /// A feed server on this device answering every request with `feed`,
+    /// after `delay`. Returns the feed's address.
+    fn feed_server(delay: Duration, feed: &'static str) -> String {
+        use std::io::{Read, Write};
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/feed.xml", server.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for mut stream in server.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let _ = stream.read(&mut [0; 4096]);
+                    std::thread::sleep(delay);
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/rss+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        feed.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(feed.as_bytes());
+                });
+            }
+        });
+        url
+    }
+
+    const FEED: &str = "<?xml version=\"1.0\"?><rss version=\"2.0\"><channel><title>T</title>\
+        <item><title>A</title><link>https://example.com/a</link><guid>a</guid></item></channel></rss>";
+
+    #[tokio::test]
+    async fn a_feed_is_added_without_waiting_for_a_sync() {
+        let app = TestApp::new().await;
+        // A feed that takes a while, so the sync's fetching does too.
+        app.db().set_subscribed(&feed_server(Duration::from_secs(3), FEED), true).unwrap();
+        let quick = feed_server(Duration::ZERO, FEED);
+        let ran = app
+            .run(|remote| {
+                remote.tx.send(Cmd::SyncNow).unwrap();
+                let add = Cmd::AddFeed { input: quick.clone(), category: String::new(), route: Route::Direct };
+                remote.tx.send(add).unwrap();
+            })
+            .await;
+        let synced = ran.statuses.iter().rposition(|s| s.starts_with("Synced at")).expect("synced");
+        assert_eq!(ran.added.len(), 1, "{:?}", ran.statuses);
+        let (statuses_before, ok) = ran.added[0];
+        assert!(ok);
+        assert!(statuses_before <= synced, "added after the sync: {:?}", ran.statuses);
+        assert!(app.db().subscribed_feeds().unwrap().contains(&quick));
+    }
+
+    #[tokio::test]
+    async fn a_sync_can_be_cancelled() {
+        let app = TestApp::new().await;
+        // A feed that would keep the sync fetching for a long time.
+        let slow = feed_server(Duration::from_secs(60), FEED);
+        app.db().set_subscribed(&slow, true).unwrap();
+        let started = std::time::Instant::now();
+        let ran = app
+            .run(|remote| {
+                remote.tx.send(Cmd::SyncNow).unwrap();
+                // Cancelled while the feed is being fetched.
+                let tx = remote.tx.clone();
+                tokio::spawn(async move {
+                    clock::sleep(Duration::from_secs(1)).await;
+                    tx.send(Cmd::CancelSync).unwrap();
+                });
+            })
+            .await;
+        assert!(started.elapsed() < Duration::from_secs(20), "the sync wasn't stopped");
+        assert!(ran.statuses.last().unwrap().starts_with("Sync cancelled"), "{:?}", ran.statuses);
+        assert_eq!(ran.syncing, [true, false]);
+        // Not a complete sync, so it doesn't count as the last one.
+        assert!(app.db().meta("synced_at").unwrap().is_none());
+        // The next sync runs as ever.
+        app.db().set_subscribed(&slow, false).unwrap();
+        let ran = app.run(|remote| remote.tx.send(Cmd::SyncNow).unwrap()).await;
+        assert!(ran.statuses.last().unwrap().starts_with("Synced at"), "{:?}", ran.statuses);
+        assert!(app.db().meta("synced_at").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_relay_left_out_through_tor_doesnt_reconnect_forever() {
+        let app = TestApp::new().await;
+        // The test relay is ws://, which isn't used through Tor: none is left.
+        app.db().set_meta("tor_everything", "1").unwrap();
+        let ran = app
+            .run(|remote| {
+                remote.tx.send(Cmd::Login(Login::Saved)).unwrap();
+                remote.tx.send(Cmd::SyncNow).unwrap();
+            })
+            .await;
+        // Connected once, not again before every command.
+        assert_eq!(ran.statuses.iter().filter(|s| *s == "Connecting to relays…").count(), 1, "{:?}", ran.statuses);
+        assert_eq!(
+            ran.statuses.last().unwrap(),
+            "Sync failed: none of your relays can be used through Tor (unencrypted ws:// ones aren't)"
+        );
     }
 
     #[tokio::test]

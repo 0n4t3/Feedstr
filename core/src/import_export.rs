@@ -180,6 +180,7 @@ impl Backup {
         subscriptions.feeds.values_mut().for_each(|v| cap(&mut v.1));
         subscriptions.categories.values_mut().for_each(|v| cap(&mut v.1));
         subscriptions.routes.values_mut().for_each(|v| cap(&mut v.1));
+        subscriptions.names.values_mut().for_each(|v| cap(&mut v.1));
         subscriptions.filters.values_mut().for_each(|v| cap(&mut v.1));
         subscriptions.cache.iter_mut().for_each(|v| cap(&mut v.1));
         for feed in self.feeds.values_mut() {

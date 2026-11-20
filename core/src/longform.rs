@@ -112,8 +112,7 @@ impl Reader {
     pub async fn fetch_author(&self, author: PublicKey, newest: Option<i64>) -> Result<Feed> {
         let session = Session::new(&self.index, self.via).await;
         let feed = session.author(author, newest).await;
-        session.client.shutdown().await;
-        feed
+        session.finish(feed, |feed| feed.items.is_empty()).await
     }
 
     /// Whether `user`'s Nostr follow list has anyone in it.
@@ -130,26 +129,29 @@ impl Reader {
     /// `author`'s events matching each of `filters`, read from the relays
     /// they publish to and the user's, with their name if they have one.
     /// Used for nsites (see [`crate::nsite`]).
-    pub(crate) async fn events_by(&self, author: PublicKey, filters: Vec<Filter>) -> (Vec<Event>, Option<String>) {
+    pub(crate) async fn events_by(
+        &self,
+        author: PublicKey,
+        filters: Vec<Filter>,
+    ) -> Result<(Vec<Event>, Option<String>)> {
         let session = Session::new(&self.index, self.via).await;
         let (relays, mut names) = session.authors(&[author]).await;
         let sources = history_sources(relays.get(&author).map_or(&[][..], |r| r), &self.index);
         let found = futures::future::join_all(filters.into_iter().map(|filter| session.query(&sources, filter))).await;
-        session.client.shutdown().await;
-        (found.into_iter().flatten().collect(), names.remove(&author))
+        let found = Ok((found.into_iter().flatten().collect::<Vec<_>>(), names.remove(&author)));
+        session.finish(found, |(events, _)| events.is_empty()).await
     }
 
     /// Every event of `kind` by `author` that their relays and the user's
     /// have, read page by page (relays cap how many they send at once). Used
     /// for older nsites, which have an event per file (see [`crate::nsite`]).
-    pub(crate) async fn every_event_by(&self, author: PublicKey, kind: Kind) -> Vec<Event> {
+    pub(crate) async fn every_event_by(&self, author: PublicKey, kind: Kind) -> Result<Vec<Event>> {
         let session = Session::new(&self.index, self.via).await;
         let (relays, _) = session.authors(&[author]).await;
         let sources = history_sources(relays.get(&author).map_or(&[][..], |r| r), &self.index);
         let base = Filter::new().kind(kind).author(author);
         let pages = futures::future::join_all(sources.iter().map(|relay| session.every(relay, base.clone()))).await;
-        session.client.shutdown().await;
-        pages.into_iter().flatten().collect()
+        session.finish(Ok(pages.into_iter().flatten().collect::<Vec<_>>()), Vec::is_empty).await
     }
 
     /// Long-form posts by everyone `user` follows, newer than about the
@@ -157,8 +159,7 @@ impl Reader {
     pub async fn fetch_follows(&self, user: PublicKey, newest: Option<i64>) -> Result<Feed> {
         let session = Session::new(&self.index, self.via).await;
         let feed = session.follows(user, newest).await;
-        session.client.shutdown().await;
-        feed
+        session.finish(feed, |feed| feed.items.is_empty()).await
     }
 }
 
@@ -169,6 +170,7 @@ struct Session {
     /// How long to wait for relays: longer through Tor.
     connect_timeout: Duration,
     timeout: Duration,
+    via: RelayProxy,
 }
 
 impl Session {
@@ -179,7 +181,23 @@ impl Session {
         }
         let (connect_timeout, timeout) =
             if via.is_some() { (TOR_CONNECT_TIMEOUT, TOR_TIMEOUT) } else { (CONNECT_TIMEOUT, TIMEOUT) };
-        Self { client, index: index.to_vec(), connect_timeout, timeout }
+        Self { client, index: index.to_vec(), connect_timeout, timeout, via }
+    }
+
+    /// Closes the connections, and passes on what was found, unless it
+    /// came to nothing (`empty`, or an error) because no relay could be
+    /// reached: then that's the error, not "nothing found" (when Tor isn't
+    /// running, say).
+    async fn finish<T>(self, found: Result<T>, empty: impl FnOnce(&T) -> bool) -> Result<T> {
+        let reached = self.client.relays().await.values().any(|relay| relay.status().is_connected());
+        self.client.shutdown().await;
+        if reached || found.as_ref().is_ok_and(|found| !empty(found)) {
+            return found;
+        }
+        match self.via {
+            Some(proxy) => bail!("couldn't reach any relay through the Tor proxy at {proxy} (is it running?)"),
+            None => bail!("couldn't reach any relay"),
+        }
     }
 
     /// Events matching `filter` on these relays. Best effort: relays that
@@ -526,6 +544,16 @@ mod tests {
         // ...or the user's follow list.
         assert!(!reader.follows_anyone(user).await);
         assert!(reader.fetch_follows(user, None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn no_relay_reached_is_an_error_not_nothing_found() {
+        // Nothing listens on port 9 (discard) here: the connection is refused.
+        let reader = Reader { index: vec!["ws://127.0.0.1:9".into()], via: None };
+        let user = Keys::generate().public_key();
+        let Err(error) = reader.fetch_author(user, None).await else { panic!("no relay was reached") };
+        assert!(format!("{error:#}").contains("couldn't reach any relay"), "{error:#}");
+        assert!(reader.events_by(user, vec![Filter::new().author(user)]).await.is_err());
     }
 
     /// Open TCP connections to or from a local port (Linux).

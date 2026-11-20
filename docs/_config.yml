@@ -1,4 +1,7 @@
 title: Feedstr
+# Served at its own domain (the CNAME file), from the domain's root.
+url: "https://feedstr.dns7.top"
+baseurl: ""
 description: Mildly improved reading. A feed reader, written in Rust, that syncs your feeds over the decentralized Nostr protocol.
 
 # The site uses its own theme: _layouts/, _includes/ and assets/css/paper.css.

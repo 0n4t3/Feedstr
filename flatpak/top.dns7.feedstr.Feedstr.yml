@@ -1,7 +1,10 @@
 # Flatpak of the desktop app, for building and installing locally:
 #   flatpak-builder --user --install-deps-from=flathub --install --force-clean build-dir flatpak/top.dns7.feedstr.Feedstr.yml
 # (run from the repository root). Not ready for Flathub: it downloads crates during the build.
+# The version shown is the newest release in top.dns7.feedstr.Feedstr.metainfo.xml, kept the
+# same as the Android app's (droid/app/build.gradle.kts).
 id: top.dns7.feedstr.Feedstr
+branch: stable
 runtime: org.freedesktop.Platform
 runtime-version: '26.08'
 sdk: org.freedesktop.Sdk
@@ -40,4 +43,6 @@ modules:
       - cargo build --release -p feedstr
       - install -Dm755 target/release/feedstr /app/bin/feedstr
       - install -Dm644 flatpak/top.dns7.feedstr.Feedstr.desktop -t /app/share/applications
+      - install -Dm644 flatpak/top.dns7.feedstr.Feedstr.metainfo.xml -t /app/share/metainfo
       - install -Dm644 logo.svg /app/share/icons/hicolor/scalable/apps/top.dns7.feedstr.Feedstr.svg
+      - install -Dm644 LICENSE -t /app/share/licenses/top.dns7.feedstr.Feedstr

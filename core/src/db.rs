@@ -127,10 +127,22 @@ const MIGRATIONS: &[&str] = &[
      ALTER TABLE feeds ADD COLUMN route_t INTEGER NOT NULL DEFAULT 0;
      ALTER TABLE sync_shadow ADD COLUMN route TEXT NOT NULL DEFAULT '';
      ALTER TABLE sync_shadow ADD COLUMN route_t INTEGER NOT NULL DEFAULT 0;",
+    // A name the user gave the feed ('' for its own title), synced like
+    // routes. Fetching the feed never changes it.
+    "ALTER TABLE feeds ADD COLUMN name TEXT NOT NULL DEFAULT '';
+     ALTER TABLE feeds ADD COLUMN name_t INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE sync_shadow ADD COLUMN name TEXT NOT NULL DEFAULT '';
+     ALTER TABLE sync_shadow ADD COLUMN name_t INTEGER NOT NULL DEFAULT 0;",
 ];
 
 /// Longer route values from other devices are ignored (they're short names).
 const MAX_ROUTE_BYTES: usize = 32;
+/// Feed names longer than this are cut (here) or ignored (from other devices).
+pub const MAX_NAME_BYTES: usize = 400;
+
+/// SQL expression: the name a feed `f` is shown with: the one the user gave
+/// it, or else its own title.
+const SHOWN_TITLE: &str = "CASE WHEN f.name != '' THEN f.name ELSE f.title END";
 
 /// SQL: keys of the items of feeds kept on this device (Local Only).
 const LOCAL_KEYS: &str = "(SELECT key FROM items WHERE feed_url IN (SELECT url FROM sync_shadow))";
@@ -163,6 +175,15 @@ pub fn state_rev(shard: u8) -> String {
 
 pub fn items_rev(feed_url: &str) -> String {
     format!("items:{feed_url}")
+}
+
+/// `text` cut to at most `max` bytes, at a character boundary.
+fn cut(text: &str, max: usize) -> &str {
+    let mut end = text.len().min(max);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 fn bump(conn: &Connection, target: &str) -> rusqlite::Result<()> {
@@ -492,6 +513,28 @@ impl Db {
         Ok(tx.commit()?)
     }
 
+    /// Names a feed; an empty name goes back to the feed's own title. Synced,
+    /// unless the feed is kept on this device only.
+    pub fn set_name(&self, url: &str, name: &str) -> Result<()> {
+        let name = cut(name.trim(), MAX_NAME_BYTES);
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE feeds SET name = ?2, name_t = max(?3, name_t + 1) WHERE url = ?1",
+            params![url, name, self.clock()?],
+        )?;
+        bump(&tx, SUBSCRIPTIONS_REV)?;
+        Ok(tx.commit()?)
+    }
+
+    /// The name the user gave a feed ("" for none).
+    pub fn name(&self, url: &str) -> Result<String> {
+        Ok(self
+            .conn
+            .query_row("SELECT name FROM feeds WHERE url = ?1", [url], |r| r.get(0))
+            .optional()?
+            .unwrap_or_default())
+    }
+
     /// How a feed is fetched, as stored ("" directly; see `proxy::Route`).
     pub fn route(&self, url: &str) -> Result<String> {
         Ok(self
@@ -543,9 +586,10 @@ impl Db {
     /// on (so other devices drop it), while this device keeps its own view.
     fn keep_local(&self, url: &str) -> Result<()> {
         self.conn.execute(
-            // The route already shared (if any) is passed on as it is.
-            "INSERT INTO sync_shadow (url, subscribed, sub_t, category, category_t, route, route_t)
-             SELECT url, 0, max(?2, sub_t + 1), '', max(?2, category_t + 1), route, route_t FROM feeds WHERE url = ?1
+            // The route and name already shared (if any) are passed on as they are.
+            "INSERT INTO sync_shadow (url, subscribed, sub_t, category, category_t, route, route_t, name, name_t)
+             SELECT url, 0, max(?2, sub_t + 1), '', max(?2, category_t + 1), route, route_t, name, name_t
+             FROM feeds WHERE url = ?1
              ON CONFLICT (url) DO NOTHING",
             params![url, self.clock()?],
         )?;
@@ -569,7 +613,10 @@ impl Db {
                 category_t = max(?2, category_t + 1, coalesce((SELECT category_t FROM sync_shadow WHERE url = ?1), 0) + 1),
                 route_t = CASE WHEN route = '' AND route_t = 0
                     AND coalesce((SELECT route_t FROM sync_shadow WHERE url = ?1), 0) = 0 THEN 0
-                    ELSE max(?2, route_t + 1, coalesce((SELECT route_t FROM sync_shadow WHERE url = ?1), 0) + 1) END
+                    ELSE max(?2, route_t + 1, coalesce((SELECT route_t FROM sync_shadow WHERE url = ?1), 0) + 1) END,
+                name_t = CASE WHEN name = '' AND name_t = 0
+                    AND coalesce((SELECT name_t FROM sync_shadow WHERE url = ?1), 0) = 0 THEN 0
+                    ELSE max(?2, name_t + 1, coalesce((SELECT name_t FROM sync_shadow WHERE url = ?1), 0) + 1) END
              WHERE url = ?1",
             params![url, self.clock()?],
         )?;
@@ -749,13 +796,14 @@ impl Db {
     /// newest item is older than `days`. Failing feeds first, then the stalest.
     pub fn feed_report(&self, days: u32) -> Result<Vec<ReportRow>> {
         let cutoff = now_ms() / 1000 - days as i64 * DAY_SECS;
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT url, title, error, latest, (SELECT value FROM meta WHERE key = ?2 || url) FROM (
-                SELECT f.url, f.title, f.error, (SELECT max(published) FROM items WHERE feed_url = f.url) AS latest
+                SELECT f.url, {SHOWN_TITLE} AS title, f.error,
+                    (SELECT max(published) FROM items WHERE feed_url = f.url) AS latest
                 FROM feeds f WHERE f.subscribed = 1)
              WHERE error IS NOT NULL OR latest IS NULL OR latest < ?1
              ORDER BY error IS NULL, coalesce(latest, 0), lower(title)",
-        )?;
+        ))?;
         let rows = stmt.query_map(params![cutoff, crate::gemini::changed_key("")], |r| {
             let url: String = r.get(0)?;
             let title: String = r.get(1)?;
@@ -820,12 +868,12 @@ impl Db {
 
     pub fn feeds(&self) -> Result<Vec<FeedRow>> {
         let sql = format!(
-            "SELECT f.url, f.title, f.error,
+            "SELECT f.url, {SHOWN_TITLE}, f.error,
                 (SELECT count(*) FROM items i LEFT JOIN state s ON s.key = i.key
                  WHERE i.feed_url = f.url AND {UNREAD} AND {VISIBLE}),
                 f.category, f.url IN (SELECT url FROM sync_shadow), f.route
              FROM feeds f WHERE f.subscribed = 1
-             ORDER BY f.category = '', lower(f.category), lower(f.title), f.url"
+             ORDER BY f.category = '', lower(f.category), lower({SHOWN_TITLE}), f.url"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map([unread_cutoff()], |r| {
@@ -881,7 +929,7 @@ impl Db {
         let (filter, value) = view_filter(view);
         let unread = if unread_only { UNREAD } else { "1" };
         let sql = format!(
-            "SELECT i.key, CASE WHEN i.feed_url = ?4 AND i.author != '' THEN i.author ELSE f.title END,
+            "SELECT i.key, CASE WHEN i.feed_url = ?4 AND i.author != '' THEN i.author ELSE {SHOWN_TITLE} END,
                 i.title, i.link, i.author, i.published, {UNREAD}, coalesce(s.fav, 0), f.url,
                 substr(i.content, 1, 1500)
              FROM items i JOIN feeds f ON f.url = i.feed_url LEFT JOIN state s ON s.key = i.key
@@ -889,13 +937,16 @@ impl Db {
              ORDER BY i.published DESC LIMIT ?5"
         );
         let mut stmt = self.conn.prepare(&sql)?;
+        let gateway = crate::nsite::gateway(self);
         let map = |r: &Row| {
             let feed_title: String = r.get(1)?;
+            let feed_url: String = r.get(8)?;
+            let link: String = r.get(3)?;
             Ok(ItemRow {
                 key: r.get(0)?,
-                feed_title: if feed_title.is_empty() { r.get(8)? } else { feed_title },
+                link: crate::nsite::link_on_gateway(&feed_url, &link, &gateway),
+                feed_title: if feed_title.is_empty() { feed_url } else { feed_title },
                 title: r.get(2)?,
-                link: r.get(3)?,
                 author: r.get(4)?,
                 published: r.get(5)?,
                 unread: r.get(6)?,
@@ -962,8 +1013,12 @@ impl Db {
         Ok(self.conn.query_row(sql, [key], read_item).optional()?)
     }
 
+    /// An item's text, as the reader shows it (an nsite's links on the gateway set).
     pub fn item_content(&self, key: &str) -> Result<String> {
-        Ok(self.conn.query_row("SELECT content FROM items WHERE key = ?1", [key], |r| r.get(0))?)
+        let sql = "SELECT content, link, feed_url FROM items WHERE key = ?1";
+        let (content, link, feed): (String, String, String) =
+            self.conn.query_row(sql, [key], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(crate::nsite::on_gateway(&feed, &link, &content, &crate::nsite::gateway(self)))
     }
 
     // ---- Feed fetching ----
@@ -1254,6 +1309,7 @@ impl Db {
             feeds: BTreeMap::new(),
             categories: BTreeMap::new(),
             routes: BTreeMap::new(),
+            names: BTreeMap::new(),
             ..self.subscriptions_doc()?
         })
     }
@@ -1264,7 +1320,14 @@ impl Db {
         doc.feeds.retain(|url, _| docs::feed_shard_of(url) == shard);
         doc.categories.retain(|url, _| docs::feed_shard_of(url) == shard);
         doc.routes.retain(|url, _| docs::feed_shard_of(url) == shard);
-        Ok(Subscriptions { feeds: doc.feeds, categories: doc.categories, routes: doc.routes, ..Default::default() })
+        doc.names.retain(|url, _| docs::feed_shard_of(url) == shard);
+        Ok(Subscriptions {
+            feeds: doc.feeds,
+            categories: doc.categories,
+            routes: doc.routes,
+            names: doc.names,
+            ..Default::default()
+        })
     }
 
     /// This device's own view, including feeds it doesn't share (for backups).
@@ -1277,13 +1340,15 @@ impl Db {
         let (own, shadow) = if shared {
             (
                 "url NOT IN (SELECT url FROM sync_shadow)",
-                "UNION ALL SELECT url, subscribed, sub_t, category, category_t, route, route_t FROM sync_shadow",
+                "UNION ALL SELECT url, subscribed, sub_t, category, category_t, route, route_t, name, name_t
+                 FROM sync_shadow",
             )
         } else {
             ("1", "")
         };
         let rows = format!(
-            "SELECT url, subscribed, sub_t, category, category_t, route, route_t FROM feeds WHERE {own} {shadow}"
+            "SELECT url, subscribed, sub_t, category, category_t, route, route_t, name, name_t
+             FROM feeds WHERE {own} {shadow}"
         );
         let mut stmt = self.conn.prepare(&format!("SELECT url, subscribed, sub_t FROM ({rows}) WHERE sub_t > 0"))?;
         let feeds = stmt.query_map([], |r| Ok((r.get(0)?, Lww(r.get(1)?, r.get(2)?))))?.collect::<Result<_, _>>()?;
@@ -1293,6 +1358,8 @@ impl Db {
             stmt.query_map([], |r| Ok((r.get(0)?, Lww(r.get(1)?, r.get(2)?))))?.collect::<Result<_, _>>()?;
         let mut stmt = self.conn.prepare(&format!("SELECT url, route, route_t FROM ({rows}) WHERE route_t > 0"))?;
         let routes = stmt.query_map([], |r| Ok((r.get(0)?, Lww(r.get(1)?, r.get(2)?))))?.collect::<Result<_, _>>()?;
+        let mut stmt = self.conn.prepare(&format!("SELECT url, name, name_t FROM ({rows}) WHERE name_t > 0"))?;
+        let names = stmt.query_map([], |r| Ok((r.get(0)?, Lww(r.get(1)?, r.get(2)?))))?.collect::<Result<_, _>>()?;
         let mut stmt = self.conn.prepare("SELECT id, phrase, scope, deleted, t FROM filters")?;
         let filters = stmt
             .query_map([], |r| {
@@ -1306,6 +1373,7 @@ impl Db {
             feeds,
             categories,
             routes,
+            names,
             filters,
             cache: self.cache_limits()?,
             erased_at,
@@ -1354,8 +1422,9 @@ impl Db {
 
     /// Every feed this account knows, subscribed or not.
     pub fn all_feeds(&self) -> Result<Vec<FeedInfo>> {
-        let mut stmt =
-            self.conn.prepare("SELECT url, title, site, category, subscribed FROM feeds ORDER BY lower(title), url")?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT url, {SHOWN_TITLE} AS title, site, category, subscribed FROM feeds f ORDER BY lower(title), url"
+        ))?;
         let rows = stmt.query_map([], |r| {
             Ok(FeedInfo {
                 url: r.get(0)?,
@@ -1507,6 +1576,18 @@ impl Db {
                     table(url)?
                 ),
                 params![url, route, t],
+            )?;
+        }
+        let names = doc.names.iter().filter(|(_, v)| v.1 > floor && v.0.len() <= MAX_NAME_BYTES);
+        for (url, Lww(name, t)) in names {
+            changed += tx.execute(
+                &format!(
+                    "INSERT INTO {} (url, name, name_t) VALUES (?1, ?2, ?3)
+                     ON CONFLICT (url) DO UPDATE SET name = excluded.name, name_t = excluded.name_t
+                     WHERE (excluded.name_t, excluded.name) > (name_t, name)",
+                    table(url)?
+                ),
+                params![url, name, t],
             )?;
         }
         if changed > 0 {

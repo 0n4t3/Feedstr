@@ -229,7 +229,9 @@ impl Doc {
 
     fn is_empty(&self) -> bool {
         match self {
-            Doc::Subscriptions(doc) => doc.feeds.is_empty() && doc.categories.is_empty() && doc.routes.is_empty(),
+            Doc::Subscriptions(doc) => {
+                doc.feeds.is_empty() && doc.categories.is_empty() && doc.routes.is_empty() && doc.names.is_empty()
+            }
             Doc::State(doc) => doc.items.is_empty(),
             Doc::Items(doc) => doc.items.is_empty() && doc.meta_t == 0,
         }
@@ -460,6 +462,7 @@ pub async fn erase<T: Transport>(db: &Db, t: &T) -> Result<usize> {
     let stamps = (local.feeds.values().map(|v| v.1))
         .chain(local.categories.values().map(|v| v.1))
         .chain(local.routes.values().map(|v| v.1))
+        .chain(local.names.values().map(|v| v.1))
         .chain(local.salt.map(|s| s.1))
         .chain(local.cache.map(|c| c.1));
     let erased_at = (stamps.max().unwrap_or(0) + 1).max(now_ms());
@@ -1528,6 +1531,47 @@ mod tests {
         sync_ok(&a, &net).await;
         sync_ok(&b, &net).await;
         assert!(read(&b, 0));
+    }
+
+    #[tokio::test]
+    async fn feed_names_sync_between_devices_but_not_for_local_feeds() {
+        let net = FakeNet::new(1);
+        let a = client_with_items();
+        a.set_name(FEED, "  My feed  ").unwrap();
+        // Fetching the feed again doesn't change the name it's shown with.
+        a.store_fetched(FEED, "Example 2", "https://example.com", &[]).unwrap();
+        assert_eq!(a.feeds().unwrap()[0].title, "My feed");
+        sync_ok(&a, &net).await;
+        let b = Db::open_memory().unwrap();
+        sync_ok(&b, &net).await;
+        assert_eq!(b.name(FEED).unwrap(), "My feed");
+        assert_eq!(b.feeds().unwrap()[0].title, "My feed");
+        assert_eq!(b.items(&View::All, false).unwrap()[0].feed_title, "My feed");
+        // Back to the feed's own name on B: A follows.
+        b.set_name(FEED, "").unwrap();
+        sync_ok(&b, &net).await;
+        sync_ok(&a, &net).await;
+        assert_eq!(a.name(FEED).unwrap(), "");
+        assert_eq!(a.feeds().unwrap()[0].title, "Example 2");
+        for db in [&a, &b] {
+            assert_eq!(sync_ok(db, &net).await.published, 0);
+        }
+        // A feed kept on A only: its new name isn't shared.
+        a.set_category(FEED, "Mine").unwrap();
+        a.set_category_synced("Mine", false).unwrap();
+        a.set_name(FEED, "Private name").unwrap();
+        sync_ok(&a, &net).await;
+        sync_ok(&b, &net).await;
+        assert_eq!(a.name(FEED).unwrap(), "Private name");
+        assert_eq!(b.name(FEED).unwrap(), "");
+        for db in [&a, &b, &a, &b] {
+            assert_eq!(sync_ok(db, &net).await.published, 0);
+        }
+        // Shared again, A's name goes to B.
+        a.set_category_synced("Mine", true).unwrap();
+        sync_ok(&a, &net).await;
+        sync_ok(&b, &net).await;
+        assert_eq!(b.name(FEED).unwrap(), "Private name");
     }
 
     #[tokio::test]
