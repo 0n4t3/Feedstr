@@ -64,3 +64,5 @@ Nothing will break, however, if you fetch your feeds without running Tor or I2P.
 
 ## Building
 Coming soon. For now, ask a clanker.
+
+* Contribute or open an issue on [Github](https://github.com/0n4t3/Feedstr) or [NGit](https://gitworkshop.dev/npub1jy90jpcdl447ae3lp4924s65khdpvnttkg7fepmvmafycusyueksrvllx9/relay.ngit.dev/Feedstr)
