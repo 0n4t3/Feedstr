@@ -15,6 +15,7 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.PersistableBundle;
+import android.os.Process;
 import android.provider.OpenableColumns;
 import android.text.InputType;
 import android.view.KeyEvent;
@@ -55,6 +56,8 @@ public class MainActivity extends NativeActivity {
     /** Whether the app got it: it then stops SyncService once it's idle. */
     private static native boolean nativePaused();
     private static native void nativeResumed();
+    /** Uploads what's left, waiting up to limitMs; whether it finished. Not on the main thread. */
+    private static native boolean nativeFinish(int limitMs);
     /** data is null if the user cancelled. */
     private static native void nativeFileOpened(int request, byte[] data);
     /** place is null if the user cancelled. */
@@ -62,6 +65,19 @@ public class MainActivity extends NativeActivity {
     private static native void nativeFileFailed(int request, String message);
     /** A signer app's answer: the key, signed event or text; null if refused or cancelled. */
     private static native void nativeSignerAnswer(int request, String answer);
+
+    /**
+     * Whether the Rust app has started in this process. It can't stop with its
+     * activity, nor start again in the same process (see android_main in
+     * lib.rs): the process ends with the activity (see endProcess).
+     */
+    private static boolean appStarted;
+    /** Whether the process is ending (see endProcess). */
+    private static boolean ending;
+    /** How long ending the process waits for changes to be uploaded. */
+    private static final int FINISH_LIMIT_MS = 8000;
+    /** Whether this activity runs the app (else it came while the process was ending). */
+    private boolean runsApp;
 
     private TextInput input;
     /** Between onResume and onPause (main thread only). */
@@ -73,7 +89,16 @@ public class MainActivity extends NativeActivity {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        runsApp = !appStarted;
+        appStarted = true;
         super.onCreate(savedInstanceState);
+        if (!runsApp) {
+            // Opened again before the process from before ended: this activity
+            // finishes by itself, and the app starts again in a new process.
+            Restart.start(this);
+            endProcess();
+            return;
+        }
         // Draw behind the system bars, and tell the app how much they cover.
         if (Build.VERSION.SDK_INT >= 28) {
             getWindow().getAttributes().layoutInDisplayCutoutMode =
@@ -123,6 +148,9 @@ public class MainActivity extends NativeActivity {
     @Override
     protected void onPause() {
         super.onPause();
+        if (!runsApp) {
+            return;
+        }
         onScreen = false;
         // Started now, while Android still allows it: a sync under way, or the
         // upload of changes on leaving, can then finish in the background.
@@ -138,8 +166,43 @@ public class MainActivity extends NativeActivity {
     @Override
     protected void onResume() {
         super.onResume();
+        if (!runsApp) {
+            return;
+        }
         onScreen = true;
         nativeResumed();
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (runsApp) {
+            // Recreated (for a configuration change the app doesn't handle
+            // itself): the new activity needs a new process.
+            if (isChangingConfigurations()) {
+                Restart.start(this);
+            }
+            endProcess();
+        }
+        // For the activity that runs the app, this waits for the app to stop,
+        // which only happens with the process.
+        super.onDestroy();
+    }
+
+    /**
+     * Ends the process once the app has uploaded what's left (or given up
+     * after FINISH_LIMIT_MS). A foreground service (SyncService) can keep the
+     * process running after its activity is gone, but the app can't go on
+     * without it or start again in the same process (see appStarted).
+     */
+    private static synchronized void endProcess() {
+        if (ending) {
+            return;
+        }
+        ending = true;
+        new Thread(() -> {
+            nativeFinish(FINISH_LIMIT_MS);
+            Process.killProcess(Process.myPid());
+        }, "feedstr-end").start();
     }
 
     // ---- Text from the keyboard ----

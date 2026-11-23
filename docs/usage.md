@@ -27,11 +27,11 @@ noted under [Platform notes](#platform-notes).
 Downloads are on the
 [latest release](https://github.com/0n4t3/feedstr/releases/latest).
 
-- **Linux:** download the Flatpak (`Feedstr-flatpak_v0.1.flatpak`) and
-  install it with `flatpak install Feedstr-flatpak_v0.1.flatpak`, then run it
+- **Linux:** download the Flatpak (`Feedstr-flatpak_v0.2.flatpak`) and
+  install it with `flatpak install Feedstr-flatpak_v0.2.flatpak`, then run it
   from your app launcher or with `flatpak run top.dns7.feedstr.Feedstr`.
-- **Android:** download the APK and install it: `Feedstr-android-arm64_v0.1.apk`
-  for phones and tablets, `Feedstr-android-x86_64_v0.1.apk` for emulators and
+- **Android:** download the APK and install it: `Feedstr-android-arm64_v0.2.apk`
+  for phones and tablets, `Feedstr-android-x86_64_v0.2.apk` for emulators and
   x86 devices. Your phone may ask you to allow installing apps from your
   browser or file manager first.
 - **Web:** open the [web client](https://feedstr.dns7.top/client/) in your browser, or host it yourself (see
@@ -39,9 +39,22 @@ Downloads are on the
 
 ## Signing in
 
-Feedstr has no accounts. Your data is synced under a Nostr key and
-encrypted to it, so whoever holds the key can read it. When you first open
-Feedstr, choose one of these:
+Syncing is optional on desktop and Android. When you first open Feedstr there,
+it asks whether to sync between your devices. (The web version always syncs,
+since browsers can't fetch most feeds themselves, so it goes straight to
+signing in.)
+
+- **Disable Sync:** Feedstr works as an ordinary feed
+  reader. You don't need a key or an account, and nothing is uploaded. The
+  **Sync** button becomes **Refresh**, which fetches your feeds. You can turn
+  on sync later under Settings → Sync → **Turn on sync…**: the feeds, articles,
+  read/unread state and favorites you already have are added to the account
+  you sign in to.
+- **Enable Sync:** sign in as described below.
+
+Feedstr has no accounts of its own. Your data is synced under a Nostr key and
+encrypted to it, so whoever holds the key can read it. To sync, choose one of
+these:
 
 - **Create a Sync Key:** Feedstr makes a new key (`nsec1…`) for you. Copy it
   somewhere safe, like a password manager. If you lose it, your synced data
@@ -422,7 +435,7 @@ articles show up after they sync.
   address, not `@name`.
 - Feedstr needs WebGL.
 
-**Hosting it yourself:** serve the files from `Feedstr-web_v0.1.tar.gz` over HTTPS
+**Hosting it yourself:** serve the files from `Feedstr-web_v0.2.tar.gz` over HTTPS
 at an address of their own (a separate domain or subdomain, not a folder next
 to other pages). With **Remember me**, your Sync Key is kept in the browser's
 storage for that address, where any page at the same address could read it.

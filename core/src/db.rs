@@ -14,6 +14,12 @@ use crate::docs::{
 use crate::html;
 use crate::longform;
 
+/// When this device began joining an account (ms), until a sync has read the
+/// account's data (see [`Db::joining_account`]).
+const JOINING: &str = "joining_account";
+/// A copy of this device's data while an erase replaces it (see [`Db::restore_kept`]).
+const KEPT: &str = "kept_through_erase";
+
 const SCHEMA: &str = "
 PRAGMA journal_mode = WAL;
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -139,6 +145,16 @@ const MIGRATIONS: &[&str] = &[
 const MAX_ROUTE_BYTES: usize = 32;
 /// Feed names longer than this are cut (here) or ignored (from other devices).
 pub const MAX_NAME_BYTES: usize = 400;
+/// The same for category names. A feed's category is synced with the feed,
+/// so a long one would be copied into the document for every feed in it.
+pub const MAX_CATEGORY_BYTES: usize = 400;
+/// The same for filter phrases.
+pub const MAX_FILTER_BYTES: usize = 400;
+
+/// A category name as stored: trimmed, and cut to [`MAX_CATEGORY_BYTES`].
+pub fn category_name(name: &str) -> &str {
+    cut(name.trim(), MAX_CATEGORY_BYTES)
+}
 
 /// SQL expression: the name a feed `f` is shown with: the one the user gave
 /// it, or else its own title.
@@ -399,15 +415,60 @@ impl Db {
         Ok(())
     }
 
+    /// At this device's first sign-in to an account: what it has (from using
+    /// Feedstr without sync, say) is added to the account. Its relay list gives
+    /// way to the account's own, and an erase from before this moment doesn't
+    /// take this device's data with it (see [`Db::merge_subscriptions`]). One
+    /// made later does, even if no sync has managed to read the account yet.
+    pub fn joining_account(&self) -> Result<()> {
+        let mut relays = self.relay_list()?;
+        relays.unshare();
+        self.store_relay_list(&self.conn, &relays)?;
+        self.set_meta(JOINING, &now_ms().to_string())
+    }
+
+    /// A sync read the account's data: any erase from now on is the user's.
+    pub fn joined_account(&self) -> Result<()> {
+        self.delete_meta(JOINING)
+    }
+
+    /// This device isn't joining an account after all.
+    pub fn forget_joining(&self) -> Result<()> {
+        self.delete_meta(JOINING)?;
+        self.delete_meta(KEPT)
+    }
+
+    /// Whether an erase at `erased_at` (ms) is from before this device joined.
+    fn erased_before_joining(&self, erased_at: i64) -> Result<bool> {
+        let joined = self.meta(JOINING)?.and_then(|t| t.parse::<i64>().ok());
+        Ok(joined.is_some_and(|joined| erased_at <= joined))
+    }
+
+    /// Puts back the data kept through an erase, dated after it. It stays in
+    /// the database until that's done, so the app being stopped halfway
+    /// doesn't lose what may be the only copy.
+    pub fn restore_kept(&self) -> Result<()> {
+        if let Some(kept) = self.meta(KEPT)? {
+            crate::import_export::restore_after_erase(self, &kept, self.erased_at()? + 1)?;
+            self.delete_meta(KEPT)?;
+        }
+        Ok(())
+    }
+
     /// Forgets the account's data (settings like relays stay), and optionally how to sign in.
     pub fn wipe_account(&self, forget_login: bool) -> Result<()> {
         // This device keeps using its relays, but the next account's own list wins over them.
         let mut relays = self.relay_list()?;
         relays.unshare();
         self.store_relay_list(&self.conn, &relays)?;
-        let login = if forget_login { ", 'login', 'sync_key', 'bunker_uri', 'bunker_app_key'" } else { "" };
+        // Without `forget_login` this device stays in the account, and knows which one.
+        let login = if forget_login {
+            format!(", 'pubkey', 'login', 'sync_key', 'bunker_uri', 'bunker_app_key', '{JOINING}', '{KEPT}'")
+        } else {
+            String::new()
+        };
         self.wipe(&format!(
-            "DELETE FROM meta WHERE key IN ('salt', 'salt_t', 'pubkey', 'cache_limits', 'erased_at', 'synced_at', 'uploaded_rev'{login});"
+            "DELETE FROM meta WHERE key IN ('salt', 'salt_t', 'cache_limits', 'erased_at', 'synced_at', 'uploaded_rev'{login});"
         ))
     }
 
@@ -483,15 +544,16 @@ impl Db {
 
     /// Puts a feed into a category; an empty name removes it from its category.
     pub fn set_category(&self, url: &str, category: &str) -> Result<()> {
+        let category = category_name(category);
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "UPDATE feeds SET category = ?2, category_t = max(?3, category_t + 1) WHERE url = ?1",
-            params![url, category.trim(), self.clock()?],
+            params![url, category, self.clock()?],
         )?;
         bump(&tx, SUBSCRIPTIONS_REV)?;
         tx.commit()?;
         // Moving into or out of a category that isn't synced changes what's shared.
-        let (was_local, now_local) = (self.is_shadowed(url)?, self.is_local_category(category.trim())?);
+        let (was_local, now_local) = (self.is_shadowed(url)?, self.is_local_category(category)?);
         if now_local && !was_local {
             self.keep_local(url)?;
         } else if was_local && !now_local {
@@ -566,6 +628,7 @@ impl Db {
 
     /// Keeps a category's feeds on this device only, or shares them again.
     pub fn set_category_synced(&self, name: &str, synced: bool) -> Result<()> {
+        let name = category_name(name);
         if synced {
             self.conn.execute("DELETE FROM local_categories WHERE name = ?1", [name])?;
         } else {
@@ -643,11 +706,12 @@ impl Db {
 
     /// Renames a category (or, with an empty name, removes it) on every feed in it.
     pub fn rename_category(&self, from: &str, to: &str) -> Result<()> {
+        let to = category_name(to);
         // A renamed category that isn't synced stays that way.
-        if !to.trim().is_empty() && self.is_local_category(from)? {
-            self.conn.execute("INSERT OR IGNORE INTO local_categories (name) VALUES (?1)", [to.trim()])?;
+        if !to.is_empty() && self.is_local_category(from)? {
+            self.conn.execute("INSERT OR IGNORE INTO local_categories (name) VALUES (?1)", [to])?;
         }
-        self.conn.execute("DELETE FROM local_categories WHERE name = ?1 AND ?1 != ?2", [from, to.trim()])?;
+        self.conn.execute("DELETE FROM local_categories WHERE name = ?1 AND ?1 != ?2", [from, to])?;
         let urls: Vec<String> = self
             .conn
             .prepare("SELECT url FROM feeds WHERE category = ?1")?
@@ -657,10 +721,10 @@ impl Db {
             self.set_category(&url, to)?;
         }
         // Filters move along with a renamed category.
-        if !to.trim().is_empty() {
+        if !to.is_empty() {
             self.conn.execute(
                 "UPDATE filters SET scope = ?2, t = max(?3, t + 1) WHERE scope = ?1 AND deleted = 0",
-                params![format!("category:{from}"), format!("category:{}", to.trim()), self.clock()?],
+                params![format!("category:{from}"), format!("category:{to}"), self.clock()?],
             )?;
             bump(&self.conn, SUBSCRIPTIONS_REV)?;
             self.refresh_hidden(None)?;
@@ -682,6 +746,7 @@ impl Db {
     /// ("category:<name>") or a feed ("feed:<url>").
     pub fn add_filter(&self, phrase: &str, scope: &str) -> Result<()> {
         let phrase = phrase.split_whitespace().collect::<Vec<_>>().join(" ");
+        let phrase = cut(&phrase, MAX_FILTER_BYTES).trim_end().to_string();
         let id = nostr_sdk::prelude::Keys::generate().public_key().to_hex()[..16].to_string();
         let filter = WordFilter { phrase, scope: scope.to_string(), deleted: false };
         self.store_filter(&id, &Lww(filter, self.clock()?))?;
@@ -1506,9 +1571,17 @@ impl Db {
         // The user deleted everything (on another device): do the same here.
         let erased = doc.erased_at.filter(|&t| t > self.erased_at().unwrap_or(0));
         if let Some(erased_at) = erased {
+            // From before this device joined the account (see `joining_account`):
+            // what it brings is newer, so it's kept.
+            if !self.erased_before_joining(erased_at)? {
+                self.delete_meta(KEPT)?;
+            } else if self.meta(KEPT)?.is_none() {
+                self.set_meta(KEPT, &crate::import_export::export_backup(self)?)?;
+            }
             self.wipe_account(false)?;
             self.set_meta("erased_at", &erased_at.to_string())?;
             bump(&self.conn, SUBSCRIPTIONS_REV)?;
+            self.restore_kept()?;
         }
         // Anything from before the last erase stays deleted.
         let floor = self.erased_at()?;
@@ -1553,7 +1626,8 @@ impl Db {
             };
             changed += tx.execute(sql, params![url, subscribed, t])?;
         }
-        for (url, Lww(category, t)) in doc.categories.iter().filter(|(_, v)| v.1 > floor) {
+        let categories = doc.categories.iter().filter(|(_, v)| v.1 > floor && v.0.len() <= MAX_CATEGORY_BYTES);
+        for (url, Lww(category, t)) in categories {
             let moved = tx.execute(
                 &format!(
                     "INSERT INTO {} (url, category, category_t) VALUES (?1, ?2, ?3)
@@ -1594,7 +1668,11 @@ impl Db {
             bump(&tx, SUBSCRIPTIONS_REV)?;
         }
         tx.commit()?;
-        for (id, filter) in doc.filters.iter().filter(|(_, f)| f.1 > floor) {
+        // A scope names a category or a feed, so it can't be much longer than one.
+        let fits = |f: &WordFilter| {
+            f.phrase.len() <= MAX_FILTER_BYTES && f.scope.len() <= "feed:".len() + crate::feeds::MAX_LINK_BYTES
+        };
+        for (id, filter) in doc.filters.iter().filter(|(_, f)| f.1 > floor && fits(&f.0)) {
             regroup |= self.store_filter(id, filter)?;
         }
         if regroup || erased.is_some() {
@@ -1717,6 +1795,80 @@ mod tests {
 
     fn item(published: i64) -> Item {
         Item { title: format!("Item {published}"), published, t: published * 1000, ..Default::default() }
+    }
+
+    #[test]
+    fn joining_an_erased_account_keeps_this_devices_data() {
+        let erase_at = |db: &Db, at: i64| {
+            db.merge_subscriptions(&Subscriptions { erased_at: Some(at), ..Default::default() }).unwrap();
+            at
+        };
+        let before = || now_ms() - 60_000;
+        let later = || now_ms() + 60_000;
+        let feed = "https://example.com/feed";
+        let with_data = || {
+            let db = Db::open_memory().unwrap();
+            db.set_subscribed(feed, true).unwrap();
+            db.store_fetched(feed, "T", "", &[("a".into(), item(1_000))]).unwrap();
+            db.set_fav(&db.items(&View::All, false).unwrap()[0].key, true).unwrap();
+            db.set_relay_list(&["wss://mine".into()], true).unwrap();
+            db
+        };
+        // Joining (the first sign-in here): the data stays, dated after the
+        // erase so it syncs, and the relay list gives way to the account's.
+        let db = with_data();
+        db.joining_account().unwrap();
+        assert_eq!(db.relay_list().unwrap().shared(), RelayList::default());
+        let at = erase_at(&db, before());
+        assert_eq!(db.subscribed_feeds().unwrap(), [feed]);
+        assert_eq!(db.favorites_count().unwrap(), 1);
+        assert!(db.subscriptions_doc().unwrap().feeds.values().all(|v| v.1 > at));
+        assert!(db.meta(KEPT).unwrap().is_none());
+        // Once joined, an erase from another device erases this one too.
+        db.joined_account().unwrap();
+        erase_at(&db, later());
+        assert!(db.subscribed_feeds().unwrap().is_empty());
+        // As it always did for a device already in the account.
+        let db = with_data();
+        erase_at(&db, later());
+        assert!(db.subscribed_feeds().unwrap().is_empty());
+        // An erase made after joining counts, even before a sync has finished.
+        let db = with_data();
+        db.joining_account().unwrap();
+        erase_at(&db, later());
+        assert!(db.subscribed_feeds().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_erase_leaves_the_device_in_its_account() {
+        let db = Db::open_memory().unwrap();
+        db.set_meta("pubkey", "mine").unwrap();
+        db.set_subscribed("https://example.com/feed", true).unwrap();
+        let doc = Subscriptions { erased_at: Some(now_ms() + 60_000), ..Default::default() };
+        db.merge_subscriptions(&doc).unwrap();
+        assert!(db.subscribed_feeds().unwrap().is_empty());
+        assert_eq!(db.meta("pubkey").unwrap().as_deref(), Some("mine"));
+        // Signing out does forget it.
+        db.wipe_account(true).unwrap();
+        assert!(db.meta("pubkey").unwrap().is_none());
+    }
+
+    #[test]
+    fn data_kept_through_an_erase_survives_the_app_stopping() {
+        let db = Db::open_memory().unwrap();
+        let feed = "https://example.com/feed";
+        db.set_subscribed(feed, true).unwrap();
+        db.store_fetched(feed, "T", "", &[("a".into(), item(1_000))]).unwrap();
+        db.joining_account().unwrap();
+        // Stopped after the wipe, before the data was put back.
+        db.set_meta(KEPT, &crate::import_export::export_backup(&db).unwrap()).unwrap();
+        db.wipe_account(false).unwrap();
+        assert!(db.subscribed_feeds().unwrap().is_empty());
+        // The next start puts it back.
+        db.restore_kept().unwrap();
+        assert_eq!(db.subscribed_feeds().unwrap(), [feed]);
+        assert_eq!(db.items(&View::All, false).unwrap().len(), 1);
+        assert!(db.meta(KEPT).unwrap().is_none());
     }
 
     #[test]
@@ -1843,6 +1995,33 @@ mod tests {
         doc.feeds.insert(followed_long_ago.into(), Lww(true, now_ms()));
         db.merge_subscriptions(&doc).unwrap();
         assert_eq!(unread(followed_long_ago), 1);
+    }
+
+    #[test]
+    fn long_category_names_and_filters_are_cut_or_ignored() {
+        let db = Db::open_memory().unwrap();
+        let (feed, other) = ("https://a.example/feed", "https://b.example/feed");
+        db.set_subscribed(feed, true).unwrap();
+        db.set_subscribed(other, true).unwrap();
+        let category = |url: &str| db.all_feeds().unwrap().into_iter().find(|f| f.url == url).unwrap().category;
+        db.set_category(feed, &format!("  {}  ", "é".repeat(MAX_CATEGORY_BYTES))).unwrap();
+        assert_eq!(category(feed).len(), MAX_CATEGORY_BYTES);
+        db.rename_category(&category(feed), &"x".repeat(MAX_CATEGORY_BYTES + 1)).unwrap();
+        assert_eq!(category(feed), "x".repeat(MAX_CATEGORY_BYTES));
+        // One that long from another device is left out.
+        let mut doc = Subscriptions::default();
+        doc.categories.insert(other.into(), Lww("y".repeat(MAX_CATEGORY_BYTES + 1), now_ms() + 1000));
+        db.merge_subscriptions(&doc).unwrap();
+        assert_eq!(category(other), "");
+        // Filter phrases too.
+        db.add_filter(&"word ".repeat(MAX_FILTER_BYTES), "").unwrap();
+        let phrase = |db: &Db| db.filters().unwrap().into_iter().map(|f| f.phrase).collect::<Vec<_>>();
+        assert!(phrase(&db).iter().all(|p| p.len() <= MAX_FILTER_BYTES && !p.ends_with(' ')));
+        let mut doc = Subscriptions::default();
+        let filter = WordFilter { phrase: "z".repeat(MAX_FILTER_BYTES + 1), scope: String::new(), deleted: false };
+        doc.filters.insert("long".into(), Lww(filter, now_ms() + 1000));
+        db.merge_subscriptions(&doc).unwrap();
+        assert_eq!(phrase(&db).len(), 1);
     }
 
     #[test]

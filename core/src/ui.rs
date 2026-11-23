@@ -258,8 +258,22 @@ enum Exit {
     Ready,
 }
 
+/// The first screen asks whether to sync at all, then how to sign in.
+#[derive(Default, PartialEq)]
+enum LoginStep {
+    /// Not on the web: browsers can't fetch most feeds, so it always syncs.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[default]
+    Choose,
+    #[cfg_attr(target_arch = "wasm32", default)]
+    SignIn,
+}
+
 #[derive(Default)]
 struct LoginForm {
+    step: LoginStep,
+    /// Turning on sync after using Feedstr without it: going back returns to the feeds.
+    from_local: bool,
     /// Something to tell the user, like that their data was deleted.
     notice: Option<String>,
     sync_key: String,
@@ -299,6 +313,8 @@ pub struct App {
     /// Signing in again (at startup, or after changing relays) failed.
     sign_in_problem: Option<String>,
     npub: String,
+    /// The user chose not to sync (see [`worker::local_only`]).
+    local: bool,
     view: View,
     /// Only unread items are listed; kept on this device.
     unread_only: bool,
@@ -379,7 +395,9 @@ impl App {
         let unread_only = db.meta("unread_only")?.as_deref() == Some("1");
         let collapsed = db.meta("collapsed")?.unwrap_or_default().lines().map(String::from).collect();
 
-        let signed_in = db.meta("login")?.is_some();
+        let local = worker::local_only(&db);
+        // A browser last used without sync, which the web version no longer offers, signs in.
+        let signed_in = local || worker::syncs(&db);
         if signed_in {
             // Show what we have right away; signing in again happens in the background.
             tx.send(Cmd::Login(Login::Saved))?;
@@ -397,11 +415,12 @@ impl App {
             login: LoginForm::default(),
             dialog: None,
             settings: None,
-            status: "Connecting…".into(),
+            status: if local { String::new() } else { "Connecting…".into() },
             progress: None,
             syncing: false,
             sign_in_problem: None,
             npub: String::new(),
+            local,
             view: View::All,
             unread_only,
             search: String::new(),
@@ -495,6 +514,11 @@ impl App {
         if self.dialog.take().is_some() {
             return true;
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.screen == Screen::Login && self.login.step == LoginStep::SignIn && !self.login.busy {
+            self.leave_sign_in();
+            return true;
+        }
         if let Some(mut page) = self.settings.take() {
             if self.narrow && page.showing {
                 page.showing = false;
@@ -545,7 +569,8 @@ impl App {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Msg::LoggedIn { npub } => {
-                    self.npub = npub;
+                    self.local = npub.is_none();
+                    self.npub = npub.unwrap_or_default();
                     self.sign_in_problem = None;
                     self.screen = Screen::Main;
                     self.login = LoginForm::default();
@@ -563,6 +588,7 @@ impl App {
                     self.sign_in_problem = Some(error);
                 }
                 Msg::LoggedOut => {
+                    self.local = false;
                     self.screen = Screen::Login;
                     self.dialog = None;
                     self.settings = None;
@@ -633,6 +659,7 @@ impl App {
                     self.view = View::All;
                     self.search.clear();
                     self.npub.clear();
+                    self.local = false;
                     self.login = LoginForm { notice: Some(done), ..Default::default() };
                     self.reload();
                 }
@@ -742,15 +769,40 @@ impl App {
         self.send(Cmd::Login(login));
     }
 
+    /// Leaves the sign-in options: back to the question whether to sync, or
+    /// (when turning on sync later) back to the feeds, still without sync.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn leave_sign_in(&mut self) {
+        if self.login.from_local {
+            self.sign_in(Login::Local);
+        } else {
+            self.login.step = LoginStep::Choose;
+            self.login.error = None;
+        }
+    }
+
+    /// Turns on sync after using Feedstr without it: the sign-in options.
+    fn turn_on_sync(&mut self) {
+        // Signing in (or going back) would wait for a refresh under way.
+        if self.syncing {
+            self.send(Cmd::CancelSync);
+        }
+        self.settings = None;
+        self.dialog = None;
+        self.screen = Screen::Login;
+        self.login = LoginForm { step: LoginStep::SignIn, from_local: true, ..Default::default() };
+    }
+
     fn login_screen(&mut self, ui: &mut Ui) {
         // Scrolls on short screens: a phone held sideways, a large interface size.
         CentralPanel::default().show(ui, |ui| {
             ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space(((ui.available_height() - 520.0) / 2.0).max(24.0));
-                    ui.set_max_width(400.0);
+                    // Narrower on a phone, or the cards would run off its sides.
+                    ui.set_max_width(ui.available_width().min(400.0));
                     ui.label(RichText::new("Feedstr").size(36.0).strong());
-                    ui.label(RichText::new("Your feeds, synced privately over Nostr").weak());
+                    ui.label(RichText::new("Mildly Improved Feed Reading").weak());
                     ui.add_space(28.0);
                     if let Some(notice) = &self.login.notice {
                         card(ui, |ui| {
@@ -758,105 +810,168 @@ impl App {
                         });
                         ui.add_space(12.0);
                     }
-
-                    let enabled = !self.login.busy;
-                    #[cfg(target_arch = "wasm32")]
-                    {
-                        card(ui, |ui| {
-                            ui.label(RichText::new("Browser extension").strong());
-                            let hint = "Alby, nos2x or another Nostr extension (NIP-07) that supports NIP-44";
-                            ui.label(RichText::new(hint).small().weak());
-                            if ui.add_enabled(enabled, wide(primary_button("Use extension"), ui)).clicked() {
-                                self.sign_in(Login::Extension);
-                            }
-                        });
-                        ui.add_space(12.0);
-                    }
-                    if self.has_signer_app {
-                        card(ui, |ui| {
-                            ui.label(RichText::new("Signer app").strong());
-                            let hint = "Amber or another Nostr signer app (NIP-55) keeps your key";
-                            ui.label(RichText::new(hint).small().weak());
-                            if ui.add_enabled(enabled, wide(primary_button("Use signer app"), ui)).clicked() {
-                                self.sign_in(Login::SignerApp);
-                            }
-                        });
-                        ui.add_space(12.0);
-                    }
-                    card(ui, |ui| {
-                        ui.label(RichText::new("Sync Key").strong());
-                        let edit = TextEdit::singleline(&mut self.login.sync_key).password(true).hint_text("nsec1…");
-                        let response = ui.add_enabled(enabled, edit.desired_width(f32::INFINITY));
-                        let submit = response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                        if ui.add_enabled(enabled, wide(primary_button("Sign in"), ui)).clicked() || submit {
-                            self.sign_in(Login::SyncKey(self.login.sync_key.clone()));
-                        }
-                    });
-                    ui.add_space(12.0);
-                    card(ui, |ui| {
-                        ui.label(RichText::new("Remote signer").strong());
-                        let edit = TextEdit::singleline(&mut self.login.bunker).hint_text("bunker://…");
-                        ui.add_enabled(enabled, edit.desired_width(f32::INFINITY));
-                        if ui.add_enabled(enabled, wide(primary_button("Connect"), ui)).clicked() {
-                            self.sign_in(Login::Bunker(self.login.bunker.clone()));
-                        }
-                        // On a computer, the signer app on a phone can scan a code instead.
-                        #[cfg(not(target_os = "android"))]
-                        match self.login.connect_link.clone() {
-                            Some(link) if self.login.busy => {
-                                ui.add_space(8.0);
-                                let hint = "Scan this with your Nostr signer app (Amber, nsec.app, …)";
-                                ui.label(RichText::new(hint).small());
-                                qr_code(ui, &link);
-                                ui.horizontal(|ui| {
-                                    if ui.button("Copy link").clicked() {
-                                        ui.ctx().copy_text(link.clone());
-                                    }
-                                    if ui.button("Cancel").clicked() {
-                                        self.cancel_connect.notify_waiters();
-                                    }
-                                });
-                            }
-                            _ => {
-                                if ui.add_enabled(enabled, wide(Button::new("Sign in with a QR code"), ui)).clicked() {
-                                    self.sign_in(Login::QrCode);
-                                }
-                            }
-                        }
-                    });
-                    #[cfg(target_arch = "wasm32")]
-                    {
-                        ui.add_space(12.0);
-                        let mut remember = !self.login.forget;
-                        ui.checkbox(&mut remember, "Remember me on this browser");
-                        self.login.forget = !remember;
-                        let hint = if remember {
-                            "Your sign-in and feeds are kept in this browser until you sign out."
-                        } else {
-                            "Nothing is kept in this browser: you sign in again next time."
-                        };
-                        ui.label(RichText::new(hint).small().weak());
-                    }
-                    ui.add_space(16.0);
-                    if self.login.busy {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label(&self.status);
-                        });
-                    } else if let Some(error) = &self.login.error {
-                        ui.colored_label(ui.visuals().error_fg_color, error);
-                    }
-                    ui.add_space(16.0);
-                    ui.label(RichText::new("New here?").weak());
-                    if ui.add_enabled(enabled, Button::new("Create a Sync Key")).clicked() {
-                        let nsec = Keys::generate().secret_key().to_bech32().expect("bech32 encoding can't fail");
-                        self.dialog = Some(Dialog::NewSyncKey { nsec });
+                    match self.login.step {
+                        #[cfg(not(target_arch = "wasm32"))]
+                        LoginStep::Choose => self.sync_choice(ui),
+                        LoginStep::SignIn => self.sign_in_options(ui),
                     }
                     ui.add_space(24.0);
                 });
                 reveal_editing(ui, &mut self.reveal_editing);
             });
         });
+    }
+
+    /// Asks whether to sync between devices over Nostr, or to keep everything on this device.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn sync_choice(&mut self, ui: &mut Ui) {
+        let enabled = !self.login.busy;
+        card(ui, |ui| {
+            ui.label(RichText::new("Enable sync?").strong());
+            let text = "Feedstr can sync the contents of your feeds, as well as read/unread and favorites, through \
+                        the Nostr protocol. All data is E2E encrypted by default. Sync is required for the web \
+                        version since browser sandboxing prevents directly fetching feeds.";
+            ui.add(Label::new(RichText::new(text).small().weak()).wrap());
+            ui.add_space(8.0);
+            if ui.add_enabled(enabled, wide(primary_button("Enable Sync"), ui)).clicked() {
+                self.login.step = LoginStep::SignIn;
+                self.login.error = None;
+            }
+            ui.add_space(4.0);
+            if ui.add_enabled(enabled, wide(Button::new("Disable Sync"), ui)).clicked() {
+                self.sign_in(Login::Local);
+            }
+            let text = "With sync off, nothing ever leaves your device. To enable it later, see Settings › Sync.";
+            ui.add(Label::new(RichText::new(text).small().weak()).wrap());
+        });
+        ui.add_space(16.0);
+        if self.login.busy {
+            ui.spinner();
+        } else if let Some(error) = &self.login.error {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
+    }
+
+    /// On the web: whether to keep the database in this browser.
+    fn remember_me(&mut self, ui: &mut Ui) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            ui.add_space(12.0);
+            let mut remember = !self.login.forget;
+            ui.checkbox(&mut remember, "Remember me on this browser");
+            self.login.forget = !remember;
+            let hint = if remember {
+                "Your sign-in and feeds are kept in this browser until you sign out."
+            } else {
+                "Nothing is kept in this browser: you sign in again next time."
+            };
+            ui.label(RichText::new(hint).small().weak());
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = ui;
+    }
+
+    /// The ways to sign in, for syncing.
+    fn sign_in_options(&mut self, ui: &mut Ui) {
+        let enabled = !self.login.busy;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            ui.horizontal(|ui| {
+                let back = if self.login.from_local { "‹  Back to my feeds" } else { "‹  Back" };
+                if ui.add_enabled(enabled, Button::new(back)).clicked() {
+                    self.leave_sign_in();
+                }
+            });
+            ui.add_space(8.0);
+        }
+        if self.login.from_local {
+            card(ui, |ui| {
+                let text = "The feeds, articles, read/unread state and favorites on this device are added to the \
+                            account you sign in to, and synced from then on.";
+                ui.add(Label::new(text).wrap());
+            });
+            ui.add_space(12.0);
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            card(ui, |ui| {
+                ui.label(RichText::new("Browser extension").strong());
+                let hint = "Alby, nos2x or another Nostr extension (NIP-07) that supports NIP-44";
+                ui.label(RichText::new(hint).small().weak());
+                if ui.add_enabled(enabled, wide(primary_button("Use extension"), ui)).clicked() {
+                    self.sign_in(Login::Extension);
+                }
+            });
+            ui.add_space(12.0);
+        }
+        if self.has_signer_app {
+            card(ui, |ui| {
+                ui.label(RichText::new("Signer app").strong());
+                let hint = "Amber or another Nostr signer app (NIP-55) keeps your key";
+                ui.label(RichText::new(hint).small().weak());
+                if ui.add_enabled(enabled, wide(primary_button("Use signer app"), ui)).clicked() {
+                    self.sign_in(Login::SignerApp);
+                }
+            });
+            ui.add_space(12.0);
+        }
+        card(ui, |ui| {
+            ui.label(RichText::new("Sync Key").strong());
+            let edit = TextEdit::singleline(&mut self.login.sync_key).password(true).hint_text("nsec1…");
+            let response = ui.add_enabled(enabled, edit.desired_width(f32::INFINITY));
+            let submit = response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            if ui.add_enabled(enabled, wide(primary_button("Sign in"), ui)).clicked() || submit {
+                self.sign_in(Login::SyncKey(self.login.sync_key.clone()));
+            }
+        });
+        ui.add_space(12.0);
+        card(ui, |ui| {
+            ui.label(RichText::new("Remote signer").strong());
+            let edit = TextEdit::singleline(&mut self.login.bunker).hint_text("bunker://…");
+            ui.add_enabled(enabled, edit.desired_width(f32::INFINITY));
+            if ui.add_enabled(enabled, wide(primary_button("Connect"), ui)).clicked() {
+                self.sign_in(Login::Bunker(self.login.bunker.clone()));
+            }
+            // On a computer, the signer app on a phone can scan a code instead.
+            #[cfg(not(target_os = "android"))]
+            match self.login.connect_link.clone() {
+                Some(link) if self.login.busy => {
+                    ui.add_space(8.0);
+                    let hint = "Scan this with your Nostr signer app (Amber, nsec.app, …)";
+                    ui.label(RichText::new(hint).small());
+                    qr_code(ui, &link);
+                    ui.horizontal(|ui| {
+                        if ui.button("Copy link").clicked() {
+                            ui.ctx().copy_text(link.clone());
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.cancel_connect.notify_waiters();
+                        }
+                    });
+                }
+                _ => {
+                    if ui.add_enabled(enabled, wide(Button::new("Sign in with a QR code"), ui)).clicked() {
+                        self.sign_in(Login::QrCode);
+                    }
+                }
+            }
+        });
+        self.remember_me(ui);
+        ui.add_space(16.0);
+        if self.login.busy {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(&self.status);
+            });
+        } else if let Some(error) = &self.login.error {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
+        ui.add_space(16.0);
+        ui.label(RichText::new("New here?").weak());
+        if ui.add_enabled(enabled, Button::new("Create a Sync Key")).clicked() {
+            let nsec = Keys::generate().secret_key().to_bech32().expect("bech32 encoding can't fail");
+            self.dialog = Some(Dialog::NewSyncKey { nsec });
+        }
     }
 
     // ---- Main screen ----
@@ -874,13 +989,21 @@ impl App {
                 ui.add_space(12.0);
             }
             if self.syncing {
-                let hint = "Stop syncing: what was done so far is kept, the rest is done next time";
+                let hint = if self.local {
+                    "Stop fetching feeds: those not fetched yet are fetched next time"
+                } else {
+                    "Stop syncing: what was done so far is kept, the rest is done next time"
+                };
                 if ui.button(if self.narrow { "✖" } else { "✖  Cancel" }).on_hover_text(hint).clicked() {
                     self.send(Cmd::CancelSync);
                 }
             } else {
-                let hint = "Download changes from relays, fetch all feeds, then upload changes (R)";
-                if ui.button(if self.narrow { "⟳" } else { "⟳  Sync" }).on_hover_text(hint).clicked() {
+                let (label, hint) = if self.local {
+                    ("⟳  Refresh", "Fetch all feeds (R)")
+                } else {
+                    ("⟳  Sync", "Download changes from relays, fetch all feeds, then upload changes (R)")
+                };
+                if ui.button(if self.narrow { "⟳" } else { label }).on_hover_text(hint).clicked() {
                     self.send(Cmd::SyncNow);
                 }
             }
@@ -962,13 +1085,14 @@ impl App {
                             let open = !self.collapsed.contains(&feed.url);
                             follows_group(ui, feed, &self.follows_people, &self.view, open, &mut action);
                         } else {
-                            feed_row(ui, feed, feed.local, &self.view, &categories, &mut action);
+                            feed_row(ui, feed, feed.local && !self.local, &self.view, &categories, &mut action);
                         }
                     }
                     continue;
                 }
                 let open = !self.collapsed.contains(category);
-                let local = group_is_local(category, group.iter(), &self.local_categories);
+                // Without sync, everything is on this device only: nothing to mark.
+                let local = !self.local && group_is_local(category, group.iter(), &self.local_categories);
                 ui.horizontal(|ui| {
                     let arrow = Button::new(if open { "⏷" } else { "⏵" }).frame(false);
                     if ui.add(arrow).clicked() {
@@ -998,7 +1122,7 @@ impl App {
                         } else {
                             "Keeps its feeds on this device only; your other devices drop them"
                         };
-                        if ui.button(toggle).on_hover_text(hint).clicked() {
+                        if !self.local && ui.button(toggle).on_hover_text(hint).clicked() {
                             action = Some(FeedAction::SetSynced(category.clone(), local));
                         }
                         if ui.button("Rename…").clicked() {
@@ -1014,7 +1138,7 @@ impl App {
                         for feed in group {
                             // A group can be partly local (a feed moved in by another device
                             // stays synced), and then each local feed says so itself.
-                            let marked = feed.local && !local;
+                            let marked = feed.local && !local && !self.local;
                             feed_row(ui, feed, marked, &self.view, &categories, &mut action);
                         }
                     });
@@ -1639,7 +1763,11 @@ impl App {
                     Dialog::NewCategory { url, name, focus } => {
                         ui.label(RichText::new("New category").size(18.0).strong());
                         ui.add_space(8.0);
-                        let response = ui.add(TextEdit::singleline(name).desired_width(f32::INFINITY));
+                        let response = ui.add(
+                            TextEdit::singleline(name)
+                                .char_limit(db::MAX_CATEGORY_BYTES / 4)
+                                .desired_width(f32::INFINITY),
+                        );
                         focus_on_open(&response, focus);
                         let enter = response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
                         ui.add_space(8.0);
@@ -1690,7 +1818,11 @@ impl App {
                     Dialog::RenameCategory { from, to } => {
                         ui.label(RichText::new(format!("Rename “{from}”")).size(18.0).strong());
                         ui.add_space(8.0);
-                        let response = ui.add(TextEdit::singleline(to).desired_width(f32::INFINITY));
+                        let response = ui.add(
+                            TextEdit::singleline(to)
+                                .char_limit(db::MAX_CATEGORY_BYTES / 4)
+                                .desired_width(f32::INFINITY),
+                        );
                         let enter = response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
@@ -1707,18 +1839,22 @@ impl App {
                     }
                     Dialog::ConfirmErase { understood, busy, error } => {
                         ui.label(RichText::new("Delete all Feedstr data?").size(18.0).strong());
-                        ui.add(
-                            Label::new(
-                                "This deletes your feeds, categories, stored articles, read/unread state, favorites \
-                                 and settings from your relays and from this device, and signs you out. Your other \
-                                 devices erase their copies the next time they sync. This can't be undone.",
-                            )
-                            .wrap(),
-                        );
-                        ui.add_space(4.0);
-                        let note = "Only Feedstr's data is deleted: your Nostr profile and posts are not affected. If \
-                                    you sign in with a Sync Key, make sure you have saved it somewhere else.";
-                        ui.add(Label::new(RichText::new(note).weak()).wrap());
+                        let text = if self.local {
+                            "This deletes your feeds, categories, stored articles, read/unread state, favorites and \
+                             settings from this device. This can't be undone."
+                        } else {
+                            "This deletes your feeds, categories, stored articles, read/unread state, favorites \
+                             and settings from your relays and from this device, and signs you out. Your other \
+                             devices erase their copies the next time they sync. This can't be undone."
+                        };
+                        ui.add(Label::new(text).wrap());
+                        if !self.local {
+                            ui.add_space(4.0);
+                            let note = "Only Feedstr's data is deleted: your Nostr profile and posts are not \
+                                        affected. If you sign in with a Sync Key, make sure you have saved it \
+                                        somewhere else.";
+                            ui.add(Label::new(RichText::new(note).weak()).wrap());
+                        }
                         ui.add_space(8.0);
                         ui.add_enabled(!*busy, egui::Checkbox::new(understood, "I understand this can't be undone"));
                         if let Some(error) = error {
@@ -2066,7 +2202,10 @@ impl App {
         };
         ui.horizontal_wrapped(|ui| {
             let width = ui.available_width().min(220.0);
-            let edit = TextEdit::singleline(&mut page.new_filter).hint_text("Word or phrase").desired_width(width);
+            let edit = TextEdit::singleline(&mut page.new_filter)
+                .hint_text("Word or phrase")
+                .char_limit(db::MAX_FILTER_BYTES / 4)
+                .desired_width(width);
             let response = ui.add(edit);
             let enter = response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
             ComboBox::from_id_salt("filter scope").selected_text(scope_label(&page.filter_scope)).width(width).show_ui(
@@ -2113,7 +2252,12 @@ impl App {
         let follows = self.feeds.iter().find(|f| f.url == longform::FOLLOWS_URL);
         let mut on = follows.is_some();
         let category = follows.map(|f| f.category.clone()).unwrap_or_default();
-        if ui.checkbox(&mut on, "Show long-form posts from everyone you follow").changed()
+        if self.local && !on {
+            // Whom you follow is known from your Nostr account.
+            ui.add_enabled(false, egui::Checkbox::new(&mut on, "Show long-form posts from everyone you follow"));
+            let hint = "Needs your Nostr account: turn on sync in Settings › Sync to sign in.";
+            ui.add(Label::new(RichText::new(hint).small().weak()).wrap());
+        } else if ui.checkbox(&mut on, "Show long-form posts from everyone you follow").changed()
             && self.db.set_subscribed(longform::FOLLOWS_URL, on).is_ok()
         {
             if on {
@@ -2316,8 +2460,33 @@ impl App {
         ui.add(Label::new(RichText::new("Ctrl + and Ctrl − change it too; Ctrl 0 resets.").small().weak()).wrap());
     }
 
+    /// Without sync: offers to turn it on, or to delete everything here.
+    fn local_settings(&mut self, ui: &mut Ui) {
+        ui.label(RichText::new("Not syncing").strong());
+        let text = "Your feeds are kept on this device only. Turn on sync to keep them the same on all your devices, \
+                    encrypted, over Nostr: what's here is added to your account.";
+        ui.add(Label::new(RichText::new(text).weak()).wrap());
+        ui.add_space(4.0);
+        if ui.add(primary_button("Turn on sync…")).clicked() {
+            self.turn_on_sync();
+        }
+        ui.add_space(16.0);
+        ui.separator();
+        ui.add_space(8.0);
+        let delete = Button::new(RichText::new("Delete all Feedstr data…").color(ui.visuals().error_fg_color));
+        if ui.add(delete).on_hover_text("Deletes your feeds, articles and settings on this device").clicked() {
+            self.dialog = Some(Dialog::ConfirmErase { understood: false, busy: false, error: None });
+        }
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(12.0);
+    }
+
     /// The account synced with, at the top of the Sync settings.
     fn account_settings(&mut self, ui: &mut Ui, show_key: &mut bool) {
+        if self.local {
+            return self.local_settings(ui);
+        }
         ui.label(RichText::new("Account").strong());
         ui.add(Label::new(RichText::new(&self.npub).monospace().small()).truncate());
         ui.horizontal_wrapped(|ui| {
@@ -2410,23 +2579,27 @@ impl App {
         let hint = |ui: &mut Ui, text: &str| ui.add(Label::new(RichText::new(text).small().weak()).wrap());
 
         ui.horizontal_wrapped(|ui| {
-            ui.label("Sync automatically");
+            ui.label(if self.local { "Fetch feeds automatically" } else { "Sync automatically" });
             let current = worker::sync_minutes(&self.db);
             let mut minutes = current;
-            ComboBox::from_id_salt("schedule").selected_text(schedule_label(current)).show_ui(ui, |ui| {
+            let local = self.local;
+            let label = schedule_label(current, local);
+            ComboBox::from_id_salt("schedule").selected_text(label).show_ui(ui, |ui| {
                 for &choice in worker::SYNC_SCHEDULES {
-                    ui.selectable_value(&mut minutes, choice, schedule_label(choice));
+                    ui.selectable_value(&mut minutes, choice, schedule_label(choice, local));
                 }
             });
             if minutes != current {
                 let _ = self.db.set_meta("sync_minutes", &minutes.to_string());
                 self.send(Cmd::ScheduleChanged);
-                if self.status == worker::MANUAL_STATUS {
+                if self.status == worker::MANUAL_STATUS || self.status == worker::MANUAL_LOCAL_STATUS {
                     self.status.clear();
                 }
             }
         });
-        if worker::manual_sync(&self.db) {
+        if worker::manual_sync(&self.db) && self.local {
+            hint(ui, "Feedstr only fetches feeds when you use the Refresh button (or press R).");
+        } else if worker::manual_sync(&self.db) {
             hint(
                 ui,
                 "Feedstr only syncs when you use the Sync button (or press R). Your changes stay on this device until then.",
@@ -2469,10 +2642,13 @@ impl App {
             let _ = worker::set_relays(&self.db, &relays);
             self.send(Cmd::RelaysChanged);
         }
+        if self.local {
+            hint(ui, "Without sync, relays are only used to read Nostr long-form posts and nsites.");
+        }
 
         ui.add_space(12.0);
         let categories = self.categories.clone();
-        if !categories.is_empty() {
+        if !categories.is_empty() && !self.local {
             ui.label(RichText::new("Groups").strong());
             for name in categories {
                 let group = self.feeds.iter().filter(|f| f.category == name);
@@ -2490,26 +2666,27 @@ impl App {
             );
             ui.add_space(12.0);
         }
-        ui.label(RichText::new("Cached on relays").strong());
-        let current = self.db.cache_limits().ok().flatten().map(|l| l.0).unwrap_or_default();
-        let mut limits = current;
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Up to");
-            ui.add(DragValue::new(&mut limits.items).range(0..=500));
-            ui.label("items per feed, from the last");
-            ui.add(DragValue::new(&mut limits.days).range(1..=3650));
-            ui.label("days");
-        });
-        if limits != current {
-            let _ = self.db.set_cache_limits(limits);
+        if !self.local {
+            ui.label(RichText::new("Cached on relays").strong());
+            let current = self.db.cache_limits().ok().flatten().map(|l| l.0).unwrap_or_default();
+            let mut limits = current;
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Up to");
+                ui.add(DragValue::new(&mut limits.items).range(0..=500));
+                ui.label("items per feed, from the last");
+                ui.add(DragValue::new(&mut limits.days).range(1..=3650));
+                ui.label("days");
+            });
+            if limits != current {
+                let _ = self.db.set_cache_limits(limits);
+            }
+            hint(
+                ui,
+                "Shared by all your devices. Clients that can't fetch feeds themselves, like the web version, only \
+                 see this cache. Favorites are always included.",
+            );
+            ui.add_space(12.0);
         }
-        hint(
-            ui,
-            "Shared by all your devices. Clients that can't fetch feeds themselves, like the web version, only see \
-             this cache. Favorites are always included.",
-        );
-
-        ui.add_space(12.0);
         let here = if cfg!(target_arch = "wasm32") { "Stored in this browser" } else { "Stored on this device" };
         ui.label(RichText::new(here).strong());
         let current = self.db.keep_days().unwrap_or(crate::db::DEFAULT_KEEP_DAYS);
@@ -2527,7 +2704,14 @@ impl App {
         if wanted != current {
             let _ = self.db.set_meta("keep_days", &wanted.to_string());
         }
-        hint(ui, "Favorites, items still in their feed, and items cached on relays are always kept.");
+        hint(
+            ui,
+            if self.local {
+                "Favorites and items still in their feed are always kept."
+            } else {
+                "Favorites, items still in their feed, and items cached on relays are always kept."
+            },
+        );
     }
 
     /// Shown while closing waits for changes to be saved to relays.
@@ -2555,11 +2739,13 @@ fn group_is_local<'a>(category: &str, mut group: impl Iterator<Item = &'a FeedRo
     local.iter().any(|c| c == category) && group.all(|f| f.local)
 }
 
-fn schedule_label(minutes: u32) -> String {
+/// `local`: without sync, nothing happens on closing.
+fn schedule_label(minutes: u32, local: bool) -> String {
     match minutes {
         worker::MANUAL_SYNC => "Manual only".into(),
         // The web version can't count on being closed properly, so it syncs while open.
         0 if cfg!(target_arch = "wasm32") => format!("Every {} minutes (default)", worker::WEB_SYNC_MINUTES),
+        0 if local => "Only at start".into(),
         0 => "Only at start and exit".into(),
         60 => "Every hour".into(),
         m if m % 60 == 0 => format!("Every {} hours", m / 60),
@@ -2798,8 +2984,9 @@ impl App {
         if ctx.input(|i| i.viewport().close_requested()) && self.exit != Exit::Ready {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             if self.exit == Exit::Running {
-                // Manual Only saves nothing on closing, so there's nothing to wait for.
-                if self.screen == Screen::Main && !worker::manual_sync(&self.db) {
+                // Manual Only saves nothing on closing, and without sync there's
+                // nowhere to save to, so there's nothing to wait for.
+                if self.screen == Screen::Main && !self.local && !worker::manual_sync(&self.db) {
                     self.send(Cmd::Exit);
                     let _ = self.closing.send(true);
                     self.exit = Exit::Saving(now_ms());
@@ -2851,7 +3038,10 @@ fn card(ui: &mut Ui, contents: impl FnOnce(&mut Ui)) {
 
 /// A category name to type, with the existing ones to pick from.
 fn category_picker(ui: &mut Ui, category: &mut String, categories: &[String], busy: bool) {
-    let edit = TextEdit::singleline(category).hint_text("Category (optional)").desired_width(f32::INFINITY);
+    let edit = TextEdit::singleline(category)
+        .hint_text("Category (optional)")
+        .char_limit(db::MAX_CATEGORY_BYTES / 4)
+        .desired_width(f32::INFINITY);
     ui.add_enabled(!busy, edit);
     if !categories.is_empty() {
         ui.horizontal_wrapped(|ui| {
@@ -2912,7 +3102,7 @@ fn route_picker(ui: &mut Ui, input: &str, route: &mut Route, busy: bool) {
 /// The version shown in About (the same as `versionName` in
 /// droid/app/build.gradle.kts, and the Flatpak's newest release in
 /// flatpak/top.dns7.feedstr.Feedstr.metainfo.xml).
-const VERSION: &str = "v0.1";
+const VERSION: &str = "v0.2";
 
 /// What Feedstr is, and where to read more.
 fn about(ui: &mut Ui) {

@@ -5,6 +5,9 @@
 //! schedule. Closing the app publishes any remaining changes. With syncing set
 //! to Manual Only ([`MANUAL_SYNC`]), only [`Cmd::SyncNow`], signing in and
 //! signing out talk to relays.
+//!
+//! Syncing is optional: without it ([`Login::Local`], see [`local_only`]),
+//! there is no account and no signer, and a cycle only fetches the feeds.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -206,6 +209,9 @@ pub enum Login {
     Extension,
     /// A signer app on the device (NIP-55 on Android).
     SignerApp,
+    /// No sync and no account: a feed reader on this device only (see [`local_only`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    Local,
     /// Sign in again with what was saved last time.
     Saved,
 }
@@ -267,8 +273,9 @@ pub enum Cmd {
 }
 
 pub enum Msg {
+    /// Signed in, as `npub`, or set up without sync (`None`, see [`local_only`]).
     LoggedIn {
-        npub: String,
+        npub: Option<String>,
     },
     /// The `nostrconnect://` link to show as a QR code while signing in.
     ConnectLink(String),
@@ -341,8 +348,28 @@ pub fn sync_minutes(db: &Db) -> u32 {
 /// Shown on starting with "Manual only" (and cleared on leaving it).
 pub const MANUAL_STATUS: &str = "Manual only: Sync to sync now";
 
+/// [`MANUAL_STATUS`], without sync (see [`local_only`]).
+pub const MANUAL_LOCAL_STATUS: &str = "Manual only: Refresh to fetch feeds now";
+
 pub fn manual_sync(db: &Db) -> bool {
     sync_minutes(db) == MANUAL_SYNC
+}
+
+/// Kept as the sign-in (`login` in the database) when the user chose not to sync.
+const LOCAL_LOGIN: &str = "local";
+
+/// Whether this device doesn't sync (the user chose not to): no account, no
+/// signer and nothing on relays, just a feed reader. A cycle only fetches the
+/// feeds. Relays are still used to read Nostr feeds and nsites. Signing in
+/// later adds what's here to the account. Never on the web, where browsers
+/// can't fetch most feeds themselves.
+pub fn local_only(db: &Db) -> bool {
+    !cfg!(target_arch = "wasm32") && db.meta("login").ok().flatten().as_deref() == Some(LOCAL_LOGIN)
+}
+
+/// Whether this device is signed in to sync (and not [`local_only`]).
+pub fn syncs(db: &Db) -> bool {
+    db.meta("login").ok().flatten().is_some_and(|login| login != LOCAL_LOGIN)
 }
 
 /// Whether anything changed since the relays last took everything (so
@@ -379,6 +406,9 @@ pub struct Remote {
     life: Arc<Lifecycle>,
     /// To tell whether going to the background leaves changes to upload.
     store: Store,
+    /// For [`Remote::finish`], as [`Handle::closing`].
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    closing: watch::Sender<bool>,
 }
 
 /// Whether the app is in the background, and since when. Kept apart from the
@@ -395,6 +425,8 @@ struct Lifecycle {
     /// (see [`Remote::network_changed`]).
     network: std::sync::atomic::AtomicU64,
     network_changed: tokio::sync::Notify,
+    /// Set once the worker has handled [`Cmd::Exit`].
+    exited: AtomicBool,
 }
 
 impl Remote {
@@ -405,8 +437,7 @@ impl Remote {
         self.life.hidden_at.store(now_ms(), Ordering::Relaxed);
         self.life.hidden.store(true, Ordering::Relaxed);
         let work = self.life.busy.load(Ordering::Relaxed)
-            || db::connect(&self.store)
-                .is_ok_and(|db| db.meta("login").ok().flatten().is_some() && !manual_sync(&db) && has_changes(&db));
+            || db::connect(&self.store).is_ok_and(|db| syncs(&db) && !manual_sync(&db) && has_changes(&db));
         self.tx.send(Cmd::Paused { kept_running: work }).is_ok() && work
     }
 
@@ -419,6 +450,26 @@ impl Remote {
     /// Uploads what's left and stops syncing (say, when another browser tab takes over).
     pub fn exit(&self) {
         let _ = self.tx.send(Cmd::Exit);
+    }
+
+    /// Closes the app without its window (Android, when the activity is gone
+    /// and the process is about to end): uploads what's left as closing does,
+    /// and waits for that for up to `limit`. Returns whether it finished.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn finish(&self, limit: Duration) -> bool {
+        let _ = self.closing.send(true);
+        if self.tx.send(Cmd::Exit).is_err() {
+            // The worker has stopped already.
+            return true;
+        }
+        let until = std::time::Instant::now() + limit;
+        while !self.life.exited.load(Ordering::Relaxed) {
+            if std::time::Instant::now() >= until {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        true
     }
 
     /// How this device connects changed (see [`Lifecycle::network`]): a sync
@@ -440,7 +491,8 @@ pub fn spawn(store: &Store, ctx: eframe::egui::Context, platform: Arc<dyn Platfo
     let cancel_connect = Arc::new(tokio::sync::Notify::new());
     let mut worker = Worker::new(db::connect(store)?, msg_tx, ctx, closing, platform);
     worker.cancel_connect = cancel_connect.clone();
-    let remote = Remote { tx: cmd_tx.clone(), life: worker.life.clone(), store: store.clone() };
+    let remote =
+        Remote { tx: cmd_tx.clone(), life: worker.life.clone(), store: store.clone(), closing: closing_tx.clone() };
     #[cfg(not(target_arch = "wasm32"))]
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -545,17 +597,25 @@ impl Worker {
                     match cmd {
                         Cmd::Login(login) => match (matches!(login, Login::Saved), self.login_with_retries(login).await) {
                             (saved, Ok(npub)) => {
+                                let local = npub.is_none();
                                 self.send(Msg::LoggedIn { npub });
-                                if !saved {
+                                // Signing in on purpose always syncs; starting up only when it's
+                                // automatic, and not again right after the last time. Choosing
+                                // not to sync is like starting up: there's nothing to sync.
+                                let on_purpose = !saved && !local;
+                                if on_purpose {
                                     self.follows_by_default().await;
                                 }
-                                // Signing in on purpose always syncs; starting up only when it's
-                                // automatic, and not again right after the last time.
-                                if !saved || (!manual_sync(&self.db) && self.auto_sync_due()) {
+                                if on_purpose || (!manual_sync(&self.db) && self.auto_sync_due()) {
                                     self.adding_meanwhile(&mut rx, &mut later, self.cycle(false)).await;
                                 } else if manual_sync(&self.db) {
                                     // Replaces "Connecting to relays…", which would stay up otherwise.
-                                    self.status(MANUAL_STATUS);
+                                    self.status(if local { MANUAL_LOCAL_STATUS } else { MANUAL_STATUS });
+                                } else if local && self.db.subscribed_feeds().is_ok_and(|feeds| feeds.is_empty()) {
+                                    // Nothing to fetch: nothing to say.
+                                    self.status("");
+                                } else if local {
+                                    self.status("Updated less than 10 minutes ago: Refresh to fetch feeds again now");
                                 } else {
                                     self.status("Synced less than 10 minutes ago: Sync to sync again now");
                                 }
@@ -624,6 +684,7 @@ impl Worker {
                             if self.kept_running.get() {
                                 self.platform.keep_running(false);
                             }
+                            self.life.exited.store(true, Ordering::Relaxed);
                             self.send(Msg::ExitReady);
                             break;
                         }
@@ -725,7 +786,9 @@ impl Worker {
         // Dropped before the feeds being added finish, so a cancelled sync
         // stops now.
         drop(work);
-        if done.is_none() {
+        if done.is_none() && local_only(&self.db) {
+            self.status("Refresh cancelled: feeds not fetched yet are fetched next time");
+        } else if done.is_none() {
             self.status("Sync cancelled: what was done so far is kept, the rest is done next time");
             self.send(Msg::Changed);
         }
@@ -749,7 +812,8 @@ impl Worker {
     fn next_cycle(&self) -> i64 {
         const NEVER: i64 = 365 * 24 * 3600 * 1000;
         match sync_minutes(&self.db) {
-            _ if self.nostr.is_none() => now_ms() + NEVER,
+            // Without sync, a cycle still fetches the feeds.
+            _ if self.nostr.is_none() && !local_only(&self.db) => now_ms() + NEVER,
             MANUAL_SYNC => now_ms() + NEVER,
             0 if cfg!(target_arch = "wasm32") => self.not_before_gap(now_ms() + WEB_SYNC_MINUTES as i64 * 60 * 1000),
             0 => now_ms() + NEVER,
@@ -781,8 +845,19 @@ impl Worker {
     }
 
     /// Pulls from relays, fetches every feed, then publishes what changed.
+    /// Without sync ([`local_only`]), only fetches the feeds.
     async fn cycle(&self, throttle_feed_caches: bool) {
         self.keep_running();
+        if local_only(&self.db) {
+            let feeds = self.db.subscribed_feeds().map(|feeds| feeds.len()).unwrap_or(0);
+            self.refresh().await;
+            if !*self.closing.borrow() {
+                let _ = self.db.set_meta("synced_at", &now_ms().to_string());
+                let time = chrono::Local::now().format("%H:%M");
+                self.status(if feeds == 0 { String::new() } else { format!("Updated at {time}") });
+            }
+            return;
+        }
         let read = self.sync(Options { publish: false, throttle_feed_caches }).await.saved;
         self.refresh().await;
         let saved = self.push(throttle_feed_caches).await;
@@ -824,7 +899,7 @@ impl Worker {
 
     /// Signing in again with what was saved is tried a few times: a browser
     /// extension or a signer may not be ready yet when the app starts.
-    async fn login_with_retries(&mut self, login: Login) -> Result<String> {
+    async fn login_with_retries(&mut self, login: Login) -> Result<Option<String>> {
         let saved = matches!(login, Login::Saved);
         let mut result = self.login(login).await;
         for _ in 0..SAVED_LOGIN_RETRIES {
@@ -837,20 +912,32 @@ impl Worker {
         result
     }
 
-    async fn login(&mut self, login: Login) -> Result<String> {
+    /// Signs in, returning the account's npub, or `None` without sync ([`Login::Local`]).
+    async fn login(&mut self, login: Login) -> Result<Option<String>> {
+        let was_local = self.db.meta("login")?.as_deref() == Some(LOCAL_LOGIN);
+        // Kept only once signing in has worked: until then, this device stays as it was.
+        let mut remember: Vec<(&str, String)> = Vec::new();
         let signer = match login {
+            #[cfg(not(target_arch = "wasm32"))]
+            Login::Local => {
+                // What an unfinished sign-in may have kept (a Sync Key typed, say) goes.
+                self.db.set_meta("login", LOCAL_LOGIN)?;
+                self.db.delete_meta("sync_key")?;
+                self.db.delete_meta("bunker_uri")?;
+                return self.go_local().await;
+            }
             Login::SyncKey(nsec) => {
                 let keys = Keys::parse(nsec.trim()).context("that is not a valid Sync Key")?;
-                self.db.set_meta("login", "sync_key")?;
-                self.db.set_meta("sync_key", &keys.secret_key().to_bech32()?)?;
+                remember.push(("sync_key", keys.secret_key().to_bech32()?));
+                remember.push(("login", "sync_key".into()));
                 Signer::Keys(keys)
             }
             Login::Bunker(uri) => {
                 self.status("Waiting for the remote signer to approve…");
                 let signer = Signer::bunker(&uri, &self.bunker_app_key()?, proxy::relay_proxy(&self.db)?)?;
                 signer.public_key().await.context("the remote signer did not respond")?;
-                self.db.set_meta("login", "bunker")?;
-                self.db.set_meta("bunker_uri", uri.trim())?;
+                remember.push(("bunker_uri", uri.trim().to_string()));
+                remember.push(("login", "bunker".into()));
                 signer
             }
             Login::QrCode => {
@@ -866,22 +953,21 @@ impl Worker {
                 }
                 // From now on it's a remote signer like any other.
                 let uri = signer.bunker_uri().await.context("the signer app didn't say how to reach it")?;
-                self.db.set_meta("login", "bunker")?;
-                self.db.set_meta("bunker_uri", &uri)?;
+                remember.push(("bunker_uri", uri));
+                remember.push(("login", "bunker".into()));
                 signer
             }
             #[cfg(target_arch = "wasm32")]
             Login::Extension => {
                 self.status("Waiting for the browser extension…");
-                let signer = Signer::extension()?;
-                self.db.set_meta("login", "extension")?;
-                signer
+                remember.push(("login", "extension".into()));
+                Signer::extension()?
             }
             Login::SignerApp => {
                 self.status("Waiting for the signer app…");
                 let signer = Signer::App(self.platform.signer_app().context("no signer app is installed")?);
                 signer.public_key().await.context("the signer app didn't give Feedstr your key")?;
-                self.db.set_meta("login", "signer_app")?;
+                remember.push(("login", "signer_app".into()));
                 signer
             }
             Login::Saved => match self.db.meta("login")?.as_deref() {
@@ -895,6 +981,8 @@ impl Worker {
                     let uri = self.db.meta("bunker_uri")?.unwrap_or_default();
                     Signer::bunker(&uri, &self.bunker_app_key()?, proxy::relay_proxy(&self.db)?)?
                 }
+                #[cfg(not(target_arch = "wasm32"))]
+                Some(LOCAL_LOGIN) => return self.go_local().await,
                 _ => bail!("not signed in"),
             },
         };
@@ -906,13 +994,35 @@ impl Worker {
         let nostr = NostrTransport::new(signer, relays(&self.db), proxy::relay_proxy(&self.db)?).await?;
         let pubkey = nostr.pubkey().to_hex();
         // Never mix two accounts' data in one database.
-        if self.db.meta("pubkey")?.is_some_and(|old| old != pubkey) {
-            self.db.wipe_account(false)?;
+        match self.db.meta("pubkey")? {
+            Some(old) if old != pubkey => {
+                self.db.wipe_account(false)?;
+                self.db.forget_joining()?;
+            }
+            // What this device has from using it without sync joins the account.
+            None if was_local => self.db.joining_account()?,
+            _ => {}
+        }
+        for (key, value) in &remember {
+            self.db.set_meta(key, value)?;
         }
         self.db.set_meta("pubkey", &pubkey)?;
+        // In case the app was stopped while an erase replaced this device's data.
+        if let Err(e) = self.db.restore_kept() {
+            log::error!("couldn't restore this device's data: {e:#}");
+        }
         let npub = nostr.pubkey().to_bech32()?;
         self.nostr = Some(nostr);
-        Ok(npub)
+        Ok(Some(npub))
+    }
+
+    /// Goes on without sync: no connection to relays for syncing.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn go_local(&mut self) -> Result<Option<String>> {
+        if let Some(old) = self.nostr.take() {
+            old.shutdown().await;
+        }
+        Ok(None)
     }
 
     /// The key identifying this app to the remote signer; kept so approval survives restarts.
@@ -943,6 +1053,11 @@ impl Worker {
     }
 
     async fn erase_all(&mut self) -> Result<String> {
+        // Nothing is on relays without sync: only this device has anything to delete.
+        if local_only(&self.db) {
+            self.db.wipe_everything()?;
+            return Ok("Your Feedstr data was deleted from this device.".into());
+        }
         let Some(nostr) = &self.nostr else { bail!("not connected to relays, so nothing was deleted") };
         // Learn about feeds added on other devices, so their data goes too.
         self.status("Checking for data from your other devices…");
@@ -1434,6 +1549,10 @@ impl Worker {
         let status = match synced {
             Ok(report) => {
                 outcome = SyncOutcome { saved: report.relays_ok > 0 && report.problems.is_empty() };
+                // The account's data has been read (an erase in it included).
+                if outcome.saved {
+                    let _ = self.db.joined_account();
+                }
                 let time = chrono::Local::now().format("%H:%M");
                 let mut status = format!("Synced at {time} · {}/{} relays", report.relays_ok, report.relays_total);
                 if report.relays_total == 0 && proxy::relay_proxy(&self.db).is_ok_and(|via| via.is_some()) {
@@ -1623,17 +1742,22 @@ mod tests {
         /// commands, and runs it until it has handled them all.
         async fn run(&self, send: impl FnOnce(&Remote)) -> Ran {
             let (msg_tx, msgs) = mpsc::channel();
-            let (_closing_tx, closing) = watch::channel(false);
+            let (closing_tx, closing) = watch::channel(false);
             let platform = Arc::new(Recorder::default());
             let ctx = eframe::egui::Context::default();
             let mut worker = Worker::new(self.db(), msg_tx, ctx, closing, platform.clone());
-            let signer = Signer::Keys(self.keys.clone());
-            worker.nostr = Some(NostrTransport::new(signer, relays(&worker.db), None).await.unwrap());
+            if syncs(&worker.db) {
+                let signer = Signer::Keys(self.keys.clone());
+                worker.nostr = Some(NostrTransport::new(signer, relays(&worker.db), None).await.unwrap());
+            }
             let (tx, rx) = unbounded_channel();
-            let remote = Remote { tx, life: worker.life.clone(), store: self.path.clone() };
+            // As in the app, where the Handle keeps one: closing it would read as closing.
+            let closing = closing_tx.clone();
+            let remote = Remote { tx, life: worker.life.clone(), store: self.path.clone(), closing };
             send(&remote);
             drop(remote);
             worker.run(rx).await;
+            drop(closing_tx);
             let (mut statuses, mut added, mut syncing) = (Vec::new(), Vec::new(), Vec::new());
             for msg in msgs.try_iter() {
                 match msg {
@@ -1645,6 +1769,14 @@ mod tests {
             }
             let kept_running = platform.kept_running.lock().unwrap().clone();
             Ran { statuses, kept_running, added, syncing }
+        }
+
+        /// The same, set up without sync instead (as if chosen earlier).
+        async fn local() -> Self {
+            let app = Self::new().await;
+            app.db().set_meta("login", LOCAL_LOGIN).unwrap();
+            app.db().delete_meta("sync_key").unwrap();
+            app
         }
 
         fn synced_minutes_ago(&self, minutes: i64) {
@@ -1716,7 +1848,7 @@ mod tests {
     fn coming_back_reports_how_long_the_app_was_away() {
         let (tx, mut rx) = unbounded_channel();
         let store = std::env::temp_dir().join(format!("feedstr-test-{}.db", Keys::generate().public_key().to_hex()));
-        let remote = Remote { tx, life: Arc::default(), store };
+        let remote = Remote { tx, life: Arc::default(), store, closing: watch::channel(false).0 };
         remote.resumed();
         assert!(matches!(rx.try_recv(), Ok(Cmd::Resumed { away_ms: 0 })));
         remote.paused();
@@ -1727,6 +1859,29 @@ mod tests {
         // Once the worker has stopped, it can't stop keeping the app running either.
         drop(rx);
         assert!(!remote.paused());
+    }
+
+    #[tokio::test]
+    async fn finishing_uploads_what_is_left_and_waits_for_it() {
+        let app = TestApp::new().await;
+        app.change();
+        let mut finishing = None;
+        let ran = app
+            .run(|remote| {
+                let remote = remote.clone();
+                finishing = Some(std::thread::spawn(move || remote.finish(Duration::from_secs(30))));
+            })
+            .await;
+        assert!(finishing.unwrap().join().unwrap(), "finish gave up");
+        assert!(ran.uploaded(), "{:?}", ran.statuses);
+        assert!(!has_changes(&app.db()));
+        // With the worker gone, there's nothing to wait for.
+        let (tx, rx) = unbounded_channel();
+        drop(rx);
+        let remote = Remote { tx, life: Arc::default(), store: app.path.clone(), closing: watch::channel(false).0 };
+        let started = std::time::Instant::now();
+        assert!(remote.finish(Duration::from_secs(30)));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[tokio::test]
@@ -1807,6 +1962,172 @@ mod tests {
         assert!(ok);
         assert!(statuses_before <= synced, "added after the sync: {:?}", ran.statuses);
         assert!(app.db().subscribed_feeds().unwrap().contains(&quick));
+    }
+
+    #[tokio::test]
+    async fn without_sync_a_refresh_only_fetches_feeds() {
+        let app = TestApp::local().await;
+        let feed = feed_server(Duration::ZERO, FEED);
+        app.db().set_subscribed(&feed, true).unwrap();
+        let ran = app.run(|remote| remote.tx.send(Cmd::SyncNow).unwrap()).await;
+        assert!(!ran.synced() && !ran.uploaded(), "{:?}", ran.statuses);
+        assert!(ran.statuses.last().unwrap().starts_with("Updated at"), "{:?}", ran.statuses);
+        assert_eq!(app.db().items(&db::View::Feed(feed), false).unwrap().len(), 1);
+        // A complete refresh counts as the last one, so starting again soon doesn't fetch again.
+        assert!(app.db().meta("synced_at").unwrap().is_some());
+        let ran = app.run(|remote| remote.tx.send(Cmd::Login(Login::Saved)).unwrap()).await;
+        assert_eq!(ran.statuses.last().unwrap(), "Updated less than 10 minutes ago: Refresh to fetch feeds again now");
+        // Changes have nowhere to go: leaving the app doesn't keep it running for them.
+        app.change();
+        let ran = app.run(|remote| assert!(!remote.paused())).await;
+        assert!(ran.kept_running.is_empty() && !ran.uploaded());
+    }
+
+    #[tokio::test]
+    async fn without_sync_refreshes_follow_the_schedule() {
+        let app = TestApp::local().await;
+        app.db().set_meta("sync_minutes", "30").unwrap();
+        app.synced_minutes_ago(60);
+        let ran = app.run(|_| {}).await;
+        let worker = Worker::new(
+            app.db(),
+            mpsc::channel().0,
+            Default::default(),
+            watch::channel(false).1,
+            Arc::new(Recorder::default()),
+        );
+        // Due in 30 minutes, though nothing is signed in.
+        let due = worker.next_cycle() - now_ms();
+        assert!((29 * 60 * 1000..=30 * 60 * 1000).contains(&due), "{due}");
+        assert!(ran.statuses.is_empty());
+        app.db().set_meta("sync_minutes", &MANUAL_SYNC.to_string()).unwrap();
+        let ran = app.run(|remote| remote.tx.send(Cmd::Login(Login::Saved)).unwrap()).await;
+        assert_eq!(ran.statuses.last().unwrap(), MANUAL_LOCAL_STATUS);
+    }
+
+    #[tokio::test]
+    async fn choosing_not_to_sync_forgets_an_unfinished_sign_in() {
+        let app = TestApp::new().await;
+        let ran = app.run(|remote| remote.tx.send(Cmd::Login(Login::Local)).unwrap()).await;
+        assert!(!ran.synced());
+        assert!(local_only(&app.db()) && !syncs(&app.db()));
+        assert!(app.db().meta("sync_key").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn turning_on_sync_keeps_and_uploads_what_is_here() {
+        let app = TestApp::local().await;
+        let feed = feed_server(Duration::ZERO, FEED);
+        app.db().set_subscribed(&feed, true).unwrap();
+        app.synced_minutes_ago(1);
+        let nsec = app.keys.secret_key().to_bech32().unwrap();
+        let ran = app.run(|remote| remote.tx.send(Cmd::Login(Login::SyncKey(nsec))).unwrap()).await;
+        assert!(ran.synced() && ran.uploaded(), "{:?}", ran.statuses);
+        assert!(syncs(&app.db()) && !local_only(&app.db()));
+        assert_eq!(app.db().subscribed_feeds().unwrap(), std::slice::from_ref(&feed));
+        // Another device signing in to the account gets the feed.
+        let mut other = TestApp::new().await;
+        set_relays(&other.db(), &relays(&app.db())).unwrap();
+        other.keys = app.keys.clone();
+        other.db().set_meta("sync_key", &app.keys.secret_key().to_bech32().unwrap()).unwrap();
+        other.run(|remote| remote.tx.send(Cmd::SyncNow).unwrap()).await;
+        assert!(other.db().subscribed_feeds().unwrap().contains(&feed));
+    }
+
+    #[tokio::test]
+    async fn turning_on_sync_with_an_erased_account_keeps_what_is_here() {
+        // The account's data was deleted from another device.
+        let account = TestApp::new().await;
+        account.change();
+        account.run(|remote| remote.tx.send(Cmd::SyncNow).unwrap()).await;
+        let relay = relays(&account.db());
+        let ran = account.run(|remote| remote.tx.send(Cmd::EraseAll).unwrap()).await;
+        assert!(ran.statuses.iter().any(|s| s.starts_with("Deleting")), "{:?}", ran.statuses);
+        // This device, used without sync, signs in to it.
+        let app = TestApp::local().await;
+        set_relays(&app.db(), &relay).unwrap();
+        let feed = feed_server(Duration::ZERO, FEED);
+        app.db().set_subscribed(&feed, true).unwrap();
+        let nsec = account.keys.secret_key().to_bech32().unwrap();
+        let ran = app.run(|remote| remote.tx.send(Cmd::Login(Login::SyncKey(nsec))).unwrap()).await;
+        assert!(ran.uploaded(), "{:?}", ran.statuses);
+        assert!(app.db().erased_at().unwrap() > 0, "the erase wasn't seen");
+        assert_eq!(app.db().subscribed_feeds().unwrap(), std::slice::from_ref(&feed));
+        // Another device in the account gets the feed.
+        let mut other = TestApp::new().await;
+        set_relays(&other.db(), &relay).unwrap();
+        other.keys = account.keys.clone();
+        other.db().set_meta("sync_key", &account.keys.secret_key().to_bech32().unwrap()).unwrap();
+        other.run(|remote| remote.tx.send(Cmd::SyncNow).unwrap()).await;
+        assert!(other.db().subscribed_feeds().unwrap().contains(&feed));
+    }
+
+    #[tokio::test]
+    async fn without_sync_deleting_everything_only_touches_this_device() {
+        let app = TestApp::local().await;
+        app.change();
+        let ran = app.run(|remote| remote.tx.send(Cmd::EraseAll).unwrap()).await;
+        assert!(!ran.synced() && !ran.uploaded(), "{:?}", ran.statuses);
+        assert!(app.db().subscribed_feeds().unwrap().is_empty());
+        assert!(app.db().meta("login").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failed_sign_in_leaves_the_device_without_sync() {
+        let app = TestApp::local().await;
+        app.change();
+        let nsec = Keys::generate().secret_key().to_bech32().unwrap();
+        // Signing in can't work: the Tor proxy can't be found.
+        proxy::set_tor_everything(&app.db(), true).unwrap();
+        proxy::set_proxy_address(&app.db(), Route::Tor, Some("does-not-exist.invalid:9050")).unwrap();
+        app.run(|remote| remote.tx.send(Cmd::Login(Login::SyncKey(nsec))).unwrap()).await;
+        assert!(local_only(&app.db()));
+        assert!(app.db().meta("sync_key").unwrap().is_none());
+        // Starting again later doesn't sign in with that key.
+        proxy::set_tor_everything(&app.db(), false).unwrap();
+        let ran = app.run(|remote| remote.tx.send(Cmd::Login(Login::Saved)).unwrap()).await;
+        assert!(!ran.synced() && !ran.uploaded(), "{:?}", ran.statuses);
+        assert!(app.db().meta("pubkey").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_second_erase_reaches_a_device_that_was_closed() {
+        let secret = "https://secret.example/feed";
+        let same_account = async |app: &TestApp| {
+            let mut device = TestApp::new().await;
+            set_relays(&device.db(), &relays(&app.db())).unwrap();
+            device.keys = app.keys.clone();
+            device.db().set_meta("sync_key", &app.keys.secret_key().to_bech32().unwrap()).unwrap();
+            device
+        };
+        // Relays keep one event per second for a document.
+        let tick = || tokio::time::sleep(Duration::from_millis(1100));
+        let app = TestApp::new().await;
+        app.run(|remote| remote.tx.send(Cmd::Login(Login::Saved)).unwrap()).await;
+        app.change();
+        app.run(|remote| remote.tx.send(Cmd::SyncNow).unwrap()).await;
+        tick().await;
+        // Everything is deleted from another device, and this one follows...
+        same_account(&app).await.run(|remote| remote.tx.send(Cmd::EraseAll).unwrap()).await;
+        tick().await;
+        app.run(|remote| remote.tx.send(Cmd::SyncNow).unwrap()).await;
+        tick().await;
+        // ...goes on being used...
+        app.db().set_subscribed(secret, true).unwrap();
+        app.run(|remote| remote.tx.send(Cmd::SyncNow).unwrap()).await;
+        tick().await;
+        // ...and is closed when everything is deleted again.
+        let other = same_account(&app).await;
+        other.run(|remote| remote.tx.send(Cmd::SyncNow).unwrap()).await;
+        other.run(|remote| remote.tx.send(Cmd::EraseAll).unwrap()).await;
+        tick().await;
+        app.synced_minutes_ago(60);
+        app.run(|remote| remote.tx.send(Cmd::Login(Login::Saved)).unwrap()).await;
+        assert!(app.db().subscribed_feeds().unwrap().is_empty());
+        tick().await;
+        let fresh = same_account(&app).await;
+        fresh.run(|remote| remote.tx.send(Cmd::SyncNow).unwrap()).await;
+        assert!(!fresh.db().subscribed_feeds().unwrap().iter().any(|feed| feed == secret));
     }
 
     #[tokio::test]

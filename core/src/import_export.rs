@@ -5,7 +5,7 @@
 //! a sync does: newer changes win and nothing is deleted, so importing an old
 //! backup can't undo anything.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{Context, Result, bail};
 use quick_xml::escape::escape;
@@ -38,6 +38,7 @@ pub struct OpmlFeed {
 pub fn parse_opml(xml: &str) -> Result<Vec<OpmlFeed>> {
     let mut reader = Reader::from_str(xml);
     let mut feeds: Vec<OpmlFeed> = Vec::new();
+    let mut seen = HashSet::new();
     let mut is_opml = false;
     // One entry per open <outline>: its name if it is a folder.
     let mut open: Vec<Option<String>> = Vec::new();
@@ -66,11 +67,14 @@ pub fn parse_opml(xml: &str) -> Result<Vec<OpmlFeed>> {
                 if feed.title.is_empty() {
                     feed.title = title;
                 }
+                feed.title = crate::feeds::truncate(feed.title, crate::feeds::MAX_TITLE_BYTES);
                 feed.category = open.iter().rev().flatten().next().cloned().unwrap_or_default();
                 if has_children {
                     open.push(feed.url.is_empty().then(|| feed.title.clone()));
                 }
-                if !feed.url.is_empty() && !feeds.iter().any(|f| f.url == feed.url) {
+                // A link too long to be one is left out (see feeds::MAX_LINK_BYTES).
+                let fits = feed.url.len() <= crate::feeds::MAX_LINK_BYTES;
+                if !feed.url.is_empty() && fits && seen.insert(feed.url.clone()) {
                     feeds.push(feed);
                 }
             }
@@ -194,6 +198,26 @@ impl Backup {
             state.r.iter_mut().chain(state.f.iter_mut()).for_each(|v| cap(&mut v.1));
         }
     }
+
+    /// Moves timestamps before `min` (ms) up to it, so the changes count as
+    /// made after an erase at `min - 1`.
+    fn lift_times(&mut self, min: i64) {
+        let lift = |t: &mut i64| *t = (*t).max(min);
+        let subscriptions = &mut self.subscriptions;
+        subscriptions.feeds.values_mut().for_each(|v| lift(&mut v.1));
+        subscriptions.categories.values_mut().for_each(|v| lift(&mut v.1));
+        subscriptions.routes.values_mut().for_each(|v| lift(&mut v.1));
+        subscriptions.names.values_mut().for_each(|v| lift(&mut v.1));
+        subscriptions.filters.values_mut().for_each(|v| lift(&mut v.1));
+        subscriptions.cache.iter_mut().for_each(|v| lift(&mut v.1));
+        for feed in self.feeds.values_mut() {
+            lift(&mut feed.meta_t);
+            feed.items.values_mut().for_each(|item| lift(&mut item.t));
+        }
+        for state in self.state.items.values_mut() {
+            state.r.iter_mut().chain(state.f.iter_mut()).for_each(|v| lift(&mut v.1));
+        }
+    }
 }
 
 /// Everything Feedstr stores for this account, except the Sync Key and device settings.
@@ -254,6 +278,19 @@ pub fn import_backup(db: &Db, json: &str) -> Result<BackupImport> {
     }
     let mut backup: Backup = serde_json::from_str(json).context("the backup is damaged")?;
     backup.cap_times(now_ms());
+    import(db, backup)
+}
+
+/// Puts back what [`export_backup`] saved just before this device's data was
+/// erased because the account's was, with every change dated `after` (ms) or
+/// later, so it counts as made after the erase (see [`Db::joining_account`]).
+pub(crate) fn restore_after_erase(db: &Db, json: &str, after: i64) -> Result<()> {
+    let mut backup: Backup = serde_json::from_str(json)?;
+    backup.lift_times(after);
+    import(db, backup).map(|_| ())
+}
+
+fn import(db: &Db, mut backup: Backup) -> Result<BackupImport> {
     backup.subscriptions.salt = None;
     backup.subscriptions.erased_at = None;
     backup.subscriptions.relays = Default::default();
@@ -306,6 +343,22 @@ mod tests {
         );
         assert!(parse_opml("<html><body>hi</body></html>").is_err());
         assert!(parse_opml("not xml at all <<<").is_err());
+    }
+
+    #[test]
+    fn opml_entries_are_kept_to_size() {
+        let long_url = format!("https://a.example/{}", "x".repeat(crate::feeds::MAX_LINK_BYTES));
+        let long_title = "é".repeat(crate::feeds::MAX_TITLE_BYTES);
+        let xml = format!(
+            r#"<opml version="2.0"><body>
+              <outline type="rss" text="Too long" xmlUrl="{long_url}"/>
+              <outline type="rss" text="{long_title}" xmlUrl="https://b.example/rss"/>
+            </body></opml>"#
+        );
+        let feeds = parse_opml(&xml).unwrap();
+        assert_eq!(feeds.len(), 1);
+        assert_eq!(feeds[0].url, "https://b.example/rss");
+        assert_eq!(feeds[0].title.len(), crate::feeds::MAX_TITLE_BYTES);
     }
 
     #[test]

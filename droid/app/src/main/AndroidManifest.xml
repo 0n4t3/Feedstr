@@ -26,11 +26,11 @@
         android:label="Feedstr"
         android:theme="@style/Theme.Feedstr">
 
-        <!-- The activity is never restarted for configuration changes:
-             the Rust app just redraws at the new size. -->
+        <!-- The activity isn't restarted for configuration changes: the Rust
+             app just redraws (for any others, see MainActivity.onDestroy). -->
         <activity
             android:name=".MainActivity"
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density|locale|layoutDirection|fontScale|colorMode|touchscreen|mcc|mnc"
             android:exported="true"
             android:launchMode="singleTask"
             android:windowSoftInputMode="adjustResize|stateAlwaysHidden">
@@ -42,6 +42,14 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Starts the app again in a new process, when it's opened while the
+             process from before is still ending (see MainActivity.endProcess). -->
+        <activity
+            android:name=".Restart"
+            android:exported="false"
+            android:noHistory="true"
+            android:process=":restart" />
 
         <!-- Keeps the app from being frozen while it syncs in the background. -->
         <service

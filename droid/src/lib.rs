@@ -36,12 +36,25 @@ static TYPED: Mutex<Vec<egui::Event>> = Mutex::new(Vec::new());
 /// File picks and signer requests waiting for an answer, by request number.
 static PENDING: Mutex<Option<HashMap<i32, oneshot::Sender<Reply>>>> = Mutex::new(None);
 static NEXT_REQUEST: AtomicI32 = AtomicI32::new(1);
+/// Whether the app has started in this process.
+static STARTED: AtomicBool = AtomicBool::new(false);
 
+/// Runs the app for the activity's lifetime, and beyond: winit doesn't stop
+/// when the activity is destroyed, and can't start again in the same process.
+/// So `MainActivity` ends the process when its activity goes, and starts a
+/// fresh one if it's opened again before that (see `MainActivity.endProcess`).
 #[unsafe(no_mangle)]
 fn android_main(app: AndroidApp) {
     android_logger::init_once(
         android_logger::Config::default().with_tag("feedstr").with_max_level(log::LevelFilter::Info),
     );
+    if STARTED.swap(true, Ordering::SeqCst) {
+        // Opened again while the process still runs the app from before:
+        // leave everything to that, and let this activity finish while
+        // MainActivity starts the app again in a new process.
+        log::info!("already running in this process: starting again in a new one");
+        return;
+    }
     let Some(dir) = app.internal_data_path() else {
         log::error!("no internal storage");
         return;
@@ -543,6 +556,18 @@ extern "system" fn Java_top_dns7_feedstr_MainActivity_nativeResumed(_env: EnvUno
     if let Some(remote) = REMOTE.lock().unwrap().as_ref() {
         remote.resumed();
     }
+}
+
+/// Before the process ends: uploads what's left, waiting up to `limit_ms`.
+/// Returns whether it finished. Not on the main thread.
+#[unsafe(no_mangle)]
+extern "system" fn Java_top_dns7_feedstr_MainActivity_nativeFinish(
+    _env: EnvUnowned,
+    _class: JClass,
+    limit_ms: i32,
+) -> bool {
+    let remote = REMOTE.lock().unwrap().clone();
+    remote.is_none_or(|remote| remote.finish(std::time::Duration::from_millis(limit_ms.max(0) as u64)))
 }
 
 /// `data` is null if the user cancelled.

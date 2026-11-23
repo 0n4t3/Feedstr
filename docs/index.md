@@ -39,6 +39,7 @@ There's currently no means of automatically updating Feedstr, aside from Android
 ## Usage
 
 #### Setting Up:
+* Don't want to sync? In the desktop or Android app, choose "Disable Sync" on the first screen and Feedstr works as a plain feed reader, no Nostr key needed. You can turn on sync later in the "Sync" settings, and what you already have comes along.
 * If you don't know what the heck a Nostr is, choose "Create a sync key" at the bottom and save it in your password manager. *(you do use a password manager, right? because you should.)* This is a private key, it keeps your data end to end encrypted. Don't lose it or give it to anyone else.
 * If you do know what a Nostr is, sign in with your nsec bunker - or if you're on the web client - your web extension. Configure your relays in the "Sync" settings (such as adding any paid/self-hosted relays you use), and you'll likely want to enable displaying NIP-23 blog posts from users you already follow in the "Socials" section.
 

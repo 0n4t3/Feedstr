@@ -37,6 +37,12 @@
   <releases>
     <!-- The same version as versionName in droid/app/build.gradle.kts
          and VERSION in core/src/ui.rs (there with a "v" in front). -->
+    <release version="0.2" date="2026-11-23">
+      <description>
+        <p>Sync is now optional on desktop and Android: use Feedstr as a plain feed reader on one device, and turn on sync later if you want it.</p>
+        <p>Fixes a hang when reopening the app quickly on Android, and deleted data coming back after syncing.</p>
+      </description>
+    </release>
     <release version="0.1" date="2026-11-20">
       <description>
         <p>First release.</p>

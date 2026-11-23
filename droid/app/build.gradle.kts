@@ -14,8 +14,8 @@ android {
         minSdk = 26
         targetSdk = 36
         // versionName matches the Flatpak's release (flatpak/top.dns7.feedstr.Feedstr.metainfo.xml).
-        versionCode = 6
-        versionName = "v0.1"
+        versionCode = 7
+        versionName = "v0.2"
     }
 
     sourceSets {
