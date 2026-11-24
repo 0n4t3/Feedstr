@@ -1,13 +1,11 @@
 **Warning!** *Feedstr is heavily AI assisted, and has only had a couple weeks of real world usage. Use with caution.*
 
 # Feedstr
-Feedstr was born out of the highly personalized annoyance of wanting private RSS feed sync, but not wanting to host my own FreshRSS instance (the only publicly accessible service on my home server right now). Feedstr attempts to solve that, syncing feeds, read/unread status, and favorites using the decentralized Nostr protocol - relying on either community relays (default), or a multi purpose self hosted relay. Since starting it, it's grown to support a handful of other protocols in addition to standard RSS.
+Feedstr was born out of the highly personalized annoyance of wanting private RSS feed sync, but not wanting to host my own FreshRSS instance (the only publicly accessible service on my home server at that time). Since then, however, it's also grown to support a handful of additional protocols beyond standard RSS. Feedstr offers both optional E2E encrypted sync (relying on either community relays or self hosted relays), and supports the following additonal protocols:
 
-## RSS++
-In addition to standard RSS/ATOM feeds, Feedstr now support following content on:
 - **Nostr NIP-23 Blogs** - both of all followed users (enabled/disabled), and individually added feeds
 - **YouTube channels**, which can be added by pasting a YouTube channel link, following either all content or only standard videos (filtering out shorts & livestreams)
-- Blogs on **Tor & I2P**, using your local Tor/I2P router as a proxy for Onion/I2P domains
+- Feeds on **Tor & I2P**, using your local Tor/I2P router as a proxy for Onion/I2P domains
 - **Gemini Capsules**, which can be followed like standard HTTP websites
 - **NSites**, which can be followed via RSS links within them, or by listing page updates if no RSS link on said NSite is present 
 
