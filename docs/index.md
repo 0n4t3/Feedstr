@@ -5,6 +5,8 @@ title: Feedstr
 
 <img src="logo.png" alt="Feedstr logo" width="112" height="112">
 
+Mildy improved reading. A feed reader, written in Rust, built to fetch content over a number of different protocols, with optional E2E sync.
+
 [Usage guide](usage/)
 
 **Warning!** *Feedstr is heavily AI assisted, and has only had a couple weeks of real world usage. Use with caution.*
